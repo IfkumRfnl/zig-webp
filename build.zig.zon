@@ -1,0 +1,14 @@
+.{
+    .name = .zig_webp,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x5614d508c6f31e1d,
+    .dependencies = .{},
+    .paths = .{
+        "AGENTS.MD",
+        "README.MD",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
