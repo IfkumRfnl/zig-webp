@@ -6,6 +6,7 @@
     .dependencies = .{},
     .paths = .{
         "AGENTS.MD",
+        "PLAN.MD",
         "README.MD",
         "build.zig",
         "build.zig.zon",

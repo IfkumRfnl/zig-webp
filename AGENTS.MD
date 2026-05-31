@@ -3,8 +3,35 @@
 - Target Zig 0.16.0. Run `zig version` before broad API changes.
 - Preserve the zero-dependency policy. Do not add C, system libraries, vendored
   codecs, or package dependencies.
+- External codec tools and cloned reference repositories may be used for local
+  research, tests, and differential validation, but they must stay outside this
+  package and must not become build dependencies.
 - Keep public API declarations in `src/root.zig`; place implementation modules
   under `src/`.
+- Keep codec subsystems modular. RIFF mux/demux, VP8, VP8L, alpha, animation,
+  metadata, pixel buffers, color conversion, bit readers, and bit writers should
+  be separate modules with narrow interfaces.
+- Do not add monolithic codec files. If a file starts mixing container parsing,
+  entropy coding, transforms, and public API policy, split it before continuing.
+- Container code must not depend on VP8 or VP8L internals. VP8/VP8L code must
+  not know about RIFF chunk ordering. Animation code should compose frames using
+  decoder interfaces rather than reaching into codec internals.
 - Prefer explicit parsing, bounded loops, and checked integer conversions.
+- Make scalar correctness authoritative before adding SIMD, threading, or
+  speed-focused variants.
+- Use the specs as the primary source of truth:
+  - WebP container: https://developers.google.com/speed/webp/docs/riff_container
+  - WebP image format RFC: https://www.rfc-editor.org/rfc/rfc9649
+  - VP8 bitstream: https://www.rfc-editor.org/rfc/rfc6386
+  - VP8L bitstream: https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification
+- Use references by role, not by copy-paste:
+  - `webmproject/libwebp`: conformance oracle and quality baseline.
+  - `webm/libwebp-test-data`: official corpus.
+  - `MikuAuahDark/simplewebp`: compact C decoder reference.
+  - `image-rs/image-webp`: independent pure-Rust decoder and module reference.
+  - `FFmpeg/libavcodec/webp.c`: mature low-level C decoder reference.
+  - `deepteams/webp` and `skrashevich/go-webp`: pure-Go encoder/test ideas.
+- Do not copy reference implementation code. Reimplement from the specs and
+  validate behavior with tests.
 - Run `zig fmt .` and `zig build test` before handing work back.
 - Do not commit generated build output such as `.zig-cache/` or `zig-out/`.
