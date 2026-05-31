@@ -19,6 +19,19 @@
 - Prefer explicit parsing, bounded loops, and checked integer conversions.
 - Make scalar correctness authoritative before adding SIMD, threading, or
   speed-focused variants.
+- Performance ambition is targeted `libwebp` outperformance, not premature
+  global superiority. First reach correctness parity, then compete on clear
+  dimensions: Zig-native API quality, auditability, deterministic allocation,
+  smaller modular code, feature probing speed, mux/demux ergonomics, selected
+  scalar decode paths, fast basic lossless encoding, and specific asset classes
+  such as UI images or alpha-heavy images.
+- Benchmark honestly against `references/libwebp` tools. Record whether a win
+  is about decode speed, encode speed, file size, visual quality, memory use,
+  binary size, API ergonomics, or safety. Do not claim a general win from a
+  narrow benchmark.
+- Treat lossy encoder quality and equal-quality speed as long-term research
+  goals. They are the hardest areas to beat because `libwebp` has mature
+  heuristics and architecture-specific optimization.
 - Use the specs as the primary source of truth:
   - WebP container: https://developers.google.com/speed/webp/docs/riff_container
   - WebP image format RFC: https://www.rfc-editor.org/rfc/rfc9649
