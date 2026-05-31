@@ -19,30 +19,32 @@ Normative references:
 
 Reference implementations and corpora inspected:
 
-| Reference | Role | Notes |
-|---|---|---|
-| `webmproject/libwebp` | Oracle | Official C implementation and tools. Use for differential testing, feature behavior, and encoding quality comparison. Do not copy architecture wholesale. |
-| `webm/libwebp-test-data` | Corpus | Official test vectors. Local clone had 131 `.webp` files and 184 files total. |
-| `MikuAuahDark/simplewebp` | Compact decoder reference | Single-header C decoder, about 5.5k lines. Good for WebP decode flow and VP8L details. No encoder, animation, metadata extraction, or partial decode. |
-| `image-rs/image-webp` | Independent full decoder reference | Pure Rust decoder covers simple and extended formats, lossy, lossless, alpha, animation, ICC, EXIF, and XMP. Lossless encoder only. Useful for module boundaries. |
-| `FFmpeg/libavcodec/webp.c` | Low-level C decoder reference | Compact C decoder file with mature edge-case handling. License is LGPL, so use only for behavior study and avoid copying code. |
-| `deepteams/webp` | Encoder architecture reference | Pure Go implementation claiming lossy, lossless, animation, metadata, and presets. Treat as a recent idea source, not an oracle. |
-| `skrashevich/go-webp` | Encoder/test matrix reference | Pure Go implementation with a detailed feature/test matrix. Useful for checklist design and encode/decode coverage. |
+| Local path | Upstream | Role | Notes |
+|---|---|---|---|
+| `references/libwebp` | `webmproject/libwebp` | Oracle | Official C implementation and tools. Use for differential testing, feature behavior, and encoding quality comparison. Do not copy architecture wholesale. |
+| `references/libwebp-test-data` | `webm/libwebp-test-data` | Corpus | Official test vectors. Local clone had 131 `.webp` files and 184 files total. |
+| `references/simplewebp` | `MikuAuahDark/simplewebp` | Compact decoder reference | Single-header C decoder, about 5.5k lines. Good for WebP decode flow and VP8L details. No encoder, animation, metadata extraction, or partial decode. |
+| `references/image-webp` | `image-rs/image-webp` | Independent full decoder reference | Pure Rust decoder covers simple and extended formats, lossy, lossless, alpha, animation, ICC, EXIF, and XMP. Lossless encoder only. Useful for module boundaries. |
+| `references/ffmpeg/libavcodec/webp.c` | `FFmpeg/FFmpeg` | Low-level C decoder reference | Compact C decoder file with mature edge-case handling. License is LGPL, so use only for behavior study and avoid copying code. |
+| `references/deepteams-webp` | `deepteams/webp` | Encoder architecture reference | Pure Go implementation claiming lossy, lossless, animation, metadata, and presets. Treat as a recent idea source, not an oracle. |
+| `references/skrashevich-go-webp` | `skrashevich/go-webp` | Encoder/test matrix reference | Pure Go implementation with a detailed feature/test matrix. Useful for checklist design and encode/decode coverage. |
 
-Reference clones used during planning were kept outside this repository:
+The local reference clones live under `references/`. The clone directories are
+ignored by git and excluded from the package; only `references/README.MD` is
+tracked. Recreate them with:
 
 ```sh
-mkdir -p /tmp/zig-webp-references
-git clone --depth 1 https://github.com/webmproject/libwebp.git
-git clone --depth 1 https://chromium.googlesource.com/webm/libwebp-test-data
-git clone --depth 1 https://github.com/MikuAuahDark/simplewebp.git
-git clone --depth 1 https://github.com/image-rs/image-webp.git
-git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
-git clone --depth 1 https://github.com/deepteams/webp.git deepteams-webp
-git clone --depth 1 https://github.com/skrashevich/go-webp.git skrashevich-go-webp
+mkdir -p references
+git clone --depth 1 https://github.com/webmproject/libwebp.git references/libwebp
+git clone --depth 1 https://chromium.googlesource.com/webm/libwebp-test-data references/libwebp-test-data
+git clone --depth 1 https://github.com/MikuAuahDark/simplewebp.git references/simplewebp
+git clone --depth 1 https://github.com/image-rs/image-webp.git references/image-webp
+git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git references/ffmpeg
+git clone --depth 1 https://github.com/deepteams/webp.git references/deepteams-webp
+git clone --depth 1 https://github.com/skrashevich/go-webp.git references/skrashevich-go-webp
 ```
 
-Do not vendor these references into `zig-webp`.
+Do not vendor the reference clone contents into git or the Zig package.
 
 ## Design Principles
 

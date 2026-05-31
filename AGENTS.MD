@@ -4,8 +4,8 @@
 - Preserve the zero-dependency policy. Do not add C, system libraries, vendored
   codecs, or package dependencies.
 - External codec tools and cloned reference repositories may be used for local
-  research, tests, and differential validation, but they must stay outside this
-  package and must not become build dependencies.
+  research, tests, and differential validation. Keep them under `references/`
+  and out of the package build. They must not become build dependencies.
 - Keep public API declarations in `src/root.zig`; place implementation modules
   under `src/`.
 - Keep codec subsystems modular. RIFF mux/demux, VP8, VP8L, alpha, animation,
@@ -25,12 +25,13 @@
   - VP8 bitstream: https://www.rfc-editor.org/rfc/rfc6386
   - VP8L bitstream: https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification
 - Use references by role, not by copy-paste:
-  - `webmproject/libwebp`: conformance oracle and quality baseline.
-  - `webm/libwebp-test-data`: official corpus.
-  - `MikuAuahDark/simplewebp`: compact C decoder reference.
-  - `image-rs/image-webp`: independent pure-Rust decoder and module reference.
-  - `FFmpeg/libavcodec/webp.c`: mature low-level C decoder reference.
-  - `deepteams/webp` and `skrashevich/go-webp`: pure-Go encoder/test ideas.
+  - `references/libwebp`: conformance oracle and quality baseline.
+  - `references/libwebp-test-data`: official corpus.
+  - `references/simplewebp`: compact C decoder reference.
+  - `references/image-webp`: independent pure-Rust decoder and module reference.
+  - `references/ffmpeg/libavcodec/webp.c`: mature low-level C decoder reference.
+  - `references/deepteams-webp` and `references/skrashevich-go-webp`: pure-Go
+    encoder/test ideas.
 - Do not copy reference implementation code. Reimplement from the specs and
   validate behavior with tests.
 - Run `zig fmt .` and `zig build test` before handing work back.
