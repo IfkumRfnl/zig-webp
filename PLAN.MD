@@ -7,6 +7,20 @@ The practical path is not to port `libwebp` wholesale. `libwebp` remains the
 behavior oracle, while smaller independent implementations and the specs guide
 module shape, test strategy, and edge-case coverage.
 
+## Progress
+
+Last updated: 2026-06-07
+
+- Step 0, Project Foundation: done.
+  Package-level API types, resource limits, corpus helpers, current
+  `zig build test` coverage, and optional local oracle tooling are in place.
+- Step 1, RIFF/WebP Container: done for static container scope.
+  Strict demux covers RIFF sizing, padding, chunk order, duplicate chunks,
+  unknown chunks, trailing data, simple `VP8 `/`VP8L`, `VP8X` feature probing,
+  raw metadata exposure, and chunk locations. Static mux/remux writes valid
+  canonical chunk ordering and preserves metadata payloads.
+- Step 2, Core Bitstream Infrastructure: next.
+
 ## References
 
 Normative references:
