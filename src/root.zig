@@ -16,6 +16,7 @@ pub const metadata = @import("metadata.zig");
 pub const mux = @import("mux.zig");
 pub const options = @import("options.zig");
 pub const testing = @import("testing.zig");
+pub const vp8l_huffman = @import("vp8l/huffman.zig");
 
 pub const AnimationFrame = animation.Frame;
 pub const BitReader = bit_reader.BitReader;
@@ -40,6 +41,8 @@ pub const MetadataPayloads = metadata.RawPayloads;
 pub const MuxOptions = mux.Options;
 pub const ResourceLimits = limits.ResourceLimits;
 pub const StaticImage = mux.StaticImage;
+pub const VP8LCodeLengthHuffmanTable = vp8l_huffman.CodeLengthTable;
+pub const VP8LHuffmanSymbolTable = vp8l_huffman.SymbolTable;
 
 pub const chunk_header_size = container.chunk_header_size;
 pub const riff_header_size = container.riff_header_size;

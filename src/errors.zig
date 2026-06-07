@@ -32,6 +32,8 @@ pub const Error = error{
     InvalidFeatureFlags,
     InvalidFrameChunk,
     InvalidBitCount,
+    InvalidHuffmanCode,
+    InvalidHuffmanTree,
     InvalidMuxChunk,
     InvalidRiffSignature,
     InvalidRiffSize,
@@ -71,6 +73,8 @@ pub fn category(err: Error) Category {
         => .resource_limit,
 
         error.InvalidBitCount,
+        error.InvalidHuffmanCode,
+        error.InvalidHuffmanTree,
         error.InvalidVP8Header,
         error.InvalidVP8LHeader,
         error.TruncatedBitstream,
@@ -115,6 +119,7 @@ test "classifies representative errors" {
     try std.testing.expectEqual(Category.container, category(error.InvalidRiffSize));
     try std.testing.expectEqual(Category.resource_limit, category(error.InputTooLarge));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8Header));
+    try std.testing.expectEqual(Category.bitstream, category(error.InvalidHuffmanTree));
     try std.testing.expectEqual(Category.bitstream, category(error.TruncatedBitstream));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationMux));
     try std.testing.expectEqual(Category.allocation, category(error.OutOfMemory));
