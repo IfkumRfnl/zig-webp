@@ -31,6 +31,7 @@ pub const Error = error{
     InvalidExtendedHeaderSize,
     InvalidFeatureFlags,
     InvalidFrameChunk,
+    InvalidBitCount,
     InvalidMuxChunk,
     InvalidRiffSignature,
     InvalidRiffSize,
@@ -45,6 +46,7 @@ pub const Error = error{
     OutputTooLarge,
     TooManyChunks,
     TrailingData,
+    TruncatedBitstream,
     TruncatedChunkHeader,
     TruncatedChunkPayload,
     UnsupportedAnimationMux,
@@ -68,8 +70,10 @@ pub fn category(err: Error) Category {
         error.TooManyChunks,
         => .resource_limit,
 
+        error.InvalidBitCount,
         error.InvalidVP8Header,
         error.InvalidVP8LHeader,
+        error.TruncatedBitstream,
         => .bitstream,
 
         error.UnsupportedAnimationMux,
@@ -111,6 +115,7 @@ test "classifies representative errors" {
     try std.testing.expectEqual(Category.container, category(error.InvalidRiffSize));
     try std.testing.expectEqual(Category.resource_limit, category(error.InputTooLarge));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8Header));
+    try std.testing.expectEqual(Category.bitstream, category(error.TruncatedBitstream));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationMux));
     try std.testing.expectEqual(Category.allocation, category(error.OutOfMemory));
 }

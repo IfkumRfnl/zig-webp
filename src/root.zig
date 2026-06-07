@@ -4,6 +4,8 @@ const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
 
 pub const animation = @import("animation.zig");
+pub const bit_reader = @import("bit_reader.zig");
+pub const bit_writer = @import("bit_writer.zig");
 pub const container = @import("container.zig");
 pub const demux = @import("demux.zig");
 pub const errors = @import("errors.zig");
@@ -16,6 +18,10 @@ pub const options = @import("options.zig");
 pub const testing = @import("testing.zig");
 
 pub const AnimationFrame = animation.Frame;
+pub const BitReader = bit_reader.BitReader;
+pub const BitWriter = bit_writer.BitWriter;
+pub const ByteReader = bit_reader.ByteReader;
+pub const ByteWriter = bit_writer.ByteWriter;
 pub const ChunkHeader = container.ChunkHeader;
 pub const ChunkKind = container.ChunkKind;
 pub const ChunkLocation = container.ChunkLocation;
