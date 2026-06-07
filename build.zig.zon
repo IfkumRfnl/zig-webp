@@ -12,5 +12,6 @@
         "build.zig.zon",
         "references/README.MD",
         "src",
+        "tools",
     },
 }

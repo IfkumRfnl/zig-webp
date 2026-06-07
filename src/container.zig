@@ -3,21 +3,22 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const errors = @import("errors.zig");
+
 pub const fourcc_size = 4;
 pub const chunk_header_size = 8;
 pub const riff_header_size = 12;
+pub const riff_payload_size_max = std.math.maxInt(u32) - 9;
+pub const file_size_max = @as(u64, riff_payload_size_max) + 8;
 
 comptime {
     assert(chunk_header_size == 2 * fourcc_size);
     assert(riff_header_size == 3 * fourcc_size);
+    assert(riff_payload_size_max == 0xfffffff6);
+    assert(file_size_max == 0xfffffffe);
 }
 
-pub const Error = error{
-    InputTooSmall,
-    InvalidRiffSignature,
-    InvalidWebPSignature,
-    TruncatedChunkHeader,
-};
+pub const Error = errors.Error;
 
 pub const ChunkKind = enum {
     lossy_bitstream,
@@ -34,6 +35,19 @@ pub const ChunkKind = enum {
 
 pub const FourCC = struct {
     bytes: [fourcc_size]u8,
+
+    pub fn fromString(comptime bytes: []const u8) FourCC {
+        comptime assert(bytes.len == fourcc_size);
+
+        return .{
+            .bytes = .{
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+            },
+        };
+    }
 
     pub fn fromBytes(bytes: []const u8) FourCC {
         assert(bytes.len == fourcc_size);
@@ -92,6 +106,37 @@ pub const ChunkHeader = struct {
     }
 };
 
+pub const ChunkLocation = struct {
+    tag: FourCC,
+    kind: ChunkKind,
+    offset: u64,
+    payload_offset: u64,
+    payload_size: u32,
+
+    pub fn paddedPayloadSizeBytes(self: ChunkLocation) u64 {
+        const payload_size: u64 = self.payload_size;
+
+        return payload_size + (payload_size & 1);
+    }
+
+    pub fn chunkSizeBytes(self: ChunkLocation) u64 {
+        return chunk_header_size + self.paddedPayloadSizeBytes();
+    }
+
+    pub fn endOffset(self: ChunkLocation) u64 {
+        return self.offset + self.chunkSizeBytes();
+    }
+
+    pub fn payload(self: ChunkLocation, bytes: []const u8) []const u8 {
+        const start: usize = @intCast(self.payload_offset);
+        const end: usize = @intCast(self.payload_offset + self.payload_size);
+        assert(start <= end);
+        assert(end <= bytes.len);
+
+        return bytes[start..end];
+    }
+};
+
 pub fn isWebP(bytes: []const u8) bool {
     if (bytes.len < riff_header_size) return false;
     if (!std.mem.eql(u8, bytes[0..fourcc_size], "RIFF")) return false;
@@ -109,8 +154,13 @@ pub fn parseHeader(bytes: []const u8) Error!ContainerHeader {
         return error.InvalidWebPSignature;
     }
 
+    const riff_payload_size = readLittleU32(bytes[4..8]);
+    if (riff_payload_size > riff_payload_size_max) return error.FileTooLarge;
+    if (riff_payload_size < fourcc_size) return error.InvalidRiffSize;
+    if ((riff_payload_size & 1) != 0) return error.InvalidRiffSize;
+
     return .{
-        .riff_payload_size = readLittleU32(bytes[4..8]),
+        .riff_payload_size = riff_payload_size,
     };
 }
 
@@ -123,13 +173,53 @@ pub fn parseChunkHeader(bytes: []const u8) Error!ChunkHeader {
     };
 }
 
-fn readLittleU32(bytes: []const u8) u32 {
+pub fn readLittleU16(bytes: []const u8) u16 {
+    assert(bytes.len == 2);
+
+    return @as(u16, bytes[0]) |
+        (@as(u16, bytes[1]) << 8);
+}
+
+pub fn readLittleU24(bytes: []const u8) u32 {
+    assert(bytes.len == 3);
+
+    return @as(u32, bytes[0]) |
+        (@as(u32, bytes[1]) << 8) |
+        (@as(u32, bytes[2]) << 16);
+}
+
+pub fn readLittleU32(bytes: []const u8) u32 {
     assert(bytes.len == 4);
 
     return @as(u32, bytes[0]) |
         (@as(u32, bytes[1]) << 8) |
         (@as(u32, bytes[2]) << 16) |
         (@as(u32, bytes[3]) << 24);
+}
+
+pub fn writeLittleU16(out: []u8, value: u16) void {
+    assert(out.len == 2);
+
+    out[0] = @truncate(value);
+    out[1] = @truncate(value >> 8);
+}
+
+pub fn writeLittleU24(out: []u8, value: u32) void {
+    assert(out.len == 3);
+    assert(value <= 0x00ff_ffff);
+
+    out[0] = @truncate(value);
+    out[1] = @truncate(value >> 8);
+    out[2] = @truncate(value >> 16);
+}
+
+pub fn writeLittleU32(out: []u8, value: u32) void {
+    assert(out.len == 4);
+
+    out[0] = @truncate(value);
+    out[1] = @truncate(value >> 8);
+    out[2] = @truncate(value >> 16);
+    out[3] = @truncate(value >> 24);
 }
 
 test "detects RIFF WebP headers" {
@@ -155,6 +245,17 @@ test "rejects invalid RIFF and WebP signatures" {
     try std.testing.expectError(
         error.InvalidWebPSignature,
         parseHeader("RIFF\x00\x00\x00\x00NOPE"),
+    );
+}
+
+test "rejects invalid RIFF size fields" {
+    try std.testing.expectError(
+        error.InvalidRiffSize,
+        parseHeader("RIFF\x05\x00\x00\x00WEBP"),
+    );
+    try std.testing.expectError(
+        error.FileTooLarge,
+        parseHeader("RIFF\xf8\xff\xff\xffWEBP"),
     );
 }
 

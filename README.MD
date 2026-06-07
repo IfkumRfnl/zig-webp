@@ -3,8 +3,9 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
-Status: scaffold. The current library exposes a small RIFF/WebP container parser
-so future decoder and encoder work has a tested public surface to grow from.
+Status: foundation. The current library exposes bounded public option, limit,
+image-buffer, metadata, animation-frame, feature-probing, RIFF/WebP demux, and
+static mux APIs. Pixel decode and codec internals are still future work.
 
 ## Goals
 
@@ -18,6 +19,7 @@ so future decoder and encoder work has a tested public surface to grow from.
 ```sh
 zig build
 zig build test
+tools/webp-oracle.sh check
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
