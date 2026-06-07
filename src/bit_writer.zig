@@ -6,6 +6,11 @@ const assert = std.debug.assert;
 const errors = @import("errors.zig");
 
 pub const Error = errors.Error;
+pub const write_bits_max = 32;
+
+const bits_per_byte = 8;
+const pending_bits_max = bits_per_byte - 1;
+const buffered_bits_max = write_bits_max + pending_bits_max;
 
 pub const ByteWriter = struct {
     out: []u8,
@@ -120,14 +125,14 @@ pub const BitWriter = struct {
     }
 
     pub fn writeBits(self: *BitWriter, value: u32, count: u6) Error!void {
-        if (count > 32) return error.InvalidBitCount;
+        if (count > write_bits_max) return error.InvalidBitCount;
         if (count == 0) return;
-        if (count < 32) assert((value >> @as(u5, @intCast(count))) == 0);
+        if (count < write_bits_max) assert((value >> @as(u5, @intCast(count))) == 0);
 
-        const bytes_to_flush = (@as(usize, self.bit_count) + count) / 8;
+        const bytes_to_flush = (@as(usize, self.bit_count) + count) / bits_per_byte;
         if (bytes_to_flush > self.out.len - self.byte_offset) return error.OutputTooLarge;
 
-        const masked_value = if (count == 32)
+        const masked_value = if (count == write_bits_max)
             @as(u64, value)
         else
             @as(u64, value) & ((@as(u64, 1) << count) - 1);
@@ -159,15 +164,24 @@ pub const BitWriter = struct {
     fn flushWholeBytes(self: *BitWriter) void {
         assert(self.bit_count < 40);
 
-        while (self.bit_count >= 8) {
+        while (self.bit_count >= bits_per_byte) {
             assert(self.byte_offset < self.out.len);
             self.out[self.byte_offset] = @truncate(self.bit_buffer);
             self.byte_offset += 1;
-            self.bit_buffer >>= 8;
-            self.bit_count = @intCast(@as(u7, self.bit_count) - 8);
+            self.bit_buffer >>= bits_per_byte;
+            self.bit_count = @intCast(@as(u7, self.bit_count) - bits_per_byte);
         }
     }
 };
+
+comptime {
+    assert(write_bits_max == 32);
+    assert(bits_per_byte == 8);
+    assert(pending_bits_max == 7);
+    assert(buffered_bits_max == 39);
+    assert(buffered_bits_max <= std.math.maxInt(u6));
+    assert(buffered_bits_max < @bitSizeOf(u64));
+}
 
 test "byte writer writes little-endian values with bounds" {
     var out: [18]u8 = undefined;

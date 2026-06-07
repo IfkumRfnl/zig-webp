@@ -6,6 +6,10 @@ const assert = std.debug.assert;
 const errors = @import("errors.zig");
 
 pub const Error = errors.Error;
+pub const read_bits_max = 32;
+
+const bits_per_byte = 8;
+const buffered_bits_max = read_bits_max + bits_per_byte - 1;
 
 pub const ByteReader = struct {
     bytes: []const u8,
@@ -144,7 +148,7 @@ pub const BitReader = struct {
     }
 
     pub fn peekBits(self: *BitReader, count: u6) Error!u32 {
-        if (count > 32) return error.InvalidBitCount;
+        if (count > read_bits_max) return error.InvalidBitCount;
         if (count == 0) return 0;
 
         try self.ensureBits(count);
@@ -156,7 +160,7 @@ pub const BitReader = struct {
     }
 
     pub fn dropBits(self: *BitReader, count: u6) Error!void {
-        if (count > 32) return error.InvalidBitCount;
+        if (count > read_bits_max) return error.InvalidBitCount;
         if (count == 0) return;
 
         try self.ensureBits(count);
@@ -175,17 +179,25 @@ pub const BitReader = struct {
         if (self.bit_count >= count) return;
 
         const missing_bits = @as(u6, count - self.bit_count);
-        const bytes_needed = (@as(usize, missing_bits) + 7) / 8;
+        const bytes_needed = (@as(usize, missing_bits) + bits_per_byte - 1) / bits_per_byte;
         if (bytes_needed > self.bytes.len - self.byte_offset) return error.TruncatedBitstream;
 
         var bytes_loaded: usize = 0;
         while (bytes_loaded < bytes_needed) : (bytes_loaded += 1) {
             self.bit_buffer |= @as(u64, self.bytes[self.byte_offset]) << self.bit_count;
             self.byte_offset += 1;
-            self.bit_count += 8;
+            self.bit_count += bits_per_byte;
         }
     }
 };
+
+comptime {
+    assert(read_bits_max == 32);
+    assert(bits_per_byte == 8);
+    assert(buffered_bits_max == 39);
+    assert(buffered_bits_max <= std.math.maxInt(u6));
+    assert(buffered_bits_max < @bitSizeOf(u64));
+}
 
 test "byte reader reads little-endian values with bounds" {
     const bytes = [_]u8{

@@ -105,3 +105,29 @@ test "root public declarations compile" {
     _ = corpus_tests;
     std.testing.refAllDecls(@This());
 }
+
+test "root exposes composable Step 2 bitstream infrastructure" {
+    var lsb_out: [2]u8 = undefined;
+    var bit_writer_instance = BitWriter.init(&lsb_out);
+    try bit_writer_instance.writeBits(0b101, 3);
+    try bit_writer_instance.writeBits(0x1f, 5);
+
+    var bit_reader_instance = BitReader.init(try bit_writer_instance.finish());
+    try std.testing.expectEqual(@as(u32, 0b101), try bit_reader_instance.readBits(3));
+    try std.testing.expectEqual(@as(u32, 0x1f), try bit_reader_instance.readBits(5));
+
+    var bool_out: [8]u8 = undefined;
+    var bool_writer_instance = VP8BoolWriter.init(&bool_out);
+    try bool_writer_instance.writeBool(40, 1);
+    try bool_writer_instance.writeBool(200, 0);
+
+    var bool_reader_instance = try VP8BoolReader.init(try bool_writer_instance.finish());
+    try std.testing.expectEqual(@as(u1, 1), try bool_reader_instance.readBool(40));
+    try std.testing.expectEqual(@as(u1, 0), try bool_reader_instance.readBool(200));
+
+    var entries: [VP8LHuffmanSymbolTable.entry_count_limit]vp8l_huffman.Entry = undefined;
+    const huffman_table = try VP8LHuffmanSymbolTable.build(&entries, &.{ 1, 1 });
+    var huffman_reader = BitReader.init(&.{0});
+
+    try std.testing.expectEqual(@as(u16, 0), try huffman_table.decode(&huffman_reader));
+}
