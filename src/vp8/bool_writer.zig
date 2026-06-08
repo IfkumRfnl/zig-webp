@@ -128,19 +128,26 @@ pub const BoolWriter = struct {
     }
 
     pub fn writeSignedLiteral(self: *BoolWriter, value: i32, bit_count: u6) Error!void {
-        if (bit_count > 32) return error.InvalidBitCount;
+        if (bit_count > 31) return error.InvalidBitCount;
         if (bit_count == 0) {
             assert(value == 0);
             return;
         }
         assertSignedLiteralFits(value, bit_count);
 
-        const encoded: u32 = @bitCast(value);
-        const masked = if (bit_count == 32)
-            encoded
+        const magnitude: u32 = if (value < 0)
+            @intCast(-@as(i64, value))
         else
-            encoded & ((@as(u32, 1) << @as(u5, @intCast(bit_count))) - 1);
-        try self.writeLiteral(masked, bit_count);
+            @intCast(value);
+
+        const sign: u1 = if (value < 0) 1 else 0;
+        const total_bits = bit_count + 1;
+        const encoded = (magnitude << 1) | sign;
+        const bytes_needed = outputBytesForLiteral(self.*, encoded, total_bits);
+        if (bytes_needed > self.out.len - self.offset) return error.OutputTooLarge;
+
+        try self.writeLiteral(magnitude, bit_count);
+        try self.writeBit(sign);
     }
 
     pub fn writeProbability(self: *BoolWriter, probability: Probability) Error!void {
@@ -275,14 +282,11 @@ fn assertValidBitCount(bit_count: u5) void {
 
 fn assertSignedLiteralFits(value: i32, bit_count: u6) void {
     assert(bit_count > 0);
-    assert(bit_count <= 32);
-    if (bit_count == 32) return;
+    assert(bit_count <= 31);
 
-    const shift: u5 = @intCast(bit_count - 1);
-    const min_value = -(@as(i64, 1) << shift);
-    const max_value = (@as(i64, 1) << shift) - 1;
-    assert(value >= min_value);
-    assert(value <= max_value);
+    const magnitude_max = (@as(i64, 1) << @as(u6, bit_count)) - 1;
+    assert(value >= -magnitude_max);
+    assert(value <= magnitude_max);
 }
 
 fn addOneToOutput(out: []u8, offset: usize) void {
@@ -413,6 +417,8 @@ test "VP8 bool writer round trips literals and probability helpers" {
     try writer.writeLiteral(0xb0, 8);
     try writer.writeSignedLiteral(-5, 4);
     try writer.writeSignedLiteral(5, 4);
+    try writer.writeSignedLiteral(0, 4);
+    try writer.writeBit(1);
     try writer.writeProbability(201);
     try writer.writeProbability7(84);
     try writer.writeProbability7(1);
@@ -422,6 +428,8 @@ test "VP8 bool writer round trips literals and probability helpers" {
     try std.testing.expectEqual(@as(u32, 0xb0), try reader.readLiteral(8));
     try std.testing.expectEqual(@as(i32, -5), try reader.readSignedLiteral(4));
     try std.testing.expectEqual(@as(i32, 5), try reader.readSignedLiteral(4));
+    try std.testing.expectEqual(@as(i32, 0), try reader.readSignedLiteral(4));
+    try std.testing.expectEqual(@as(u1, 1), try reader.readBit());
     try std.testing.expectEqual(@as(Probability, 201), try reader.readProbability());
     try std.testing.expectEqual(@as(Probability, 84), try reader.readProbability7());
     try std.testing.expectEqual(@as(Probability, 1), try reader.readProbability7());
@@ -432,6 +440,7 @@ test "VP8 bool writer reports invalid literal widths" {
     var writer = BoolWriter.init(&out);
 
     try std.testing.expectError(error.InvalidBitCount, writer.writeLiteral(0, 33));
+    try std.testing.expectError(error.InvalidBitCount, writer.writeSignedLiteral(0, 32));
     try std.testing.expectError(error.InvalidBitCount, writer.writeSignedLiteral(0, 33));
 }
 

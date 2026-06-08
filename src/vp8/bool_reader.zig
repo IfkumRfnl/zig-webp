@@ -121,18 +121,17 @@ pub const BoolReader = struct {
     }
 
     pub fn readSignedLiteral(self: *BoolReader, bit_count: u6) Error!i32 {
-        if (bit_count > 32) return error.InvalidBitCount;
+        if (bit_count > 31) return error.InvalidBitCount;
         if (bit_count == 0) return 0;
 
         var reader_next = self.*;
-        var value: i64 = if (try reader_next.readBit() == 1) -1 else 0;
-        var bits_read: u6 = 1;
-        while (bits_read < bit_count) : (bits_read += 1) {
-            value = (value << 1) + @as(i64, try reader_next.readBit());
-        }
+        const magnitude = try reader_next.readLiteral(bit_count);
+        const sign = try reader_next.readBit();
+        const value: i32 = @intCast(magnitude);
+        const signed_value = if (sign == 1) -value else value;
 
         self.* = reader_next;
-        return @intCast(value);
+        return signed_value;
     }
 
     pub fn readProbability(self: *BoolReader) Error!Probability {
@@ -224,8 +223,13 @@ test "VP8 bool reader handles biased probabilities" {
 }
 
 test "VP8 bool reader reads signed literals and probability helpers" {
-    var signed_reader = try BoolReader.init(&.{ 0xb0, 0x00, 0x00 });
+    var signed_reader = try BoolReader.init(&.{ 0x5c, 0x00, 0x00 });
     try std.testing.expectEqual(@as(i32, -5), try signed_reader.readSignedLiteral(4));
+    try std.testing.expectEqual(@as(u1, 1), try signed_reader.readBit());
+
+    var zero_signed_reader = try BoolReader.init(&.{ 0x04, 0x00, 0x00 });
+    try std.testing.expectEqual(@as(i32, 0), try zero_signed_reader.readSignedLiteral(4));
+    try std.testing.expectEqual(@as(u1, 1), try zero_signed_reader.readBit());
 
     var probability_reader = try BoolReader.init(&.{ 0x54, 0x00, 0x00 });
     try std.testing.expectEqual(@as(Probability, 84), try probability_reader.readProbability7());
@@ -241,6 +245,7 @@ test "VP8 bool reader reports invalid literal widths" {
     var reader = try BoolReader.init(&.{ 0x00, 0x00, 0x00 });
 
     try std.testing.expectError(error.InvalidBitCount, reader.readLiteral(33));
+    try std.testing.expectError(error.InvalidBitCount, reader.readSignedLiteral(32));
     try std.testing.expectError(error.InvalidBitCount, reader.readSignedLiteral(33));
 }
 

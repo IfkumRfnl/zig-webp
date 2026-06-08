@@ -170,8 +170,11 @@ pub const BitReader = struct {
     }
 
     pub fn alignToByte(self: *BitReader) void {
-        self.bit_buffer = 0;
-        self.bit_count = 0;
+        const unaligned_bits: u3 = @truncate(self.bit_count);
+        if (unaligned_bits == 0) return;
+
+        self.bit_buffer >>= unaligned_bits;
+        self.bit_count = @intCast(@as(u7, self.bit_count) - @as(u7, unaligned_bits));
     }
 
     fn ensureBits(self: *BitReader, count: u6) Error!void {
@@ -277,6 +280,20 @@ test "bit reader peeks and drops without changing logical bit order" {
     try std.testing.expectEqual(@as(usize, 9), reader.remainingBits());
     try reader.dropBits(9);
     try std.testing.expectEqual(@as(usize, 0), reader.remainingBits());
+}
+
+test "bit reader byte alignment preserves prefetched bytes" {
+    const bytes = [_]u8{ 0xa5, 0x3c };
+    var reader = BitReader.init(&bytes);
+
+    try std.testing.expectEqual(@as(u32, 1), try reader.peekBits(1));
+    try std.testing.expectEqual(@as(usize, 1), reader.loadedBytes());
+    try std.testing.expectEqual(@as(u6, 8), reader.bufferedBits());
+    reader.alignToByte();
+    try std.testing.expectEqual(@as(usize, 1), reader.loadedBytes());
+    try std.testing.expectEqual(@as(u6, 8), reader.bufferedBits());
+    try std.testing.expectEqual(@as(u32, 0xa5), try reader.readBits(8));
+    try std.testing.expectEqual(@as(u32, 0x3c), try reader.readBits(8));
 }
 
 test "bit reader reports invalid counts and truncation without consuming bytes" {
