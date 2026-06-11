@@ -291,11 +291,9 @@ fn assertSignedLiteralFits(value: i32, bit_count: u6) void {
 
 fn addOneToOutput(out: []u8, offset: usize) void {
     assert(offset <= out.len);
-    if (offset == 0) return;
 
     var index = offset;
-    while (true) {
-        assert(index > 0);
+    while (index > 0) {
         index -= 1;
 
         if (out[index] == 0xff) {
@@ -509,6 +507,23 @@ test "VP8 bool writer treats carry before first output byte as a no-op" {
     try writer.writeBool(probability_even, 0);
 
     try std.testing.expectEqualSlices(u8, &.{0}, writer.written());
+    try std.testing.expectEqual(@as(u32, range_min), writer.range);
+    try std.testing.expectEqual(@as(u5, 8), writer.pendingShiftCount());
+}
+
+test "VP8 bool writer drops carry past an all 0xff output prefix" {
+    var out = [_]u8{ 0xff, 0xff, 0x00 };
+    var writer = BoolWriter{
+        .out = &out,
+        .offset = 2,
+        .range = 128,
+        .bottom = bottom_carry_bit,
+        .bit_count = 1,
+    };
+
+    try writer.writeBool(probability_even, 0);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00 }, writer.written());
     try std.testing.expectEqual(@as(u32, range_min), writer.range);
     try std.testing.expectEqual(@as(u5, 8), writer.pendingShiftCount());
 }

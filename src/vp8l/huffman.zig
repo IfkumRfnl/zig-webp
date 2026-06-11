@@ -140,6 +140,7 @@ pub fn Table(comptime options: TableOptions) type {
             if (populated_symbols == 0) return error.InvalidHuffmanTree;
 
             if (populated_symbols == 1) {
+                // The VP8L single-leaf exception is encoded with length 1.
                 if (code_lengths[@intCast(last_symbol)] != 1) return error.InvalidHuffmanTree;
 
                 @memset(entries_buffer[0..root_entry_count], symbolEntry(last_symbol, 0));
