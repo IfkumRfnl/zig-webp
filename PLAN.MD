@@ -33,10 +33,9 @@ Last updated: 2026-06-11
   parsing are implemented with focused tests. Multiple Huffman group storage and
   meta-prefix selection during main-image entropy decode are also in place.
   Subtract-green inverse transform support is wired into the limited raw VP8L
-  decoder, and color/color-indexing inverse-transform helpers are implemented.
-  Remaining work includes predictor inverse transform, wiring color and
-  color-indexing transform data into decode, public static decode composition,
-  and differential corpus checks against `dwebp`.
+  decoder, and predictor/color/color-indexing inverse-transform helpers are
+  implemented. Remaining work includes wiring transform data into decode, public
+  static decode composition, and differential corpus checks against `dwebp`.
 
 ## References
 
@@ -332,8 +331,8 @@ input.
 6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
    Subtract-green inverse transform is done and wired into raw VP8L decode.
-   Color transform arithmetic/block application and color-indexing expansion are
-   done; predictor and transform data wiring remain.
+   Predictor, color transform arithmetic/block application, and color-indexing
+   expansion are done; transform data wiring remains.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.
