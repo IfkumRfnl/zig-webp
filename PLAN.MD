@@ -32,9 +32,10 @@ Last updated: 2026-06-11
   literals, LZ77 copies, color-cache references, and meta-prefix entropy image
   parsing are implemented with focused tests. Multiple Huffman group storage and
   meta-prefix selection during main-image entropy decode are also in place.
-  Subtract-green inverse transform support is implemented. Remaining work
-  includes predictor/color/color-indexing inverse transforms, public static
-  decode composition, and differential corpus checks against `dwebp`.
+  Subtract-green inverse transform support is wired into the limited raw VP8L
+  decoder. Remaining work includes predictor/color/color-indexing inverse
+  transforms, public static decode composition, and differential corpus checks
+  against `dwebp`.
 
 ## References
 
