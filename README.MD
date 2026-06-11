@@ -7,8 +7,8 @@ Status: VP8L decoder groundwork in progress. The current library exposes
 bounded public option, limit, image-buffer, metadata, animation-frame,
 feature-probing, RIFF/WebP demux, static mux, bitstream, VP8 boolean coder, and
 VP8L header/transform/Huffman image-data APIs. A limited raw VP8L path can
-materialize no-transform, single-prefix-group ARGB payloads; full static WebP
-pixel decode is not available yet.
+materialize no-transform, single-prefix-group ARGB payloads and parse
+meta-prefix entropy images; full static WebP pixel decode is not available yet.
 
 ## Goals
 
