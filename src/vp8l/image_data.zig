@@ -242,7 +242,7 @@ pub fn distanceFromCode(distance_code: u32, image_width: u32) u64 {
     return @intCast(distance);
 }
 
-fn readColorCache(reader: *bit_reader.BitReader) errors.Error!?ColorCache {
+pub fn readColorCache(reader: *bit_reader.BitReader) errors.Error!?ColorCache {
     const present = try reader.readBit();
     if (present == 0) return null;
 
@@ -428,7 +428,7 @@ fn repeatCodeLength(
     symbol_index.* = end;
 }
 
-fn colorCacheSize(color_cache: ?ColorCache) u16 {
+pub fn colorCacheSize(color_cache: ?ColorCache) u16 {
     return if (color_cache) |cache| cache.size else 0;
 }
 

@@ -10,7 +10,8 @@ VP8L header/transform/Huffman image-data APIs. A limited raw VP8L path can
 materialize no-transform, single-prefix-group ARGB payloads and parse
 meta-prefix entropy images, prefix-code group storage, and multi-group entropy
 streams. Raw VP8L payload decode supports subtract-green, predictor, color, and
-color-indexing transforms; full static WebP pixel decode is not available yet.
+color-indexing transforms, plus allocator-backed main-image meta-prefix/group
+stores; full static WebP pixel decode is not available yet.
 
 ## Goals
 
