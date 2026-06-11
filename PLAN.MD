@@ -30,9 +30,10 @@ Last updated: 2026-06-11
   color-cache metadata validation, distance mapping, bounded entropy-stream
   scanning, and no-transform single-prefix-group ARGB materialization for
   literals, LZ77 copies, color-cache references, and meta-prefix entropy image
-  parsing are implemented with focused tests. Remaining work includes multiple
-  Huffman group storage/selection, inverse transforms, public static decode
-  composition, and differential corpus checks against `dwebp`.
+  parsing are implemented with focused tests. Multiple Huffman group storage and
+  meta-prefix selection helpers are also in place. Remaining work includes
+  wiring multi-group selection into main-image decode, inverse transforms, public
+  static decode composition, and differential corpus checks against `dwebp`.
 
 ## References
 
@@ -323,8 +324,8 @@ input.
 4. Done for single-prefix-group scope: materialize pixels from literals, LZ77
    backward references, distance mapping, and optional color-cache references.
 5. In progress: support meta-prefix images and multiple Huffman groups.
-   Entropy-image parsing and group-count derivation are done; group storage and
-   selection for main-image decode remain.
+   Entropy-image parsing, group-count derivation, and prefix-code group
+   storage/selection helpers are done; main-image multi-group decode remains.
 6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
 
