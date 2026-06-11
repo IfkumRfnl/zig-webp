@@ -9,7 +9,7 @@ module shape, test strategy, and edge-case coverage.
 
 ## Progress
 
-Last updated: 2026-06-08
+Last updated: 2026-06-11
 
 - Step 0, Project Foundation: done.
   Package-level API types, resource limits, corpus helpers, current
@@ -24,6 +24,14 @@ Last updated: 2026-06-08
   VP8L canonical Huffman table construction/lookup, and VP8 boolean arithmetic
   reader/writer are implemented with unit, invalid-input, round-trip, and
   compile-time capacity tests.
+- Step 3, VP8L Lossless Decoder: in progress.
+  VP8L image header parsing, transform-list parsing and dimension bookkeeping,
+  single-prefix-group image-data Huffman parsing, code-length repeat handling,
+  color-cache metadata validation, distance mapping, and bounded entropy-stream
+  scanning are implemented with focused tests. Remaining work includes
+  meta-prefix images and multiple Huffman groups, pixel materialization from
+  literals, LZ77 copies, and color-cache references, inverse transforms, and
+  differential corpus checks against `dwebp`.
 
 ## References
 
@@ -306,13 +314,15 @@ input.
 
 ## Near-Term Work Items
 
-1. Start VP8L decode against the official lossless vectors.
-2. Parse VP8L signature, dimensions, alpha flag, version, and transform list.
-3. Decode VP8L code-length and image Huffman groups using the shared table
-   builder.
-4. Decode literals, LZ77 backward references, distance mapping, and optional
-   color-cache references.
-5. Add inverse-transform scaffolding and differential pixel checks against
+1. Done: start VP8L decode modules against the official lossless-vector scope.
+2. Done: parse VP8L signature, dimensions, alpha flag, version, and transform
+   list.
+3. Done for single-prefix-group scope: decode VP8L code-length and image
+   Huffman groups using the shared table builder.
+4. Next: support meta-prefix images and multiple Huffman groups.
+5. Next: materialize pixels from literals, LZ77 backward references, distance
+   mapping, and optional color-cache references.
+6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
 
 This order keeps early work testable and prevents the project from becoming one
