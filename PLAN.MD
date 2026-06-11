@@ -35,8 +35,8 @@ Last updated: 2026-06-11
   Subtract-green, predictor, color, and color-indexing inverse transform support
   are wired into the limited raw VP8L decoder. Main-image meta-prefix/group-store
   entropy decoding is available through the allocator-backed raw decoder path.
-  Remaining work includes public static decode composition and differential
-  corpus checks against `dwebp`.
+  Public static lossless decode composition is available for still VP8L images.
+  Remaining work includes differential corpus checks against `dwebp`.
 
 ## References
 
@@ -331,9 +331,9 @@ input.
    storage/selection during main-image entropy decode are done.
 6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
-   Subtract-green, predictor, color, color-indexing, and main-image meta-prefix
-   group-store decode are wired into raw VP8L decode. Remaining work is to
-   compose the public static decode entrypoint and add differential pixel checks.
+   Subtract-green, predictor, color, color-indexing, main-image meta-prefix
+   group-store decode, and public static lossless decode composition are done.
+   Remaining work is to add differential pixel checks.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.
