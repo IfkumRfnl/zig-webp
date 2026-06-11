@@ -40,6 +40,7 @@ pub const Error = error{
     InvalidSimpleChunk,
     InvalidVP8Header,
     InvalidVP8LHeader,
+    InvalidVP8LTransform,
     InvalidWebPSignature,
     MissingAnimationControl,
     MissingExtendedHeader,
@@ -77,6 +78,7 @@ pub fn category(err: Error) Category {
         error.InvalidHuffmanTree,
         error.InvalidVP8Header,
         error.InvalidVP8LHeader,
+        error.InvalidVP8LTransform,
         error.TruncatedBitstream,
         => .bitstream,
 
@@ -120,6 +122,7 @@ test "classifies representative errors" {
     try std.testing.expectEqual(Category.resource_limit, category(error.InputTooLarge));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8Header));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidHuffmanTree));
+    try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8LTransform));
     try std.testing.expectEqual(Category.bitstream, category(error.TruncatedBitstream));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationMux));
     try std.testing.expectEqual(Category.allocation, category(error.OutOfMemory));

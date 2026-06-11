@@ -20,6 +20,7 @@ pub const vp8_bool_reader = @import("vp8/bool_reader.zig");
 pub const vp8_bool_writer = @import("vp8/bool_writer.zig");
 pub const vp8l_header = @import("vp8l/header.zig");
 pub const vp8l_huffman = @import("vp8l/huffman.zig");
+pub const vp8l_transform = @import("vp8l/transform.zig");
 
 pub const AnimationFrame = animation.Frame;
 pub const BitReader = bit_reader.BitReader;
@@ -49,6 +50,8 @@ pub const VP8BoolWriter = vp8_bool_writer.BoolWriter;
 pub const VP8LHeader = vp8l_header.Header;
 pub const VP8LCodeLengthHuffmanTable = vp8l_huffman.CodeLengthTable;
 pub const VP8LHuffmanSymbolTable = vp8l_huffman.SymbolTable;
+pub const VP8LTransform = vp8l_transform.Transform;
+pub const VP8LTransformListReader = vp8l_transform.ListReader;
 
 pub const chunk_header_size = container.chunk_header_size;
 pub const riff_header_size = container.riff_header_size;
