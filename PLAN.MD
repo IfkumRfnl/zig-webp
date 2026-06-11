@@ -24,7 +24,7 @@ Last updated: 2026-06-11
   VP8L canonical Huffman table construction/lookup, and VP8 boolean arithmetic
   reader/writer are implemented with unit, invalid-input, round-trip, and
   compile-time capacity tests.
-- Step 3, VP8L Lossless Decoder: in progress.
+- Step 3, VP8L Lossless Decoder: done for still-image lossless corpus scope.
   VP8L image header parsing, transform-list parsing and dimension bookkeeping,
   single-prefix-group image-data Huffman parsing, code-length repeat handling,
   color-cache metadata validation, distance mapping, bounded entropy-stream
@@ -36,7 +36,9 @@ Last updated: 2026-06-11
   are wired into the limited raw VP8L decoder. Main-image meta-prefix/group-store
   entropy decoding is available through the allocator-backed raw decoder path.
   Public static lossless decode composition is available for still VP8L images.
-  Remaining work includes differential corpus checks against `dwebp`.
+  The optional local oracle workflow compares VP8L PAM output against `dwebp`;
+  on 2026-06-11 it matched all 43 VP8L files in `references/libwebp-test-data`
+  with 88 non-lossless files skipped.
 
 ## References
 
@@ -329,11 +331,12 @@ input.
 5. In progress: support meta-prefix images and multiple Huffman groups.
    Entropy-image parsing, group-count derivation, and prefix-code group
    storage/selection during main-image entropy decode are done.
-6. Next: implement inverse transforms and differential pixel checks against
+6. Done: implement inverse transforms and differential pixel checks against
    `dwebp`.
    Subtract-green, predictor, color, color-indexing, main-image meta-prefix
-   group-store decode, and public static lossless decode composition are done.
-   Remaining work is to add differential pixel checks.
+   group-store decode, public static lossless decode composition, and optional
+   `dwebp` pixel comparison tooling are done. The local corpus comparison
+   matched all VP8L files in `references/libwebp-test-data`.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.

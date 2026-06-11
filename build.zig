@@ -21,6 +21,24 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile the library");
     check_step.dependOn(&webp_library.step);
 
+    const decode_tool = b.addExecutable(.{
+        .name = "zig-webp-decode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    const run_decode_tool = b.addRunArtifact(decode_tool);
+    if (b.args) |args| {
+        run_decode_tool.addArgs(args);
+    }
+    const decode_step = b.step("decode", "Decode a static lossless WebP to PAM");
+    decode_step.dependOn(&run_decode_tool.step);
+
     const unit_tests = b.addTest(.{
         .root_module = webp_module,
     });
