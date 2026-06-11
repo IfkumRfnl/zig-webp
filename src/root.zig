@@ -7,6 +7,7 @@ pub const animation = @import("animation.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
 pub const container = @import("container.zig");
+pub const decode = @import("decode.zig");
 pub const demux = @import("demux.zig");
 pub const errors = @import("errors.zig");
 pub const features = @import("features.zig");
@@ -113,6 +114,14 @@ pub fn encodeStatic(
     encode_options: MuxOptions,
 ) Error![]u8 {
     return mux.encodeStatic(gpa, static_image, encode_options);
+}
+
+pub fn decodeStatic(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    decode_options: DecoderOptions,
+) Error!image.OwnedBuffer {
+    return decode.decodeStatic(gpa, bytes, decode_options);
 }
 
 test "root exposes WebP container helpers" {

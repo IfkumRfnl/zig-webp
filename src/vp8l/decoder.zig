@@ -20,6 +20,7 @@ const transform = @import("transform.zig");
 pub const WorkBuffers = struct {
     prefix_code_group: image_data.PrefixCodeGroupBuffers = .{},
     prefix_groups: prefix_groups.WorkBuffers = .{},
+    prefix_group_options: prefix_groups.Options = .{},
     entropy_image: []pixel.Pixel = &.{},
     transform_pixels: []pixel.Pixel = &.{},
 };
@@ -185,7 +186,7 @@ fn decodeMainImage(
         reader,
         info.group_count,
         image_data.colorCacheSize(color_cache),
-        .{},
+        buffers.prefix_group_options,
         &buffers.prefix_groups,
     );
     defer group_store.deinit();

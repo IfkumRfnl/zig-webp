@@ -11,7 +11,8 @@ materialize no-transform, single-prefix-group ARGB payloads and parse
 meta-prefix entropy images, prefix-code group storage, and multi-group entropy
 streams. Raw VP8L payload decode supports subtract-green, predictor, color, and
 color-indexing transforms, plus allocator-backed main-image meta-prefix/group
-stores; full static WebP pixel decode is not available yet.
+stores. Static lossless WebP decode is available for still VP8L images; lossy,
+alpha chunks, and animation are not available yet.
 
 ## Goals
 
