@@ -28,6 +28,7 @@ pub const Result = struct {
 const TransformData = union(enum) {
     none: void,
     block: []const pixel.Pixel,
+    color_table: []const pixel.Pixel,
 };
 
 const TransformPixelStore = struct {
@@ -59,9 +60,12 @@ pub fn decodeARGB(
     var transform_reader = transform.ListReader.init(parsed_header.dimensions);
     var transforms: [transform.transform_count_max]transform.Transform = undefined;
     var transform_data: [transform.transform_count_max]TransformData = undefined;
+    var transform_dimensions: [transform.transform_count_max]image.Dimensions = undefined;
     var transform_pixels = TransformPixelStore.init(buffers.transform_pixels);
     var transform_count: usize = 0;
-    while (try transform_reader.readNext(&reader)) |transform_value| {
+    while (true) {
+        const dimensions_before = transform_reader.currentDimensions();
+        const transform_value = (try transform_reader.readNext(&reader)) orelse break;
         const data: TransformData = switch (transform_value) {
             .subtract_green => .{ .none = {} },
             .predictor => |predictor_transform| .{
@@ -80,13 +84,20 @@ pub fn decodeARGB(
                     &buffers.prefix_code_group,
                 ),
             },
-            .color_indexing,
-            => return error.UnsupportedVP8LImageData,
+            .color_indexing => |color_indexing| .{
+                .color_table = try decodeColorTable(
+                    &reader,
+                    color_indexing,
+                    &transform_pixels,
+                    &buffers.prefix_code_group,
+                ),
+            },
         };
 
         assert(transform_count < transforms.len);
         transforms[transform_count] = transform_value;
         transform_data[transform_count] = data;
+        transform_dimensions[transform_count] = dimensions_before;
         transform_count += 1;
     }
 
@@ -104,7 +115,7 @@ pub fn decodeARGB(
         try applyDecodedTransform(
             transforms[transform_index],
             transform_data[transform_index],
-            parsed_header.dimensions,
+            transform_dimensions[transform_index],
             output,
         );
     }
@@ -120,7 +131,7 @@ fn decodeTransformImage(
     dimensions: image.Dimensions,
     store: *TransformPixelStore,
     buffers: *image_data.PrefixCodeGroupBuffers,
-) errors.Error![]const pixel.Pixel {
+) errors.Error![]pixel.Pixel {
     const pixel_count = try dimensions.pixelCount();
     const pixels = try store.reserve(pixel_count);
     const summary = try entropy.decodeSingleGroup(
@@ -131,6 +142,23 @@ fn decodeTransformImage(
         buffers,
     );
     assert(summary.pixel_count == pixel_count);
+
+    return pixels;
+}
+
+fn decodeColorTable(
+    reader: *bit_reader.BitReader,
+    color_indexing: transform.ColorIndexing,
+    store: *TransformPixelStore,
+    buffers: *image_data.PrefixCodeGroupBuffers,
+) errors.Error![]const pixel.Pixel {
+    const pixels = try decodeTransformImage(
+        reader,
+        color_indexing.color_table,
+        store,
+        buffers,
+    );
+    inverse_transform.applyColorTableDeltas(pixels);
 
     return pixels;
 }
@@ -150,7 +178,9 @@ fn applyDecodedTransform(
         .color => |color_transform| {
             const transform_pixels = switch (data) {
                 .block => |pixels| pixels,
-                .none => unreachable,
+                .none,
+                .color_table,
+                => unreachable,
             };
             try inverse_transform.applyColorTransform(
                 color_transform,
@@ -162,7 +192,9 @@ fn applyDecodedTransform(
         .predictor => |predictor_transform| {
             const transform_pixels = switch (data) {
                 .block => |pixels| pixels,
-                .none => unreachable,
+                .none,
+                .color_table,
+                => unreachable,
             };
             try inverse_transform.applyPredictorTransform(
                 predictor_transform,
@@ -171,8 +203,20 @@ fn applyDecodedTransform(
                 output,
             );
         },
-        .color_indexing,
-        => unreachable,
+        .color_indexing => |color_indexing| {
+            const color_table = switch (data) {
+                .color_table => |pixels| pixels,
+                .none,
+                .block,
+                => unreachable,
+            };
+            try inverse_transform.applyColorIndexingTransform(
+                color_indexing,
+                color_table,
+                dimensions,
+                output,
+            );
+        },
     }
 }
 
@@ -328,6 +372,45 @@ test "VP8L decoder applies predictor inverse transform data" {
     try std.testing.expectEqual(pixel.fromChannels(255, 40, 40, 40), output[5]);
 }
 
+test "VP8L decoder applies color-indexing with reduced-dimension predictor data" {
+    var payload: [header.byte_count + 160]u8 = undefined;
+    writeHeader(payload[0..header.byte_count], 5, 1, false);
+
+    var writer = bit_writer.BitWriter.init(payload[header.byte_count..]);
+    try writer.writeBit(1);
+    try writer.writeBits(@intFromEnum(transform.Kind.color_indexing), 2);
+    try writer.writeBits(3, 8);
+
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 0, 10, 0, 0);
+
+    try writer.writeBit(1);
+    try writer.writeBits(@intFromEnum(transform.Kind.predictor), 2);
+    try writer.writeBits(0, 3);
+
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 1, 0, 0, 0);
+
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 1, 0, 0, 1);
+    const image_data_bytes = try writer.finish();
+    const payload_len = header.byte_count + image_data_bytes.len;
+
+    var transform_pixels: [5]pixel.Pixel = undefined;
+    var buffers = WorkBuffers{ .transform_pixels = &transform_pixels };
+    var output: [5]pixel.Pixel = undefined;
+    const result = try decodeARGB(payload[0..payload_len], &output, &buffers);
+
+    try std.testing.expectEqual(@as(u64, 2), result.entropy_summary.pixel_count);
+    try std.testing.expectEqual(pixel.fromChannels(0, 20, 0, 0), output[0]);
+    try std.testing.expectEqual(pixel.fromChannels(0, 10, 0, 0), output[1]);
+    try std.testing.expectEqual(pixel.fromChannels(0, 10, 0, 0), output[2]);
+    try std.testing.expectEqual(pixel.fromChannels(0, 10, 0, 0), output[3]);
+    try std.testing.expectEqual(pixel.fromChannels(0, 30, 0, 0), output[4]);
+}
+
 test "VP8L decoder requires storage for color transform data" {
     var payload: [header.byte_count + 1]u8 = undefined;
     writeHeader(payload[0..header.byte_count], 1, 1, false);
@@ -347,7 +430,7 @@ test "VP8L decoder requires storage for color transform data" {
     );
 }
 
-test "VP8L decoder reports unimplemented transforms as unsupported" {
+test "VP8L decoder requires storage for color-indexing transform data" {
     var payload: [header.byte_count + 2]u8 = undefined;
     writeHeader(payload[0..header.byte_count], 1, 1, false);
 
@@ -361,7 +444,7 @@ test "VP8L decoder reports unimplemented transforms as unsupported" {
     var buffers: WorkBuffers = .{};
     var output: [1]pixel.Pixel = undefined;
     try std.testing.expectError(
-        error.UnsupportedVP8LImageData,
+        error.OutputTooLarge,
         decodeARGB(payload[0..payload_len], &output, &buffers),
     );
 }
