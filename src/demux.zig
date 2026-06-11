@@ -10,6 +10,7 @@ const features = @import("features.zig");
 const image = @import("image.zig");
 const limits = @import("limits.zig");
 const metadata = @import("metadata.zig");
+const vp8l_header = @import("vp8l/header.zig");
 
 pub const Options = struct {
     limits: limits.ResourceLimits = .{},
@@ -654,20 +655,12 @@ fn parseVP8Info(payload: []const u8) errors.Error!BitstreamInfo {
 }
 
 fn parseVP8LInfo(payload: []const u8) errors.Error!BitstreamInfo {
-    if (payload.len < 5) return error.InvalidVP8LHeader;
-    if (payload[0] != 0x2f) return error.InvalidVP8LHeader;
-
-    const bits = container.readLittleU32(payload[1..5]);
-    const width = (bits & 0x3fff) + 1;
-    const height = ((bits >> 14) & 0x3fff) + 1;
-    const has_alpha = ((bits >> 28) & 1) == 1;
-    const version = (bits >> 29) & 0x7;
-    if (version != 0) return error.InvalidVP8LHeader;
+    const header = try vp8l_header.parse(payload);
 
     return .{
         .format = .lossless,
-        .dimensions = try image.Dimensions.init(width, height),
-        .has_alpha = has_alpha,
+        .dimensions = header.dimensions,
+        .has_alpha = header.has_alpha,
     };
 }
 
