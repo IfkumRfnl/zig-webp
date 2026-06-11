@@ -24,6 +24,7 @@ pub const vp8l_decoder = @import("vp8l/decoder.zig");
 pub const vp8l_entropy = @import("vp8l/entropy.zig");
 pub const vp8l_huffman = @import("vp8l/huffman.zig");
 pub const vp8l_image_data = @import("vp8l/image_data.zig");
+pub const vp8l_meta_prefix = @import("vp8l/meta_prefix.zig");
 pub const vp8l_pixel = @import("vp8l/pixel.zig");
 pub const vp8l_transform = @import("vp8l/transform.zig");
 
@@ -62,6 +63,7 @@ pub const VP8LCodeLengthHuffmanTable = vp8l_huffman.CodeLengthTable;
 pub const VP8LHuffmanSymbolTable = vp8l_huffman.SymbolTable;
 pub const VP8LImageData = vp8l_image_data.ImageData;
 pub const VP8LImageDataPrefixCodeGroupBuffers = vp8l_image_data.PrefixCodeGroupBuffers;
+pub const VP8LMetaPrefixInfo = vp8l_meta_prefix.Info;
 pub const VP8LTransform = vp8l_transform.Transform;
 pub const VP8LTransformListReader = vp8l_transform.ListReader;
 
