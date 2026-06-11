@@ -9,7 +9,7 @@ module shape, test strategy, and edge-case coverage.
 
 ## Progress
 
-Last updated: 2026-06-07
+Last updated: 2026-06-08
 
 - Step 0, Project Foundation: done.
   Package-level API types, resource limits, corpus helpers, current
@@ -19,7 +19,11 @@ Last updated: 2026-06-07
   unknown chunks, trailing data, simple `VP8 `/`VP8L`, `VP8X` feature probing,
   raw metadata exposure, and chunk locations. Static mux/remux writes valid
   canonical chunk ordering and preserves metadata payloads.
-- Step 2, Core Bitstream Infrastructure: next.
+- Step 2, Core Bitstream Infrastructure: done.
+  Bounded little-endian byte readers/writers, LSB-first bit readers/writers,
+  VP8L canonical Huffman table construction/lookup, and VP8 boolean arithmetic
+  reader/writer are implemented with unit, invalid-input, round-trip, and
+  compile-time capacity tests.
 
 ## References
 
@@ -302,11 +306,14 @@ input.
 
 ## Near-Term Work Items
 
-1. Expand `container.zig` into strict demux and mux modules.
-2. Add `Features` and `DecoderOptions` with explicit limits.
-3. Add the optional corpus/oracle test script.
-4. Implement reusable bit readers and Huffman utilities.
-5. Start VP8L decode against the official lossless vectors.
+1. Start VP8L decode against the official lossless vectors.
+2. Parse VP8L signature, dimensions, alpha flag, version, and transform list.
+3. Decode VP8L code-length and image Huffman groups using the shared table
+   builder.
+4. Decode literals, LZ77 backward references, distance mapping, and optional
+   color-cache references.
+5. Add inverse-transform scaffolding and differential pixel checks against
+   `dwebp`.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.

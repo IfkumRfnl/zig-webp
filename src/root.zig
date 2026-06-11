@@ -4,6 +4,8 @@ const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
 
 pub const animation = @import("animation.zig");
+pub const bit_reader = @import("bit_reader.zig");
+pub const bit_writer = @import("bit_writer.zig");
 pub const container = @import("container.zig");
 pub const demux = @import("demux.zig");
 pub const errors = @import("errors.zig");
@@ -14,8 +16,15 @@ pub const metadata = @import("metadata.zig");
 pub const mux = @import("mux.zig");
 pub const options = @import("options.zig");
 pub const testing = @import("testing.zig");
+pub const vp8_bool_reader = @import("vp8/bool_reader.zig");
+pub const vp8_bool_writer = @import("vp8/bool_writer.zig");
+pub const vp8l_huffman = @import("vp8l/huffman.zig");
 
 pub const AnimationFrame = animation.Frame;
+pub const BitReader = bit_reader.BitReader;
+pub const BitWriter = bit_writer.BitWriter;
+pub const ByteReader = bit_reader.ByteReader;
+pub const ByteWriter = bit_writer.ByteWriter;
 pub const ChunkHeader = container.ChunkHeader;
 pub const ChunkKind = container.ChunkKind;
 pub const ChunkLocation = container.ChunkLocation;
@@ -34,6 +43,10 @@ pub const MetadataPayloads = metadata.RawPayloads;
 pub const MuxOptions = mux.Options;
 pub const ResourceLimits = limits.ResourceLimits;
 pub const StaticImage = mux.StaticImage;
+pub const VP8BoolReader = vp8_bool_reader.BoolReader;
+pub const VP8BoolWriter = vp8_bool_writer.BoolWriter;
+pub const VP8LCodeLengthHuffmanTable = vp8l_huffman.CodeLengthTable;
+pub const VP8LHuffmanSymbolTable = vp8l_huffman.SymbolTable;
 
 pub const chunk_header_size = container.chunk_header_size;
 pub const riff_header_size = container.riff_header_size;
@@ -91,4 +104,30 @@ test "root exposes WebP container helpers" {
 test "root public declarations compile" {
     _ = corpus_tests;
     std.testing.refAllDecls(@This());
+}
+
+test "root exposes composable Step 2 bitstream infrastructure" {
+    var lsb_out: [2]u8 = undefined;
+    var bit_writer_instance = BitWriter.init(&lsb_out);
+    try bit_writer_instance.writeBits(0b101, 3);
+    try bit_writer_instance.writeBits(0x1f, 5);
+
+    var bit_reader_instance = BitReader.init(try bit_writer_instance.finish());
+    try std.testing.expectEqual(@as(u32, 0b101), try bit_reader_instance.readBits(3));
+    try std.testing.expectEqual(@as(u32, 0x1f), try bit_reader_instance.readBits(5));
+
+    var bool_out: [8]u8 = undefined;
+    var bool_writer_instance = VP8BoolWriter.init(&bool_out);
+    try bool_writer_instance.writeBool(40, 1);
+    try bool_writer_instance.writeBool(200, 0);
+
+    var bool_reader_instance = try VP8BoolReader.init(try bool_writer_instance.finish());
+    try std.testing.expectEqual(@as(u1, 1), try bool_reader_instance.readBool(40));
+    try std.testing.expectEqual(@as(u1, 0), try bool_reader_instance.readBool(200));
+
+    var entries: [VP8LHuffmanSymbolTable.entry_count_limit]vp8l_huffman.Entry = undefined;
+    const huffman_table = try VP8LHuffmanSymbolTable.build(&entries, &.{ 1, 1 });
+    var huffman_reader = BitReader.init(&.{0});
+
+    try std.testing.expectEqual(@as(u16, 0), try huffman_table.decode(&huffman_reader));
 }
