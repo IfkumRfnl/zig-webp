@@ -9,7 +9,8 @@ feature-probing, RIFF/WebP demux, static mux, bitstream, VP8 boolean coder, and
 VP8L header/transform/Huffman image-data APIs. A limited raw VP8L path can
 materialize no-transform, single-prefix-group ARGB payloads and parse
 meta-prefix entropy images, prefix-code group storage, and multi-group entropy
-streams; full static WebP pixel decode is not available yet.
+streams. Subtract-green inverse transform support is available; full static WebP
+pixel decode is not available yet.
 
 ## Goals
 

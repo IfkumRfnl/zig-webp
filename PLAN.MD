@@ -32,8 +32,9 @@ Last updated: 2026-06-11
   literals, LZ77 copies, color-cache references, and meta-prefix entropy image
   parsing are implemented with focused tests. Multiple Huffman group storage and
   meta-prefix selection during main-image entropy decode are also in place.
-  Remaining work includes inverse transforms, public static decode composition,
-  and differential corpus checks against `dwebp`.
+  Subtract-green inverse transform support is implemented. Remaining work
+  includes predictor/color/color-indexing inverse transforms, public static
+  decode composition, and differential corpus checks against `dwebp`.
 
 ## References
 
@@ -328,6 +329,8 @@ input.
    storage/selection during main-image entropy decode are done.
 6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
+   Subtract-green inverse transform is done; predictor, color transform, and
+   color indexing remain.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.
