@@ -40,6 +40,7 @@ pub const Error = error{
     InvalidSimpleChunk,
     InvalidVP8Header,
     InvalidVP8LHeader,
+    InvalidVP8LImageData,
     InvalidVP8LTransform,
     InvalidWebPSignature,
     MissingAnimationControl,
@@ -53,6 +54,7 @@ pub const Error = error{
     TruncatedChunkHeader,
     TruncatedChunkPayload,
     UnsupportedAnimationMux,
+    UnsupportedVP8LImageData,
     OutOfMemory,
 };
 
@@ -78,11 +80,13 @@ pub fn category(err: Error) Category {
         error.InvalidHuffmanTree,
         error.InvalidVP8Header,
         error.InvalidVP8LHeader,
+        error.InvalidVP8LImageData,
         error.InvalidVP8LTransform,
         error.TruncatedBitstream,
         => .bitstream,
 
         error.UnsupportedAnimationMux,
+        error.UnsupportedVP8LImageData,
         => .unsupported,
 
         error.CorpusUnavailable,
@@ -122,6 +126,7 @@ test "classifies representative errors" {
     try std.testing.expectEqual(Category.resource_limit, category(error.InputTooLarge));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8Header));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidHuffmanTree));
+    try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8LImageData));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8LTransform));
     try std.testing.expectEqual(Category.bitstream, category(error.TruncatedBitstream));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationMux));
