@@ -64,6 +64,14 @@ pub fn decodeARGB(
     while (try transform_reader.readNext(&reader)) |transform_value| {
         const data: TransformData = switch (transform_value) {
             .subtract_green => .{ .none = {} },
+            .predictor => |predictor_transform| .{
+                .block = try decodeTransformImage(
+                    &reader,
+                    predictor_transform.image,
+                    &transform_pixels,
+                    &buffers.prefix_code_group,
+                ),
+            },
             .color => |color_transform| .{
                 .block = try decodeTransformImage(
                     &reader,
@@ -72,7 +80,6 @@ pub fn decodeARGB(
                     &buffers.prefix_code_group,
                 ),
             },
-            .predictor,
             .color_indexing,
             => return error.UnsupportedVP8LImageData,
         };
@@ -152,7 +159,18 @@ fn applyDecodedTransform(
                 output,
             );
         },
-        .predictor,
+        .predictor => |predictor_transform| {
+            const transform_pixels = switch (data) {
+                .block => |pixels| pixels,
+                .none => unreachable,
+            };
+            try inverse_transform.applyPredictorTransform(
+                predictor_transform,
+                transform_pixels,
+                dimensions,
+                output,
+            );
+        },
         .color_indexing,
         => unreachable,
     }
@@ -277,6 +295,39 @@ test "VP8L decoder applies color inverse transform data" {
     try std.testing.expectEqual(pixel.fromChannels(7, 15, 5, 45), output[0]);
 }
 
+test "VP8L decoder applies predictor inverse transform data" {
+    var payload: [header.byte_count + 96]u8 = undefined;
+    writeHeader(payload[0..header.byte_count], 3, 2, false);
+
+    var writer = bit_writer.BitWriter.init(payload[header.byte_count..]);
+    try writer.writeBit(1);
+    try writer.writeBits(@intFromEnum(transform.Kind.predictor), 2);
+    try writer.writeBits(0, 3);
+
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 7, 0, 0, 0);
+
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 10, 10, 10, 0);
+    const image_data_bytes = try writer.finish();
+    const payload_len = header.byte_count + image_data_bytes.len;
+
+    var transform_pixels: [1]pixel.Pixel = undefined;
+    var buffers = WorkBuffers{ .transform_pixels = &transform_pixels };
+    var output: [6]pixel.Pixel = undefined;
+    const result = try decodeARGB(payload[0..payload_len], &output, &buffers);
+
+    try std.testing.expectEqual(@as(u64, 6), result.entropy_summary.pixel_count);
+    try std.testing.expectEqual(pixel.fromChannels(255, 10, 10, 10), output[0]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 20, 20, 20), output[1]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 30, 30, 30), output[2]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 20, 20, 20), output[3]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 30, 30, 30), output[4]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 40, 40, 40), output[5]);
+}
+
 test "VP8L decoder requires storage for color transform data" {
     var payload: [header.byte_count + 1]u8 = undefined;
     writeHeader(payload[0..header.byte_count], 1, 1, false);
@@ -297,13 +348,13 @@ test "VP8L decoder requires storage for color transform data" {
 }
 
 test "VP8L decoder reports unimplemented transforms as unsupported" {
-    var payload: [header.byte_count + 1]u8 = undefined;
+    var payload: [header.byte_count + 2]u8 = undefined;
     writeHeader(payload[0..header.byte_count], 1, 1, false);
 
     var writer = bit_writer.BitWriter.init(payload[header.byte_count..]);
     try writer.writeBit(1);
-    try writer.writeBits(@intFromEnum(transform.Kind.predictor), 2);
-    try writer.writeBits(0, 3);
+    try writer.writeBits(@intFromEnum(transform.Kind.color_indexing), 2);
+    try writer.writeBits(0, 8);
     const image_data_bytes = try writer.finish();
     const payload_len = header.byte_count + image_data_bytes.len;
 
