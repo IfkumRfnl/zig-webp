@@ -45,7 +45,10 @@ pub const Info = struct {
             @as(usize, entropy_x);
         assert(entropy_index < entropy_image.len);
 
-        return code(entropy_image[entropy_index]);
+        const group_index = code(entropy_image[entropy_index]);
+        if (group_index >= self.group_count) return error.InvalidVP8LImageData;
+
+        return group_index;
     }
 };
 
@@ -177,6 +180,24 @@ test "VP8L meta-prefix group lookup uses entropy image blocks" {
     try std.testing.expectError(
         error.InvalidVP8LImageData,
         info.groupIndex(&entropy_pixels, 9, 0),
+    );
+}
+
+test "VP8L meta-prefix group lookup rejects codes outside declared group count" {
+    const info = Info{
+        .prefix_bits = 2,
+        .block_size = 4,
+        .image_dimensions = try image.Dimensions.init(1, 1),
+        .entropy_dimensions = try image.Dimensions.init(1, 1),
+        .group_count = 1,
+    };
+    const entropy_pixels = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 1, 0),
+    };
+
+    try std.testing.expectError(
+        error.InvalidVP8LImageData,
+        info.groupIndex(&entropy_pixels, 0, 0),
     );
 }
 

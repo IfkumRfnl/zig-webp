@@ -10,7 +10,9 @@ const image = @import("../image.zig");
 const image_data = @import("image_data.zig");
 const bit_writer = @import("../bit_writer.zig");
 const color_cache = @import("color_cache.zig");
+const meta_prefix = @import("meta_prefix.zig");
 const pixel = @import("pixel.zig");
+const prefix_groups = @import("prefix_groups.zig");
 
 pub const DecodeSummary = struct {
     pixel_count: u64,
@@ -58,11 +60,111 @@ pub fn decodeWithPrefixCodes(
     return decodeImage(reader, dimensions, cache, prefix_codes, output_pixels);
 }
 
+pub fn decodeWithGroupStore(
+    reader: *bit_reader.BitReader,
+    dimensions: image.Dimensions,
+    color_cache_info: ?image_data.ColorCache,
+    group_store: prefix_groups.Store,
+    meta_prefix_info: meta_prefix.Info,
+    entropy_image: []const pixel.Pixel,
+    output: []pixel.Pixel,
+) errors.Error!DecodeSummary {
+    if (meta_prefix_info.image_dimensions.width != dimensions.width) {
+        return error.InvalidVP8LImageData;
+    }
+    if (meta_prefix_info.image_dimensions.height != dimensions.height) {
+        return error.InvalidVP8LImageData;
+    }
+    if (meta_prefix_info.group_count == 0) return error.InvalidVP8LImageData;
+    if (meta_prefix_info.group_count > meta_prefix.group_count_max) {
+        return error.InvalidVP8LImageData;
+    }
+    if (meta_prefix_info.group_count > group_store.initialized_count) {
+        return error.InvalidVP8LImageData;
+    }
+
+    const pixel_count = try dimensions.pixelCount();
+    if (pixel_count > output.len) return error.OutputTooLarge;
+
+    const output_pixels = output[0..@intCast(pixel_count)];
+    var cache_storage: color_cache.Cache = undefined;
+    const cache = if (color_cache_info) |info| cache: {
+        try cache_storage.init(info.bits);
+        if (cache_storage.size != info.size) return error.InvalidVP8LImageData;
+        break :cache &cache_storage;
+    } else null;
+
+    return decodeImageWithSelector(
+        reader,
+        dimensions,
+        cache,
+        .{
+            .spatial = .{
+                .store = group_store,
+                .meta_prefix_info = meta_prefix_info,
+                .entropy_image = entropy_image,
+            },
+        },
+        output_pixels,
+    );
+}
+
 fn decodeImage(
     reader: *bit_reader.BitReader,
     dimensions: image.Dimensions,
     cache: ?*color_cache.Cache,
     prefix_codes: image_data.PrefixCodeGroup,
+    output: []pixel.Pixel,
+) errors.Error!DecodeSummary {
+    return decodeImageWithSelector(
+        reader,
+        dimensions,
+        cache,
+        .{ .single = prefix_codes },
+        output,
+    );
+}
+
+const PrefixCodeSelector = union(enum) {
+    single: image_data.PrefixCodeGroup,
+    spatial: SpatialPrefixCodeSelector,
+
+    fn group(
+        self: PrefixCodeSelector,
+        dimensions: image.Dimensions,
+        output_index: usize,
+    ) errors.Error!image_data.PrefixCodeGroup {
+        assert(output_index < try dimensions.pixelCount());
+
+        return switch (self) {
+            .single => |prefix_codes| prefix_codes,
+            .spatial => |spatial| {
+                const width: usize = @intCast(dimensions.width);
+                const x: u32 = @intCast(output_index % width);
+                const y: u32 = @intCast(output_index / width);
+
+                return spatial.store.groupForPixel(
+                    spatial.meta_prefix_info,
+                    spatial.entropy_image,
+                    x,
+                    y,
+                );
+            },
+        };
+    }
+};
+
+const SpatialPrefixCodeSelector = struct {
+    store: prefix_groups.Store,
+    meta_prefix_info: meta_prefix.Info,
+    entropy_image: []const pixel.Pixel,
+};
+
+fn decodeImageWithSelector(
+    reader: *bit_reader.BitReader,
+    dimensions: image.Dimensions,
+    cache: ?*color_cache.Cache,
+    selector: PrefixCodeSelector,
     output: []pixel.Pixel,
 ) errors.Error!DecodeSummary {
     assert(output.len == try dimensions.pixelCount());
@@ -76,6 +178,7 @@ fn decodeImage(
 
     var output_index: usize = 0;
     while (output_index < output.len) {
+        const prefix_codes = try selector.group(dimensions, output_index);
         const green_symbol = try prefix_codes.green.decode(reader);
         if (green_symbol < huffman.literal_alphabet_size) {
             const value = try readLiteral(reader, prefix_codes, green_symbol);
@@ -202,6 +305,17 @@ fn writeLiteralOnlyPrefixCodeGroup(writer: *bit_writer.BitWriter) errors.Error!v
     while (code_index < image_data.prefix_code_count) : (code_index += 1) {
         try writeSimplePrefixCode(writer, @intFromBool(code_index == 0));
     }
+}
+
+fn writeConstantPrefixCodeGroup(
+    writer: *bit_writer.BitWriter,
+    green_symbol: u8,
+) errors.Error!void {
+    try writeSimplePrefixCode(writer, green_symbol);
+    try writeSimplePrefixCode(writer, 0);
+    try writeSimplePrefixCode(writer, 0);
+    try writeSimplePrefixCode(writer, 0);
+    try writeSimplePrefixCode(writer, 0);
 }
 
 fn singleSymbolTable(
@@ -351,4 +465,106 @@ test "VP8L entropy resolves color-cache references" {
     try std.testing.expectEqual(@as(u64, 1), summary.color_cache_count);
     try std.testing.expectEqual(cached_pixel, output[0]);
     try std.testing.expectEqual(cached_pixel, output[1]);
+}
+
+test "VP8L entropy selects prefix groups from meta-prefix blocks" {
+    var group_bytes: [32]u8 = undefined;
+    var group_writer = bit_writer.BitWriter.init(&group_bytes);
+    try writeConstantPrefixCodeGroup(&group_writer, 0);
+    try writeConstantPrefixCodeGroup(&group_writer, 1);
+
+    var group_reader = bit_reader.BitReader.init(try group_writer.finish());
+    const buffers = try std.testing.allocator.create(prefix_groups.WorkBuffers);
+    defer std.testing.allocator.destroy(buffers);
+    buffers.* = .{};
+
+    var store = try prefix_groups.Store.readAll(
+        std.testing.allocator,
+        &group_reader,
+        2,
+        0,
+        .{},
+        buffers,
+    );
+    defer store.deinit();
+
+    const info = meta_prefix.Info{
+        .prefix_bits = 2,
+        .block_size = 4,
+        .image_dimensions = try image.Dimensions.init(8, 1),
+        .entropy_dimensions = try image.Dimensions.init(2, 1),
+        .group_count = 2,
+    };
+    const entropy_image = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 0, 0),
+        pixel.fromChannels(0, 0, 1, 0),
+    };
+
+    var image_reader = bit_reader.BitReader.init(&.{});
+    var output: [8]pixel.Pixel = undefined;
+    const summary = try decodeWithGroupStore(
+        &image_reader,
+        try image.Dimensions.init(8, 1),
+        null,
+        store,
+        info,
+        &entropy_image,
+        &output,
+    );
+
+    try std.testing.expectEqual(@as(u64, 8), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 8), summary.literal_count);
+    for (output[0..4]) |value| {
+        try std.testing.expectEqual(pixel.fromChannels(0, 0, 0, 0), value);
+    }
+    for (output[4..8]) |value| {
+        try std.testing.expectEqual(pixel.fromChannels(0, 0, 1, 0), value);
+    }
+}
+
+test "VP8L entropy rejects meta-prefix groups that were not read" {
+    var group_bytes: [16]u8 = undefined;
+    var group_writer = bit_writer.BitWriter.init(&group_bytes);
+    try writeConstantPrefixCodeGroup(&group_writer, 0);
+
+    var group_reader = bit_reader.BitReader.init(try group_writer.finish());
+    const buffers = try std.testing.allocator.create(prefix_groups.WorkBuffers);
+    defer std.testing.allocator.destroy(buffers);
+    buffers.* = .{};
+
+    var store = try prefix_groups.Store.readAll(
+        std.testing.allocator,
+        &group_reader,
+        1,
+        0,
+        .{},
+        buffers,
+    );
+    defer store.deinit();
+
+    const info = meta_prefix.Info{
+        .prefix_bits = 2,
+        .block_size = 4,
+        .image_dimensions = try image.Dimensions.init(4, 1),
+        .entropy_dimensions = try image.Dimensions.init(1, 1),
+        .group_count = 2,
+    };
+    const entropy_image = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 1, 0),
+    };
+
+    var image_reader = bit_reader.BitReader.init(&.{});
+    var output: [4]pixel.Pixel = undefined;
+    try std.testing.expectError(
+        error.InvalidVP8LImageData,
+        decodeWithGroupStore(
+            &image_reader,
+            try image.Dimensions.init(4, 1),
+            null,
+            store,
+            info,
+            &entropy_image,
+            &output,
+        ),
+    );
 }
