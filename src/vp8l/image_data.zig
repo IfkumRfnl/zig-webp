@@ -219,7 +219,7 @@ fn scanEntropyCodedImage(
     return summary;
 }
 
-fn readPrefixValue(reader: *bit_reader.BitReader, prefix_code: u8) errors.Error!u32 {
+pub fn readPrefixValue(reader: *bit_reader.BitReader, prefix_code: u8) errors.Error!u32 {
     if (prefix_code >= huffman.distance_alphabet_size) return error.InvalidVP8LImageData;
     if (prefix_code < 4) return @as(u32, prefix_code) + 1;
 
@@ -229,7 +229,7 @@ fn readPrefixValue(reader: *bit_reader.BitReader, prefix_code: u8) errors.Error!
     return offset + try reader.readBits(extra_bits) + 1;
 }
 
-fn distanceFromCode(distance_code: u32, image_width: u32) u64 {
+pub fn distanceFromCode(distance_code: u32, image_width: u32) u64 {
     assert(distance_code > 0);
     assert(image_width > 0);
 

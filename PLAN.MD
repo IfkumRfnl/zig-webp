@@ -27,11 +27,12 @@ Last updated: 2026-06-11
 - Step 3, VP8L Lossless Decoder: in progress.
   VP8L image header parsing, transform-list parsing and dimension bookkeeping,
   single-prefix-group image-data Huffman parsing, code-length repeat handling,
-  color-cache metadata validation, distance mapping, and bounded entropy-stream
-  scanning are implemented with focused tests. Remaining work includes
-  meta-prefix images and multiple Huffman groups, pixel materialization from
-  literals, LZ77 copies, and color-cache references, inverse transforms, and
-  differential corpus checks against `dwebp`.
+  color-cache metadata validation, distance mapping, bounded entropy-stream
+  scanning, and no-transform single-prefix-group ARGB materialization for
+  literals, LZ77 copies, and color-cache references are implemented with focused
+  tests. Remaining work includes meta-prefix images and multiple Huffman groups,
+  inverse transforms, public static decode composition, and differential corpus
+  checks against `dwebp`.
 
 ## References
 
@@ -319,9 +320,9 @@ input.
    list.
 3. Done for single-prefix-group scope: decode VP8L code-length and image
    Huffman groups using the shared table builder.
-4. Next: support meta-prefix images and multiple Huffman groups.
-5. Next: materialize pixels from literals, LZ77 backward references, distance
-   mapping, and optional color-cache references.
+4. Done for single-prefix-group scope: materialize pixels from literals, LZ77
+   backward references, distance mapping, and optional color-cache references.
+5. Next: support meta-prefix images and multiple Huffman groups.
 6. Next: implement inverse transforms and differential pixel checks against
    `dwebp`.
 
