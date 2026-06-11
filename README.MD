@@ -3,9 +3,11 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
-Status: foundation. The current library exposes bounded public option, limit,
-image-buffer, metadata, animation-frame, feature-probing, RIFF/WebP demux, and
-static mux APIs. Pixel decode and codec internals are still future work.
+Status: VP8L decoder groundwork in progress. The current library exposes
+bounded public option, limit, image-buffer, metadata, animation-frame,
+feature-probing, RIFF/WebP demux, static mux, bitstream, VP8 boolean coder, and
+VP8L header/transform/Huffman image-data APIs. Static pixel decode is not
+available yet.
 
 ## Goals
 

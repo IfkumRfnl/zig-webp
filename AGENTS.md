@@ -6,6 +6,8 @@
 - External codec tools and cloned reference repositories may be used for local
   research, tests, and differential validation. Keep them under `references/`
   and out of the package build. They must not become build dependencies.
+- Keep `README.MD` and `PLAN.MD` up-to-date when behavior, scope, roadmap, or
+  usage changes.
 - Keep public API declarations in `src/root.zig`; place implementation modules
   under `src/`.
 - Keep codec subsystems modular. RIFF mux/demux, VP8, VP8L, alpha, animation,
