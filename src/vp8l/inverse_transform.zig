@@ -8,6 +8,9 @@ const image = @import("../image.zig");
 const pixel = @import("pixel.zig");
 const transform = @import("transform.zig");
 
+const predictor_mode_count = 14;
+const predictor_black = pixel.fromChannels(255, 0, 0, 0);
+
 pub fn applyTransform(
     transform_value: transform.Transform,
     dimensions: image.Dimensions,
@@ -23,6 +26,52 @@ pub fn applyTransform(
         .color,
         .color_indexing,
         => return error.UnsupportedVP8LImageData,
+    }
+}
+
+pub fn applyPredictorTransform(
+    predictor_transform: transform.BlockTransform,
+    predictor_data: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    pixels: []pixel.Pixel,
+) errors.Error!void {
+    try validateBlockTransform(predictor_transform, dimensions);
+
+    const predictor_pixel_count = try predictor_transform.image.pixelCount();
+    if (predictor_data.len < predictor_pixel_count) return error.InvalidVP8LTransform;
+
+    const predictor_pixels = predictor_data[0..@intCast(predictor_pixel_count)];
+    try validatePredictorModes(predictor_pixels);
+
+    const pixel_count = try dimensions.pixelCount();
+    if (pixels.len < pixel_count) return error.OutputTooLarge;
+
+    const width: usize = @intCast(dimensions.width);
+    const height: usize = @intCast(dimensions.height);
+    const transform_width: usize = @intCast(predictor_transform.image.width);
+    const block_bits: u5 = @intCast(predictor_transform.block_bits);
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            const pixel_index = y * width + x;
+            const transform_x = x >> block_bits;
+            const transform_y = y >> block_bits;
+            const transform_index = transform_y * transform_width + transform_x;
+            assert(transform_index < predictor_pixels.len);
+
+            const mode = pixel.green(predictor_pixels[transform_index]);
+            assert(mode < predictor_mode_count);
+
+            const prediction = predictorForPosition(mode, .{
+                .x = x,
+                .y = y,
+                .width = width,
+                .pixels = pixels[0..@intCast(pixel_count)],
+            });
+            pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], prediction);
+        }
     }
 }
 
@@ -178,6 +227,182 @@ fn addDelta(value: u8, delta: i32) u8 {
     return @intCast(@mod(@as(i32, value) + delta, 256));
 }
 
+const PredictorPosition = struct {
+    x: usize,
+    y: usize,
+    width: usize,
+    pixels: []const pixel.Pixel,
+};
+
+const PredictorNeighbors = struct {
+    left: pixel.Pixel,
+    top: pixel.Pixel,
+    top_right: pixel.Pixel,
+    top_left: pixel.Pixel,
+};
+
+fn validatePredictorModes(predictor_data: []const pixel.Pixel) errors.Error!void {
+    for (predictor_data) |entry| {
+        if (pixel.green(entry) >= predictor_mode_count) return error.InvalidVP8LTransform;
+    }
+}
+
+fn predictorForPosition(mode: u8, position: PredictorPosition) pixel.Pixel {
+    assert(mode < predictor_mode_count);
+    assert(position.width > 0);
+    assert(position.x < position.width);
+
+    if (position.y == 0) {
+        if (position.x == 0) return predictor_black;
+
+        return position.pixels[position.x - 1];
+    }
+
+    const row_start = position.y * position.width;
+    const pixel_index = row_start + position.x;
+    if (position.x == 0) return position.pixels[pixel_index - position.width];
+
+    const top_right = if (position.x + 1 < position.width)
+        position.pixels[pixel_index - position.width + 1]
+    else
+        position.pixels[row_start];
+
+    return predictPixel(mode, .{
+        .left = position.pixels[pixel_index - 1],
+        .top = position.pixels[pixel_index - position.width],
+        .top_right = top_right,
+        .top_left = position.pixels[pixel_index - position.width - 1],
+    });
+}
+
+fn predictPixel(mode: u8, neighbors: PredictorNeighbors) pixel.Pixel {
+    assert(mode < predictor_mode_count);
+
+    return switch (mode) {
+        0 => predictor_black,
+        1 => neighbors.left,
+        2 => neighbors.top,
+        3 => neighbors.top_right,
+        4 => neighbors.top_left,
+        5 => averagePixels(averagePixels(neighbors.left, neighbors.top_right), neighbors.top),
+        6 => averagePixels(neighbors.left, neighbors.top_left),
+        7 => averagePixels(neighbors.left, neighbors.top),
+        8 => averagePixels(neighbors.top_left, neighbors.top),
+        9 => averagePixels(neighbors.top, neighbors.top_right),
+        10 => averagePixels(
+            averagePixels(neighbors.left, neighbors.top_left),
+            averagePixels(neighbors.top, neighbors.top_right),
+        ),
+        11 => selectPixel(neighbors.left, neighbors.top, neighbors.top_left),
+        12 => clampAddSubtractFullPixel(neighbors.left, neighbors.top, neighbors.top_left),
+        13 => clampAddSubtractHalfPixel(
+            averagePixels(neighbors.left, neighbors.top),
+            neighbors.top_left,
+        ),
+        else => unreachable,
+    };
+}
+
+fn addPixelsModulo(residual: pixel.Pixel, prediction: pixel.Pixel) pixel.Pixel {
+    return pixel.fromChannels(
+        pixel.alpha(residual) +% pixel.alpha(prediction),
+        pixel.red(residual) +% pixel.red(prediction),
+        pixel.green(residual) +% pixel.green(prediction),
+        pixel.blue(residual) +% pixel.blue(prediction),
+    );
+}
+
+fn averagePixels(a: pixel.Pixel, b: pixel.Pixel) pixel.Pixel {
+    return pixel.fromChannels(
+        averageChannel(pixel.alpha(a), pixel.alpha(b)),
+        averageChannel(pixel.red(a), pixel.red(b)),
+        averageChannel(pixel.green(a), pixel.green(b)),
+        averageChannel(pixel.blue(a), pixel.blue(b)),
+    );
+}
+
+fn averageChannel(a: u8, b: u8) u8 {
+    return @intCast((@as(u16, a) + @as(u16, b)) / 2);
+}
+
+fn selectPixel(left: pixel.Pixel, top: pixel.Pixel, top_left: pixel.Pixel) pixel.Pixel {
+    const alpha_estimate = channelEstimate(
+        pixel.alpha(left),
+        pixel.alpha(top),
+        pixel.alpha(top_left),
+    );
+    const red_estimate = channelEstimate(pixel.red(left), pixel.red(top), pixel.red(top_left));
+    const green_estimate = channelEstimate(
+        pixel.green(left),
+        pixel.green(top),
+        pixel.green(top_left),
+    );
+    const blue_estimate = channelEstimate(pixel.blue(left), pixel.blue(top), pixel.blue(top_left));
+
+    const left_distance = channelDistance(alpha_estimate, pixel.alpha(left)) +
+        channelDistance(red_estimate, pixel.red(left)) +
+        channelDistance(green_estimate, pixel.green(left)) +
+        channelDistance(blue_estimate, pixel.blue(left));
+    const top_distance = channelDistance(alpha_estimate, pixel.alpha(top)) +
+        channelDistance(red_estimate, pixel.red(top)) +
+        channelDistance(green_estimate, pixel.green(top)) +
+        channelDistance(blue_estimate, pixel.blue(top));
+
+    if (left_distance < top_distance) return left;
+
+    return top;
+}
+
+fn channelEstimate(left: u8, top: u8, top_left: u8) i32 {
+    return @as(i32, left) + @as(i32, top) - @as(i32, top_left);
+}
+
+fn channelDistance(estimate: i32, value: u8) u32 {
+    const difference = estimate - @as(i32, value);
+    if (difference < 0) return @intCast(-difference);
+
+    return @intCast(difference);
+}
+
+fn clampAddSubtractFullPixel(
+    left: pixel.Pixel,
+    top: pixel.Pixel,
+    top_left: pixel.Pixel,
+) pixel.Pixel {
+    return pixel.fromChannels(
+        clampAddSubtractFullChannel(pixel.alpha(left), pixel.alpha(top), pixel.alpha(top_left)),
+        clampAddSubtractFullChannel(pixel.red(left), pixel.red(top), pixel.red(top_left)),
+        clampAddSubtractFullChannel(pixel.green(left), pixel.green(top), pixel.green(top_left)),
+        clampAddSubtractFullChannel(pixel.blue(left), pixel.blue(top), pixel.blue(top_left)),
+    );
+}
+
+fn clampAddSubtractFullChannel(left: u8, top: u8, top_left: u8) u8 {
+    return clampChannel(@as(i32, left) + @as(i32, top) - @as(i32, top_left));
+}
+
+fn clampAddSubtractHalfPixel(average: pixel.Pixel, top_left: pixel.Pixel) pixel.Pixel {
+    return pixel.fromChannels(
+        clampAddSubtractHalfChannel(pixel.alpha(average), pixel.alpha(top_left)),
+        clampAddSubtractHalfChannel(pixel.red(average), pixel.red(top_left)),
+        clampAddSubtractHalfChannel(pixel.green(average), pixel.green(top_left)),
+        clampAddSubtractHalfChannel(pixel.blue(average), pixel.blue(top_left)),
+    );
+}
+
+fn clampAddSubtractHalfChannel(average: u8, top_left: u8) u8 {
+    const difference = @as(i32, average) - @as(i32, top_left);
+
+    return clampChannel(@as(i32, average) + @divTrunc(difference, 2));
+}
+
+fn clampChannel(value: i32) u8 {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+
+    return @intCast(value);
+}
+
 fn validateBlockTransform(
     block_transform: transform.BlockTransform,
     dimensions: image.Dimensions,
@@ -283,6 +508,111 @@ test "VP8L inverse transform dispatcher rejects unimplemented transforms" {
         error.UnsupportedVP8LImageData,
         applyTransform(.{ .predictor = block }, dimensions, &pixels),
     );
+}
+
+test "VP8L inverse predictor transform applies borders and average mode" {
+    const dimensions = try image.Dimensions.init(3, 2);
+    const predictor_transform = transform.BlockTransform{
+        .block_bits = transform.block_bits_min,
+        .block_size = @as(u32, 1) << transform.block_bits_min,
+        .image = try image.Dimensions.init(1, 1),
+    };
+    const predictor_data = [_]pixel.Pixel{pixel.fromChannels(0, 0, 7, 0)};
+    var pixels = [_]pixel.Pixel{
+        pixel.fromChannels(0, 10, 10, 10),
+        pixel.fromChannels(0, 10, 10, 10),
+        pixel.fromChannels(0, 10, 10, 10),
+        pixel.fromChannels(0, 10, 10, 10),
+        pixel.fromChannels(0, 10, 10, 10),
+        pixel.fromChannels(0, 10, 10, 10),
+    };
+
+    try applyPredictorTransform(predictor_transform, &predictor_data, dimensions, &pixels);
+
+    try std.testing.expectEqual(pixel.fromChannels(255, 10, 10, 10), pixels[0]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 20, 20, 20), pixels[1]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 30, 30, 30), pixels[2]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 20, 20, 20), pixels[3]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 30, 30, 30), pixels[4]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 40, 40, 40), pixels[5]);
+}
+
+test "VP8L inverse predictor transform uses row start as right-column top-right" {
+    const dimensions = try image.Dimensions.init(3, 2);
+    const predictor_transform = transform.BlockTransform{
+        .block_bits = transform.block_bits_min,
+        .block_size = @as(u32, 1) << transform.block_bits_min,
+        .image = try image.Dimensions.init(1, 1),
+    };
+    const predictor_data = [_]pixel.Pixel{pixel.fromChannels(0, 0, 3, 0)};
+    var pixels = [_]pixel.Pixel{
+        pixel.fromChannels(0, 10, 0, 0),
+        pixel.fromChannels(0, 20, 0, 0),
+        pixel.fromChannels(0, 30, 0, 0),
+        pixel.fromChannels(0, 1, 0, 0),
+        pixel.fromChannels(0, 2, 0, 0),
+        pixel.fromChannels(0, 3, 0, 0),
+    };
+
+    try applyPredictorTransform(predictor_transform, &predictor_data, dimensions, &pixels);
+
+    try std.testing.expectEqual(pixel.fromChannels(255, 10, 0, 0), pixels[0]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 30, 0, 0), pixels[1]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 60, 0, 0), pixels[2]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 11, 0, 0), pixels[3]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 62, 0, 0), pixels[4]);
+    try std.testing.expectEqual(pixel.fromChannels(255, 14, 0, 0), pixels[5]);
+}
+
+test "VP8L predictor modes implement select and clamp arithmetic" {
+    const select_neighbors = PredictorNeighbors{
+        .left = pixel.fromChannels(10, 10, 10, 10),
+        .top = pixel.fromChannels(20, 20, 20, 20),
+        .top_right = pixel.fromChannels(0, 0, 0, 0),
+        .top_left = pixel.fromChannels(0, 0, 0, 0),
+    };
+    const clamp_full_neighbors = PredictorNeighbors{
+        .left = pixel.fromChannels(250, 250, 250, 250),
+        .top = pixel.fromChannels(20, 20, 20, 20),
+        .top_right = pixel.fromChannels(0, 0, 0, 0),
+        .top_left = pixel.fromChannels(10, 10, 10, 10),
+    };
+    const clamp_half_neighbors = PredictorNeighbors{
+        .left = pixel.fromChannels(20, 20, 20, 20),
+        .top = pixel.fromChannels(30, 30, 30, 30),
+        .top_right = pixel.fromChannels(0, 0, 0, 0),
+        .top_left = pixel.fromChannels(100, 100, 100, 100),
+    };
+
+    try std.testing.expectEqual(
+        pixel.fromChannels(20, 20, 20, 20),
+        predictPixel(11, select_neighbors),
+    );
+    try std.testing.expectEqual(
+        pixel.fromChannels(255, 255, 255, 255),
+        predictPixel(12, clamp_full_neighbors),
+    );
+    try std.testing.expectEqual(
+        pixel.fromChannels(0, 0, 0, 0),
+        predictPixel(13, clamp_half_neighbors),
+    );
+}
+
+test "VP8L inverse predictor transform rejects invalid modes before mutation" {
+    const dimensions = try image.Dimensions.init(1, 1);
+    const predictor_transform = transform.BlockTransform{
+        .block_bits = transform.block_bits_min,
+        .block_size = @as(u32, 1) << transform.block_bits_min,
+        .image = try image.Dimensions.init(1, 1),
+    };
+    const predictor_data = [_]pixel.Pixel{pixel.fromChannels(0, 0, 14, 0)};
+    var pixels = [_]pixel.Pixel{pixel.fromChannels(1, 2, 3, 4)};
+
+    try std.testing.expectError(
+        error.InvalidVP8LTransform,
+        applyPredictorTransform(predictor_transform, &predictor_data, dimensions, &pixels),
+    );
+    try std.testing.expectEqual(pixel.fromChannels(1, 2, 3, 4), pixels[0]);
 }
 
 test "VP8L inverse color transform applies signed 3.5 fixed-point deltas" {
