@@ -12,11 +12,15 @@ const header = @import("header.zig");
 const image = @import("../image.zig");
 const image_data = @import("image_data.zig");
 const inverse_transform = @import("inverse_transform.zig");
+const meta_prefix = @import("meta_prefix.zig");
 const pixel = @import("pixel.zig");
+const prefix_groups = @import("prefix_groups.zig");
 const transform = @import("transform.zig");
 
 pub const WorkBuffers = struct {
     prefix_code_group: image_data.PrefixCodeGroupBuffers = .{},
+    prefix_groups: prefix_groups.WorkBuffers = .{},
+    entropy_image: []pixel.Pixel = &.{},
     transform_pixels: []pixel.Pixel = &.{},
 };
 
@@ -50,6 +54,24 @@ const TransformPixelStore = struct {
 };
 
 pub fn decodeARGB(
+    payload: []const u8,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!Result {
+    return decodeARGBInternal(null, payload, output, buffers);
+}
+
+pub fn decodeARGBAlloc(
+    gpa: std.mem.Allocator,
+    payload: []const u8,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!Result {
+    return decodeARGBInternal(gpa, payload, output, buffers);
+}
+
+fn decodeARGBInternal(
+    gpa: ?std.mem.Allocator,
     payload: []const u8,
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
@@ -101,12 +123,12 @@ pub fn decodeARGB(
         transform_count += 1;
     }
 
-    const entropy_summary = try entropy.decodeSingleGroup(
+    const entropy_summary = try decodeMainImage(
+        gpa,
         &reader,
         transform_reader.currentDimensions(),
-        .argb,
         output,
-        &buffers.prefix_code_group,
+        buffers,
     );
 
     var transform_index = transform_count;
@@ -124,6 +146,59 @@ pub fn decodeARGB(
         .header = parsed_header,
         .entropy_summary = entropy_summary,
     };
+}
+
+fn decodeMainImage(
+    gpa: ?std.mem.Allocator,
+    reader: *bit_reader.BitReader,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!entropy.DecodeSummary {
+    const color_cache = try image_data.readColorCache(reader);
+    const meta_prefix_present = try reader.readBit();
+    if (meta_prefix_present == 0) {
+        const prefix_codes = try image_data.readPrefixCodeGroup(
+            reader,
+            image_data.colorCacheSize(color_cache),
+            &buffers.prefix_code_group,
+        );
+
+        return entropy.decodeWithPrefixCodes(
+            reader,
+            dimensions,
+            color_cache,
+            prefix_codes,
+            output,
+        );
+    }
+
+    const allocator = gpa orelse return error.UnsupportedVP8LImageData;
+    const info = try meta_prefix.readEntropyImage(
+        reader,
+        dimensions,
+        buffers.entropy_image,
+        &buffers.prefix_code_group,
+    );
+    var group_store = try prefix_groups.Store.readAll(
+        allocator,
+        reader,
+        info.group_count,
+        image_data.colorCacheSize(color_cache),
+        .{},
+        &buffers.prefix_groups,
+    );
+    defer group_store.deinit();
+
+    return entropy.decodeWithGroupStore(
+        reader,
+        dimensions,
+        color_cache,
+        group_store,
+        info,
+        buffers.entropy_image,
+        output,
+    );
 }
 
 fn decodeTransformImage(
@@ -287,6 +362,46 @@ test "VP8L decoder materializes a no-transform single-group payload" {
     try std.testing.expectEqual(@as(u64, 2), result.entropy_summary.pixel_count);
     try std.testing.expectEqual(pixel.fromChannels(0, 0, 1, 0), output[0]);
     try std.testing.expectEqual(pixel.fromChannels(0, 0, 1, 0), output[1]);
+}
+
+test "VP8L decoder materializes a main-image meta-prefix payload" {
+    var payload: [header.byte_count + 64]u8 = undefined;
+    writeHeader(payload[0..header.byte_count], 3, 1, false);
+
+    var writer = bit_writer.BitWriter.init(payload[header.byte_count..]);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writer.writeBit(1);
+    try writer.writeBits(0, 3);
+
+    try writer.writeBit(0);
+    try writeConstantPrefixCodeGroup(&writer, 0, 0, 0, 0);
+
+    try writeConstantPrefixCodeGroup(&writer, 2, 1, 3, 4);
+    const image_data_bytes = try writer.finish();
+    const payload_len = header.byte_count + image_data_bytes.len;
+
+    var unsupported_buffers: WorkBuffers = .{};
+    var unsupported_output: [3]pixel.Pixel = undefined;
+    try std.testing.expectError(
+        error.UnsupportedVP8LImageData,
+        decodeARGB(payload[0..payload_len], &unsupported_output, &unsupported_buffers),
+    );
+
+    var entropy_image: [1]pixel.Pixel = undefined;
+    var buffers = WorkBuffers{ .entropy_image = &entropy_image };
+    var output: [3]pixel.Pixel = undefined;
+    const result = try decodeARGBAlloc(
+        std.testing.allocator,
+        payload[0..payload_len],
+        &output,
+        &buffers,
+    );
+
+    try std.testing.expectEqual(@as(u64, 3), result.entropy_summary.pixel_count);
+    try std.testing.expectEqual(pixel.fromChannels(4, 1, 2, 3), output[0]);
+    try std.testing.expectEqual(pixel.fromChannels(4, 1, 2, 3), output[1]);
+    try std.testing.expectEqual(pixel.fromChannels(4, 1, 2, 3), output[2]);
 }
 
 test "VP8L decoder applies subtract-green inverse transform" {
