@@ -1196,3 +1196,30 @@ test "enforces configured allocation limits" {
         }),
     );
 }
+
+test "fuzz strict demux" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8l = makeSimpleVP8L(2, 5, true);
+    const payload_size = container.chunk_header_size + vp8l.len + 1;
+    var file_buffer: [container.riff_header_size + payload_size]u8 = undefined;
+    @memcpy(file_buffer[0..4], "RIFF");
+    container.writeLittleU32(file_buffer[4..8], @intCast(file_buffer.len - 8));
+    @memcpy(file_buffer[8..12], "WEBP");
+    var offset: usize = 12;
+    writeChunk(&file_buffer, &offset, "VP8L", &vp8l);
+    assert(offset == file_buffer.len);
+
+    var seed_buffer: [file_buffer.len + testing_fuzz.slice_length_prefix_size]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, &file_buffer);
+
+    try std.testing.fuzz({}, fuzzParseOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [2048]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+
+    var result = parse(std.testing.allocator, input_buffer[0..input_len], .{}) catch return;
+    result.deinit();
+}

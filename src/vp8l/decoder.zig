@@ -603,3 +603,50 @@ test "VP8L decoder requires storage for color-indexing transform data" {
         decodeARGB(payload[0..payload_len], &output, &buffers),
     );
 }
+
+test "fuzz VP8L still-image decode" {
+    const testing_fuzz = @import("../testing/fuzz.zig");
+
+    var payload: [header.byte_count + 16]u8 = undefined;
+    writeHeader(payload[0..header.byte_count], 2, 1, false);
+    var writer = bit_writer.BitWriter.init(payload[header.byte_count..]);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writeLiteralOnlyPrefixCodeGroup(&writer);
+    const image_data_bytes = try writer.finish();
+    const payload_len = header.byte_count + image_data_bytes.len;
+
+    var seed_buffer: [payload.len + testing_fuzz.slice_length_prefix_size]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, payload[0..payload_len]);
+
+    try std.testing.fuzz({}, fuzzDecodeARGBOne, .{ .corpus = &.{seed} });
+}
+
+const fuzz_pixel_count_max = 1 << 12;
+
+fn fuzzDecodeARGBOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [1024]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+    const payload = input_buffer[0..input_len];
+
+    const parsed_header = header.parse(payload) catch return;
+    const pixel_count = parsed_header.dimensions.pixelCount() catch return;
+    if (pixel_count > fuzz_pixel_count_max) return;
+
+    const gpa = std.testing.allocator;
+    const count: usize = @intCast(pixel_count);
+    const output = try gpa.alloc(pixel.Pixel, count);
+    defer gpa.free(output);
+    const transform_pixels = try gpa.alloc(pixel.Pixel, count + 257);
+    defer gpa.free(transform_pixels);
+    const entropy_pixels = try gpa.alloc(pixel.Pixel, count);
+    defer gpa.free(entropy_pixels);
+
+    var buffers = WorkBuffers{
+        .transform_pixels = transform_pixels,
+        .entropy_image = entropy_pixels,
+        .prefix_group_options = .{ .allocation_bytes_max = 1 << 20 },
+    };
+    _ = decodeARGBAlloc(gpa, payload, output, &buffers) catch return;
+}
