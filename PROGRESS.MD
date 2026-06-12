@@ -16,6 +16,16 @@ in `PLAN.MD` remain open and should land before reconstruction goes deeper.
 
 ## Cross-Cutting Practices
 
+CI runs on every pull request and push to main
+(`.github/workflows/ci.yml`): `zig fmt --check .` and `zig build test` on
+Zig 0.16.0. The test suite includes a hash-based corpus regression
+(`src/testing/corpus.zig`): decoded RGBA planes of all 43 still lossless
+files and decoded alpha planes of all 18 ALPH-bearing files (61 rows) are
+compared against committed SHA-256 hashes in `testdata/corpus-hashes.tsv`,
+so CI needs no `dwebp`. The hashes lock the decoded planes that matched
+`dwebp` byte-for-byte in the dated oracle runs below; regenerate with
+`zig build corpus-hashes` only after a fresh corpus-wide oracle run.
+
 Fuzz smoke targets are in place for every public decode entry point: strict
 demux (`src/demux.zig`), VP8L still-image decode (`src/vp8l/decoder.zig`),
 alpha plane decode (`src/alpha.zig`), VP8 key-frame header parsing
