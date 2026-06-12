@@ -3,6 +3,7 @@
 const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
 
+pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
@@ -31,6 +32,10 @@ pub const vp8l_pixel = @import("vp8l/pixel.zig");
 pub const vp8l_prefix_groups = @import("vp8l/prefix_groups.zig");
 pub const vp8l_transform = @import("vp8l/transform.zig");
 
+pub const AlphaCompression = alpha.Compression;
+pub const AlphaFilter = alpha.Filter;
+pub const AlphaHeader = alpha.Header;
+pub const AlphaPreprocessing = alpha.Preprocessing;
 pub const AnimationFrame = animation.Frame;
 pub const BitReader = bit_reader.BitReader;
 pub const BitWriter = bit_writer.BitWriter;
