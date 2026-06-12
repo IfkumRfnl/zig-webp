@@ -10,8 +10,30 @@ Last updated: 2026-06-12
 
 Steps 0 through 4 are complete for their static scopes. Composing decoded
 alpha planes over lossy VP8 color output is folded into step 5 because it
-needs the VP8 decoder. Next up is step 5, the VP8 lossy decoder, preceded by
-the near-term fuzzing and CI items listed in `PLAN.MD`.
+needs the VP8 decoder. Step 5 reconstruction has started: key-frame header
+parsing is in place (see below). The near-term fuzzing and CI items listed
+in `PLAN.MD` remain open and should land before reconstruction goes deeper.
+
+## In Progress
+
+### Step 5 — VP8 Lossy Decoder
+
+Key-frame header parsing is implemented in `src/vp8/frame_header.zig` on top
+of the existing boolean reader: frame tag (key-frame/version/show-frame
+validation), picture header (start code, dimensions, scale codes), and the
+compressed first-partition header through color space, segmentation, loop
+filter, token partition layout, quantizer indices, `refresh_entropy_probs`,
+DCT coefficient probability updates, and the skip probability. The RFC 6386
+default and update token probability tables live in
+`src/vp8/token_probs.zig`, transcribed from the normative tables and
+cross-checked value-for-value between `references/libwebp` and
+`references/ffmpeg` before committing. The returned reader is positioned at
+the macroblock prediction records for the next slice. All 88 lossy still
+files in the committed corpus parse with dimensions matching demux features.
+
+Not yet started: macroblock mode parsing, dequantization, intra prediction,
+inverse transforms, loop filtering, YUV output, and the `compare-yuv`
+oracle mode.
 
 ## Completed Steps
 
