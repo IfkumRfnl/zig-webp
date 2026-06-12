@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Format, tests, and corpus regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      # The unit test suite includes the hash-based corpus regression:
+      # decoded RGBA and alpha planes of the committed corpus are compared
+      # against SHA-256 hashes in testdata/corpus-hashes.tsv, so CI needs
+      # no dwebp. Full dwebp/cwebp differential runs stay local via
+      # tools/webp-oracle.sh.
+      - name: Run tests
+        run: zig build test

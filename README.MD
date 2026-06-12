@@ -35,3 +35,10 @@ tools/webp-oracle.sh compare-alpha-corpus .zig-cache/alpha-diff references/libwe
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
+
+`zig build test` includes a hash-based corpus regression: decoded RGBA and
+alpha planes of the committed corpus in `testdata/libwebp-test-data` are
+compared against SHA-256 hashes in `testdata/corpus-hashes.tsv`, so the
+check needs no `dwebp`. CI runs `zig fmt --check .` and `zig build test` on
+every pull request. Regenerate the manifest with `zig build corpus-hashes`
+only after a corpus-wide oracle run confirms the decoded planes.

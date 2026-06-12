@@ -58,6 +58,28 @@ pub fn build(b: *std.Build) void {
     const alpha_step = b.step("alpha", "Decode a WebP ALPH chunk to a raw alpha plane");
     alpha_step.dependOn(&run_alpha_tool.step);
 
+    const corpus_hashes_tool = b.addExecutable(.{
+        .name = "zig-webp-corpus-hashes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-corpus-hashes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    const run_corpus_hashes_tool = b.addRunArtifact(corpus_hashes_tool);
+    run_corpus_hashes_tool.setCwd(b.path("."));
+    if (b.args) |args| {
+        run_corpus_hashes_tool.addArgs(args);
+    }
+    const corpus_hashes_step = b.step(
+        "corpus-hashes",
+        "Regenerate testdata/corpus-hashes.tsv from decoded corpus planes",
+    );
+    corpus_hashes_step.dependOn(&run_corpus_hashes_tool.step);
+
     const unit_tests = b.addTest(.{
         .root_module = webp_module,
     });
