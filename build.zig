@@ -58,6 +58,25 @@ pub fn build(b: *std.Build) void {
     const alpha_step = b.step("alpha", "Decode a WebP ALPH chunk to a raw alpha plane");
     alpha_step.dependOn(&run_alpha_tool.step);
 
+    const yuv_tool = b.addExecutable(.{
+        .name = "zig-webp-yuv",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-yuv.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    b.installArtifact(yuv_tool);
+    const run_yuv_tool = b.addRunArtifact(yuv_tool);
+    if (b.args) |args| {
+        run_yuv_tool.addArgs(args);
+    }
+    const yuv_step = b.step("yuv", "Decode a lossy WebP to raw YUV planes");
+    yuv_step.dependOn(&run_yuv_tool.step);
+
     const corpus_hashes_tool = b.addExecutable(.{
         .name = "zig-webp-corpus-hashes",
         .root_module = b.createModule(.{
