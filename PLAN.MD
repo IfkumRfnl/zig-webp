@@ -46,11 +46,13 @@ Last updated: 2026-06-12
   vertical/gradient unfilters, and VP8L-compressed alpha decode through the
   headerless VP8L image-stream entry point are implemented in `src/alpha.zig`
   with unit, invalid-input, filter round-trip, and corpus decode tests.
-  On 2026-06-12 a local manual diff matched the decoded alpha planes of all
-  17 alpha-bearing corpus files against `dwebp -alpha -pgm` byte-for-byte
-  (both methods, all four filters, color cache). Composition with lossy VP8
-  color output awaits the VP8 decoder; committed alpha oracle tooling is not
-  written yet.
+  The committed oracle workflow (`compare-alpha`/`compare-alpha-corpus` modes
+  backed by the `zig build alpha` plane-dump tool) compares decoded ALPH
+  planes against the alpha region of `dwebp -alpha -pgm`; on 2026-06-12 it
+  matched all 18 ALPH-bearing files in `references/libwebp-test-data`
+  byte-for-byte (both methods, all four filters, color cache) with 113
+  non-ALPH files skipped. Composition with lossy VP8 color output awaits the
+  VP8 decoder.
   Note: strict demux keeps its lenient ALPH policy (reserved bits tolerated and
   canonicalized on remux); the decode path rejects them like `dwebp`.
 
@@ -354,10 +356,12 @@ input.
 7. Done: ALPH header parsing, raw (uncompressed) alpha stream decode, and the
    four alpha unfilters with raw-method corpus coverage.
 8. Done: VP8L-compressed alpha decode via the headerless VP8L image-stream
-   entry point, validated locally against `dwebp -alpha -pgm` for all 17
-   alpha-bearing corpus files.
-9. Next: extend `tools/webp-oracle.sh` with a committed alpha-plane comparison
-   mode, then start Step 5 (VP8 lossy decoder).
+   entry point.
+9. Done: committed alpha oracle tooling. `zig build alpha` dumps decoded ALPH
+   planes and `tools/webp-oracle.sh compare-alpha[-corpus]` diffs them against
+   `dwebp -alpha -pgm`; all 18 ALPH corpus files matched byte-for-byte.
+10. Next: start Step 5, the VP8 lossy decoder, beginning with frame header
+    parsing.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.

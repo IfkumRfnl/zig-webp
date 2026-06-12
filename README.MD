@@ -31,6 +31,7 @@ zig build
 zig build test
 tools/webp-oracle.sh check
 tools/webp-oracle.sh compare-vp8l-corpus .zig-cache/vp8l-diff references/libwebp-test-data
+tools/webp-oracle.sh compare-alpha-corpus .zig-cache/alpha-diff references/libwebp-test-data
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
