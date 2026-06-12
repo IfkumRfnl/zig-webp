@@ -7,6 +7,7 @@
     .paths = .{
         "AGENTS.MD",
         "PLAN.MD",
+        "PROGRESS.MD",
         "README.MD",
         "build.zig",
         "build.zig.zon",

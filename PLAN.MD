@@ -7,54 +7,43 @@ The practical path is not to port `libwebp` wholesale. `libwebp` remains the
 behavior oracle, while smaller independent implementations and the specs guide
 module shape, test strategy, and edge-case coverage.
 
-## Progress
+This document is forward-looking: goals, scope boundaries, ordering, and
+acceptance gates. Completed work, dated oracle results, and the current
+position live in `PROGRESS.MD`.
 
-Last updated: 2026-06-12
+## Goals and Non-Goals
 
-- Step 0, Project Foundation: done.
-  Package-level API types, resource limits, corpus helpers, current
-  `zig build test` coverage, and optional local oracle tooling are in place.
-- Step 1, RIFF/WebP Container: done for static container scope.
-  Strict demux covers RIFF sizing, padding, chunk order, duplicate chunks,
-  unknown chunks, trailing data, simple `VP8 `/`VP8L`, `VP8X` feature probing,
-  raw metadata exposure, and chunk locations. Static mux/remux writes valid
-  canonical chunk ordering and preserves metadata payloads.
-- Step 2, Core Bitstream Infrastructure: done.
-  Bounded little-endian byte readers/writers, LSB-first bit readers/writers,
-  VP8L canonical Huffman table construction/lookup, and VP8 boolean arithmetic
-  reader/writer are implemented with unit, invalid-input, round-trip, and
-  compile-time capacity tests.
-- Step 3, VP8L Lossless Decoder: done for still-image lossless corpus scope.
-  VP8L image header parsing, transform-list parsing and dimension bookkeeping,
-  single-prefix-group image-data Huffman parsing, code-length repeat handling,
-  color-cache metadata validation, distance mapping, bounded entropy-stream
-  scanning, and no-transform single-prefix-group ARGB materialization for
-  literals, LZ77 copies, color-cache references, and meta-prefix entropy image
-  parsing are implemented with focused tests. Multiple Huffman group storage and
-  meta-prefix selection during main-image entropy decode are also in place.
-  Subtract-green, predictor, color, and color-indexing inverse transform support
-  are wired into the limited raw VP8L decoder. Main-image meta-prefix/group-store
-  entropy decoding is available through the allocator-backed raw decoder path.
-  Public static lossless decode composition is available for still VP8L images.
-  The optional local oracle workflow compares VP8L PAM output against `dwebp`;
-  on 2026-06-11 it matched all 43 VP8L files in `references/libwebp-test-data`
-  with 88 non-lossless files skipped.
-- Step 4, Alpha Chunk Decode: alpha-plane decode done; lossy composition
-  pending.
-  ALPH header parsing (compression, filter, preprocessing, reserved-bit
-  validation), uncompressed alpha stream decode, the none/horizontal/
-  vertical/gradient unfilters, and VP8L-compressed alpha decode through the
-  headerless VP8L image-stream entry point are implemented in `src/alpha.zig`
-  with unit, invalid-input, filter round-trip, and corpus decode tests.
-  The committed oracle workflow (`compare-alpha`/`compare-alpha-corpus` modes
-  backed by the `zig build alpha` plane-dump tool) compares decoded ALPH
-  planes against the alpha region of `dwebp -alpha -pgm`; on 2026-06-12 it
-  matched all 18 ALPH-bearing files in `references/libwebp-test-data`
-  byte-for-byte (both methods, all four filters, color cache) with 113
-  non-ALPH files skipped. Composition with lossy VP8 color output awaits the
-  VP8 decoder.
-  Note: strict demux keeps its lenient ALPH policy (reserved bits tolerated and
-  canonicalized on remux); the decode path rejects them like `dwebp`.
+Goals:
+
+- Full static decode: VP8 lossy, VP8L lossless, and alpha.
+- Animated decode with frame iteration and composited output.
+- VP8L lossless encode, VP8 lossy encode, and animation/metadata encode.
+- Safe-by-default handling of untrusted input with explicit resource limits.
+- A Zig-native public API with caller-controlled allocation.
+
+Non-goals, explicitly out of scope unless deliberately revisited:
+
+- Streaming or incremental decode of partial files. The API takes complete
+  input buffers.
+- VP8 features WebP forbids or never uses: inter-frame prediction,
+  golden/altref frames, and non-key-frame decode.
+- Applying ICC color management. Profiles are exposed as raw chunks; color
+  transformation is the caller's concern.
+- A C ABI or bindings layer before the Zig API stabilizes.
+
+Portability and threading stance: development and CI test little-endian
+64-bit targets. Code must not assume host endianness, but big-endian targets
+remain untested until CI covers one. The library is thread-compatible: no
+global mutable state, so distinct decode/encode jobs may run on distinct
+threads. Internal parallelism is deferred to step 10.
+
+## Toolchain Policy
+
+The package pins `minimum_zig_version` (currently 0.16.0) in `build.zig.zon`
+and tracks the latest stable Zig release. Compiler upgrades land as dedicated
+commits that pass `zig build test` plus a full local corpus run, so toolchain
+churn never mixes with codec changes. Zig is the project's one moving
+dependency; treat upgrades with the same care as code changes.
 
 ## References
 
@@ -106,8 +95,30 @@ Do not vendor the reference clone contents into git or the Zig package.
   values.
 - Use differential tests against `libwebp` for decoded pixels, metadata, muxed
   structure, and encoder output validity.
+- Demand bit-exactness wherever the spec defines exact output: VP8L ARGB
+  pixels, VP8 YUV reconstruction, and alpha planes are compared byte-for-byte
+  against `libwebp`. Numeric tolerances are reserved for layers that are
+  genuinely implementation-defined (such as YUV-to-RGB conversion variants),
+  and each such layer must document why exactness does not apply.
 - Avoid copying reference code. Use specs and independent tests to write Zig
   implementations.
+
+## Cross-Cutting Practices
+
+These run continuously from now on rather than as scheduled steps.
+
+- Fuzzing starts now, not at the end. Demux, VP8L decode, and alpha decode
+  are already public entry points and get fuzz smoke targets before VP8
+  decoder work begins. Every new decode entry point lands with a fuzz target
+  in the same change. Fuzz findings become committed regression tests.
+- CI runs on every pull request: `zig fmt --check .`, `zig build test`, and a
+  corpus regression mode that compares decoded output against committed
+  SHA-256 hashes of known-good planes, so CI does not require `dwebp`. Full
+  `dwebp`/`cwebp` differential runs remain available locally (and later in
+  CI by building `libwebp` tools) via `tools/webp-oracle.sh`.
+- Every decoder or encoder milestone records a dated, corpus-wide oracle
+  result in `PROGRESS.MD`: corpus, file counts, byte-exact or gate metric,
+  and skips.
 
 ## Proposed Module Layout
 
@@ -144,6 +155,9 @@ src/testing/corpus.zig
 src/testing/metrics.zig
 ```
 
+Fuzz targets live alongside the tests of the module they exercise, using
+Zig's built-in fuzzer, so fuzz coverage moves with the code it protects.
+
 The exact names can change, but the ownership boundaries should remain. A
 container parser must not know how VP8 macroblocks work. A VP8L Huffman builder
 must not know how RIFF chunks are ordered. Animation compositing must not own
@@ -151,85 +165,48 @@ single-frame codec internals.
 
 ## Implementation Order
 
-### 0. Project Foundation
+### 0–4. Completed Foundations
 
-- Add package-level types for decoder options, encoder options, image buffers,
-  metadata, animation frames, and error categories.
-- Add explicit resource limits: input bytes, output pixels, allocation bytes,
-  frame count, animation canvas size, and chunk count.
-- Add test helpers for reading corpus files without making the package depend on
-  external references.
-- Add a local differential-test script that can call `dwebp`, `cwebp`, and
-  `webpinfo` when those tools are installed.
-
-Deliverable: `zig build test` covers current container code and a local optional
-oracle workflow exists.
-
-### 1. RIFF/WebP Container
-
-- Finish strict RIFF parsing: size fields, padding bytes, chunk order, duplicate
-  chunks, unknown chunks, trailing data, and 4 GiB limits.
-- Parse simple files containing only `VP8 ` or `VP8L`.
-- Parse extended `VP8X` flags and canvas dimensions.
-- Parse and expose raw `ICCP`, `EXIF`, and `XMP ` metadata chunks.
-- Add a `Features` API for dimensions, format kind, alpha, animation, metadata,
-  and chunk locations without full pixel decode.
-- Add muxing support for valid chunk ordering and padding.
-
-Deliverable: lossless metadata-preserving demux/mux round trips for static files.
-
-### 2. Core Bitstream Infrastructure
-
-- Implement bounded little-endian byte readers and bit readers.
-- Implement canonical Huffman table construction and lookup for VP8L.
-- Implement VP8 boolean arithmetic reader and writer as an isolated module.
-- Add table-size proofs and compile-time assertions for all static tables.
-- Test bit readers/writers independently before using them in codecs.
-
-Deliverable: reusable bitstream modules with unit tests and invalid-input tests.
-
-### 3. VP8L Lossless Decoder
-
-Implement the lossless decoder first because it outputs exact ARGB pixels and is
-easier to validate bit-for-bit than lossy reconstruction.
-
-- Parse VP8L signature, dimensions, alpha flag, version, and transform list.
-- Decode Huffman groups, meta prefix images, literals, LZ77 backward references,
-  distance mapping, and optional color cache references.
-- Implement inverse transforms: predictor, color transform, subtract-green, and
-  color indexing.
-- Validate all dimensions, distances, copy ranges, Huffman code lengths, and
-  color-cache sizes before writing output.
-- Compare decoded pixels against `dwebp -pam` or `dwebp -ppm` for every VP8L
-  file in `libwebp-test-data`.
-
-Deliverable: still-image VP8L decode to RGBA/ARGB with corpus coverage.
-
-### 4. Alpha Chunk Decode
-
-- Parse `ALPH` chunk headers for compression, filtering, and preprocessing.
-- Decode raw alpha streams.
-- Decode VP8L-compressed alpha streams through the VP8L decoder core.
-- Implement alpha filters: none, horizontal, vertical, and gradient.
-- Compose alpha with lossy VP8 color output and validate VP8X alpha flag rules.
-
-Deliverable: lossy+alpha and lossless-alpha test vectors decode correctly.
+Step 0 (project foundation), step 1 (RIFF/WebP container), step 2 (core
+bitstream infrastructure), step 3 (VP8L lossless decoder), and step 4 (alpha
+chunk decode) are complete for their static scopes. See `PROGRESS.MD` for
+what each delivered and the dated corpus results. One remainder moves
+forward: composing decoded alpha planes over lossy VP8 color output is part
+of step 5's gate, because it cannot land before the VP8 decoder.
 
 ### 5. VP8 Lossy Decoder
 
-- Parse WebP's VP8 key-frame payloads and reject unsupported non-key-frame
-  states where WebP forbids them.
+VP8 reconstruction is exactly specified: RFC 6386 fixes the boolean decoder,
+dequantization, intra prediction, inverse DCT/WHT, and loop filter to the
+bit. Only YUV-to-RGB conversion is implementation-defined. Build and validate
+the decoder in two layers so exactness is never blurred by conversion
+choices.
+
+Reconstruction layer (bit-exact, no tolerances):
+
+- Parse WebP's VP8 key-frame payloads and reject non-key-frame states WebP
+  forbids.
 - Implement frame header parsing, segmentation, quantization, coefficient
   probability updates, token partitions, macroblock modes, and skip flags.
 - Implement intra prediction for luma and chroma modes.
 - Implement inverse DCT and WHT using exact integer rules.
 - Implement normal and simple loop filters.
-- Implement YUV420 to RGB conversion and chroma upsampling with explicit options
-  for compatibility and quality.
-- Validate against `libwebp-test-data` lossy files and a generated corpus from
-  `cwebp`.
+- Add a `compare-yuv` oracle mode (mirroring the alpha tooling) that diffs
+  decoded YUV420 planes byte-for-byte against `dwebp -yuv` for every lossy
+  corpus file. Any mismatch is a bug, never a tolerance.
 
-Deliverable: static lossy decode with differential pixel tolerances defined.
+Conversion layer (separately tested):
+
+- Implement YUV420-to-RGB conversion and chroma upsampling as its own module
+  with explicit mode options; the mode mirroring `libwebp`'s default fancy
+  upsampling is validated against `dwebp -pam` output for that mode.
+- Compose decoded alpha planes over lossy color and validate VP8X alpha flag
+  rules (the remainder of step 4).
+
+Acceptance gate: byte-exact YUV planes against `dwebp -yuv` for all lossy
+files in `libwebp-test-data` plus a generated `cwebp` corpus, and byte-exact
+RGBA against `dwebp -pam` in the matching upsampling mode, including
+lossy+alpha files.
 
 ### 6. Extended Decode and Animation
 
@@ -240,81 +217,119 @@ Deliverable: static lossy decode with differential pixel tolerances defined.
 - Provide both frame iteration and fully composited output APIs.
 - Preserve metadata extraction for still and animated files.
 
-Deliverable: all static and animated decode features are usable from public API.
+Acceptance gate: composited animation frames match `libwebp`'s `anim_dump`
+output byte-for-byte on the animated corpus files, and all static and
+animated decode features are usable from the public API.
 
 ### 7. VP8L Lossless Encoder
 
 Start with correctness and valid output, then improve compression.
 
 - Implement RIFF/VP8L muxing for still images.
-- Implement VP8L bit writer, canonical Huffman writer, and basic literal output.
+- Implement VP8L bit writer, canonical Huffman writer, and basic literal
+  output.
 - Add simple LZ77 matches and distance mapping.
 - Add subtract-green transform.
 - Add palette/color-indexing transform for low-color images.
 - Add predictor and color transforms.
-- Add entropy image / multiple Huffman groups after the single-group encoder is
-  stable.
+- Add entropy image / multiple Huffman groups after the single-group encoder
+  is stable.
 - Add optional color cache and near-lossless preprocessing.
-- Differentially validate by decoding produced files with both `zig-webp` and
-  `dwebp`.
 
-Deliverable: lossless encoder that beats PNG on common inputs and produces
-libwebp-compatible files.
+Acceptance gates, measured on a defined encode corpus (the decoded ARGB of
+all VP8L files in `libwebp-test-data` plus the `libwebp` gallery images):
+
+- Validity: 100% of encoded files decode without error by both `dwebp` and
+  this library, and round-trip bit-exactly to the source pixels.
+- Size: median compressed size at most 1.10x `cwebp -lossless` at default
+  settings, recorded per file. The PNG comparison is reported, not gated:
+  measure against a named PNG encoder at stated settings (stock `libpng`
+  defaults, plus `oxipng -o 2` where available) on the same pixels.
 
 ### 8. VP8 Lossy Encoder
 
-This is the hardest part of the project and should not start until the decoder,
-bit writers, muxer, and lossless encoder are solid.
+This is the largest single work item in the project: expect it to cost
+roughly as much as steps 0 through 7 combined. It must not start until the
+VP8 decoder, bit writers, muxer, and lossless encoder are solid, and it is
+planned, built, and reviewed as three separately gated phases.
+
+#### 8a. Valid-bitstream baseline
 
 - Implement RGB/RGBA to YUV420 conversion, including exact transparent-RGB
   handling.
-- Implement DCT/WHT forward transforms, quantization, coefficient coding, and
-  boolean arithmetic output.
-- Implement baseline macroblock mode decision.
-- Implement rate-distortion scoring, segmentation, skip decisions, and loop
-  filter selection.
+- Implement forward DCT/WHT, quantization, coefficient coding, and boolean
+  arithmetic output, with a deliberately simple fixed mode decision.
+- Gate: every encoded corpus image decodes without error by both `dwebp` and
+  this library, and this library's decoder reproduces the encoder's own
+  reconstruction bit-for-bit at the YUV layer.
+
+#### 8b. Quality
+
+- Implement real macroblock mode decision with rate-distortion scoring,
+  segmentation, skip decisions, token cost estimation, and loop filter
+  selection.
+- Gate: at matched output size on the photo corpus, mean luma PSNR within
+  1.0 dB of `cwebp -q 75 -m 4`. This threshold is an initial target; revise
+  it only with recorded data and rationale, per the honest-benchmarking
+  rules in `AGENTS.md`.
+
+#### 8c. Controls and parity features
+
 - Add method/quality presets compatible with `cwebp` concepts.
-- Add target size and target PSNR modes after regular quality mode is stable.
+- Add target-size and target-PSNR modes after regular quality mode is stable.
 - Add sharp-YUV or equivalent high-quality chroma conversion.
 - Add alpha encoding via `ALPH` for lossy+alpha output.
-
-Deliverable: lossy still-image encoder with acceptable visual quality and
-configurable speed/quality tradeoffs.
+- Gate: the preset matrix encodes the corpus without validity regressions,
+  and target-size mode lands within 5% of the requested size.
 
 ### 9. Animation and Metadata Encode
 
 - Encode `VP8X`, `ANIM`, and `ANMF`.
 - Support lossless and lossy frame codecs.
-- Implement sub-rectangle detection, frame differencing, blend/dispose strategy,
-  keyframe insertion, loop count, and background color.
-- Encode raw metadata chunks and preserve user-specified chunk order where the
-  spec permits it.
+- Implement sub-rectangle detection, frame differencing, blend/dispose
+  strategy, keyframe insertion, loop count, and background color.
+- Encode raw metadata chunks and preserve user-specified chunk order where
+  the spec permits it.
 
-Deliverable: animated WebP encoding that browsers and `webpmux` accept.
+Acceptance gate: encoded animations are accepted by `webpmux` and
+`webpinfo`, decode through `libwebp`'s `anim_dump` to frames matching this
+library's own composition, and render in at least two major browsers.
 
 ### 10. Performance Work
 
 - Establish scalar baselines before optimizing.
 - Benchmark decode and encode separately for small icons, photos, alpha-heavy
   UI assets, large images, and animations.
+- Working targets, revised only with recorded data: scalar decode within 3x
+  single-threaded `libwebp` on the benchmark set, within 1.5x after Zig
+  vector work. Encode targets are set once 8b lands and quality/speed
+  tradeoffs are measurable.
 - Add cache-aware hot loops for transforms, prediction, color conversion, and
   filters.
 - Add optional Zig vectorized implementations behind clean module boundaries.
-- Consider row or tile parallelism only after deterministic scalar behavior is
-  locked down.
+- Consider row or tile parallelism only after deterministic scalar behavior
+  is locked down.
 
-Deliverable: performance reports against `libwebp`, `image-webp`, and selected
-pure-Go references.
+Deliverable: dated performance reports against `libwebp`, `image-webp`, and
+selected pure-Go references, following the honest-benchmarking rules in
+`AGENTS.md`.
 
-### 11. Robustness and Security
+### 11. Robustness Hardening
 
-- Add fuzz targets for demux, VP8L decode, VP8 decode, alpha decode, animation
-  composition, and encoder round trips.
-- Add allocation-failure tests around every public entry point.
+Fuzzing and limits checks run continuously (see Cross-Cutting Practices);
+this step deepens them to release depth.
+
+- Grow fuzz corpora from corpus seeds and accumulated findings; give CI a
+  fixed fuzz time budget per target: demux, VP8L decode, VP8 decode, alpha
+  decode, animation composition, and encoder round trips.
+- Add allocation-failure injection tests around every public entry point.
 - Add limits tests for huge dimensions, oversized chunks, invalid distances,
-  invalid Huffman trees, recursive VP8L transforms, and animation frame counts.
-- Keep all loops bounded by parsed dimensions, chunk sizes, or explicit limits.
-- Ensure malicious inputs fail with errors, not panics or unbounded allocation.
+  invalid Huffman trees, recursive VP8L transforms, and animation frame
+  counts.
+- Keep all loops bounded by parsed dimensions, chunk sizes, or explicit
+  limits.
+- Ensure malicious inputs fail with errors, not panics or unbounded
+  allocation.
 
 Deliverable: fuzzed, bounded decode and encode paths suitable for untrusted
 input.
@@ -328,40 +343,29 @@ input.
   - animation iteration and composition;
   - metadata extraction and muxing;
   - memory and security limits.
-- Document pixel formats, ownership, allocation behavior, and error semantics.
-- Require `zig build test`, corpus decode tests, encoder validity tests, and
-  fuzz smoke tests in CI.
-- Release `0.1.0` only after static VP8/VP8L decode and VP8L encode are stable.
-- Release `1.0.0` only after lossy encode, alpha, animation, metadata, fuzzing,
-  docs, and compatibility testing are all production-ready.
+- Document pixel formats, ownership, allocation behavior, and error
+  semantics.
+- Require `zig build test`, hash-based corpus regression, encoder validity
+  gates, and fuzz smoke budgets in CI.
+- Release `0.1.0` only after the step 5 decode gate and the step 7 validity
+  and size gates hold in CI.
+- Release `1.0.0` only after the 8b and 8c gates, animation encode, metadata,
+  hardening, docs, and compatibility testing are all met.
 
 ## Near-Term Work Items
 
-1. Done: start VP8L decode modules against the official lossless-vector scope.
-2. Done: parse VP8L signature, dimensions, alpha flag, version, and transform
-   list.
-3. Done for single-prefix-group scope: decode VP8L code-length and image
-   Huffman groups using the shared table builder.
-4. Done for single-prefix-group scope: materialize pixels from literals, LZ77
-   backward references, distance mapping, and optional color-cache references.
-5. In progress: support meta-prefix images and multiple Huffman groups.
-   Entropy-image parsing, group-count derivation, and prefix-code group
-   storage/selection during main-image entropy decode are done.
-6. Done: implement inverse transforms and differential pixel checks against
-   `dwebp`.
-   Subtract-green, predictor, color, color-indexing, main-image meta-prefix
-   group-store decode, public static lossless decode composition, and optional
-   `dwebp` pixel comparison tooling are done. The local corpus comparison
-   matched all VP8L files in `references/libwebp-test-data`.
-7. Done: ALPH header parsing, raw (uncompressed) alpha stream decode, and the
-   four alpha unfilters with raw-method corpus coverage.
-8. Done: VP8L-compressed alpha decode via the headerless VP8L image-stream
-   entry point.
-9. Done: committed alpha oracle tooling. `zig build alpha` dumps decoded ALPH
-   planes and `tools/webp-oracle.sh compare-alpha[-corpus]` diffs them against
-   `dwebp -alpha -pgm`; all 18 ALPH corpus files matched byte-for-byte.
-10. Next: start Step 5, the VP8 lossy decoder, beginning with frame header
-    parsing.
+1. Add fuzz smoke targets for strict demux, VP8L decode, and alpha decode
+   using Zig's built-in fuzzer, runnable from `zig build`, before VP8
+   decoder work begins.
+2. Add CI: `zig fmt --check .` and `zig build test` on every pull request,
+   plus hash-based corpus regression using committed SHA-256 hashes of
+   known-good decoded planes so CI needs no `dwebp`.
+3. Add a `compare-yuv` mode to `tools/webp-oracle.sh` backed by a YUV
+   plane-dump build target, mirroring the existing alpha tooling.
+4. Start step 5 reconstruction: VP8 frame header parsing on top of the
+   existing boolean reader, with unit and invalid-input tests.
+5. Once step 5 reaches full-frame reconstruction, compose alpha over lossy
+   color to close out the step 4 remainder.
 
-This order keeps early work testable and prevents the project from becoming one
-large codec file that is difficult to audit or optimize.
+This order keeps early work testable and prevents the project from becoming
+one large codec file that is difficult to audit or optimize.
