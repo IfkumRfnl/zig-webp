@@ -25,6 +25,7 @@ pub const vp8_modes = @import("vp8/modes.zig");
 pub const vp8_quant = @import("vp8/quant.zig");
 pub const vp8_token_probs = @import("vp8/token_probs.zig");
 pub const vp8_tokens = @import("vp8/tokens.zig");
+pub const vp8_transform = @import("vp8/transform.zig");
 pub const vp8l_header = @import("vp8l/header.zig");
 pub const vp8l_color_cache = @import("vp8l/color_cache.zig");
 pub const vp8l_decoder = @import("vp8l/decoder.zig");
