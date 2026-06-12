@@ -9,7 +9,7 @@ module shape, test strategy, and edge-case coverage.
 
 ## Progress
 
-Last updated: 2026-06-11
+Last updated: 2026-06-12
 
 - Step 0, Project Foundation: done.
   Package-level API types, resource limits, corpus helpers, current
@@ -39,6 +39,14 @@ Last updated: 2026-06-11
   The optional local oracle workflow compares VP8L PAM output against `dwebp`;
   on 2026-06-11 it matched all 43 VP8L files in `references/libwebp-test-data`
   with 88 non-lossless files skipped.
+- Step 4, Alpha Chunk Decode: in progress.
+  ALPH header parsing (compression, filter, preprocessing, reserved-bit
+  validation), uncompressed alpha stream decode, and the none/horizontal/
+  vertical/gradient unfilters are implemented in `src/alpha.zig` with unit,
+  invalid-input, filter round-trip, and raw-method corpus decode tests.
+  VP8L-compressed alpha streams and lossy composition are not implemented yet.
+  Note: strict demux keeps its lenient ALPH policy (reserved bits tolerated and
+  canonicalized on remux); the decode path rejects them like `dwebp`.
 
 ## References
 
@@ -337,6 +345,11 @@ input.
    group-store decode, public static lossless decode composition, and optional
    `dwebp` pixel comparison tooling are done. The local corpus comparison
    matched all VP8L files in `references/libwebp-test-data`.
+7. Done: ALPH header parsing, raw (uncompressed) alpha stream decode, and the
+   four alpha unfilters with raw-method corpus coverage.
+8. Next: decode VP8L-compressed alpha streams through the VP8L decoder core
+   (headerless 8-bit mode), then extend the oracle tooling to compare alpha
+   planes against `dwebp -alpha`.
 
 This order keeps early work testable and prevents the project from becoming one
 large codec file that is difficult to audit or optimize.

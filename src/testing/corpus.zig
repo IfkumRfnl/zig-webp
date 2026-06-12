@@ -164,6 +164,48 @@ test "parses committed libwebp WebP corpus" {
     try std.testing.expectEqual(@as(u32, default_webp_file_count), parsed_count);
 }
 
+test "decodes raw alpha planes from the committed corpus" {
+    const alpha = @import("../alpha.zig");
+
+    const raw_alpha_files = [_]struct {
+        name: []const u8,
+        filter: alpha.Filter,
+    }{
+        .{ .name = "alpha_no_compression.webp", .filter = .none },
+        .{ .name = "alpha_filter_0_method_0.webp", .filter = .none },
+        .{ .name = "alpha_filter_1_method_0.webp", .filter = .horizontal },
+        .{ .name = "alpha_filter_2_method_0.webp", .filter = .vertical },
+        .{ .name = "alpha_filter_3_method_0.webp", .filter = .gradient },
+    };
+
+    for (raw_alpha_files) |corpus_file| {
+        const bytes = readFileAlloc(
+            std.testing.allocator,
+            corpus_file.name,
+            .{},
+        ) catch |err| switch (err) {
+            error.CorpusUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer std.testing.allocator.free(bytes);
+
+        var result = try demux.parse(std.testing.allocator, bytes, .{});
+        defer result.deinit();
+
+        const location = result.features.alpha orelse return error.TestUnexpectedResult;
+        const dimensions = result.features.canvas;
+        const pixel_count: usize = @intCast(try dimensions.pixelCount());
+
+        const plane = try std.testing.allocator.alloc(u8, pixel_count);
+        defer std.testing.allocator.free(plane);
+
+        const header = try alpha.decodePlane(location.payload(bytes), dimensions, plane);
+
+        try std.testing.expectEqual(alpha.Compression.none, header.compression);
+        try std.testing.expectEqual(corpus_file.filter, header.filter);
+    }
+}
+
 test "rejects corpus paths that escape the configured root" {
     try std.testing.expectError(
         error.InvalidCorpusPath,
