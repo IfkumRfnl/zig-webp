@@ -8,6 +8,7 @@ const limits = @import("../limits.zig");
 
 pub const default_root_path = "testdata/libwebp-test-data";
 pub const default_webp_file_count = 131;
+pub const default_lossy_still_file_count = 88;
 
 pub const Options = struct {
     root_path: []const u8 = default_root_path,
@@ -219,6 +220,67 @@ test "decodes alpha planes from the committed corpus" {
         try std.testing.expectEqual(corpus_file.compression, header.compression);
         try std.testing.expectEqual(corpus_file.filter, header.filter);
     }
+}
+
+test "parses VP8 frame headers from the committed corpus" {
+    const frame_header = @import("../vp8/frame_header.zig");
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, default_root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        error.NotDir => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.close(io);
+
+    const corpus_limits = limits.ResourceLimits{
+        .output_pixels_max = std.math.maxInt(u32),
+        .animation_canvas_pixels_max = std.math.maxInt(u32),
+    };
+
+    var parsed_count: u32 = 0;
+    var iterator = root.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
+
+        const bytes = try readFileAlloc(std.testing.allocator, entry.name, .{
+            .limits = corpus_limits,
+        });
+        defer std.testing.allocator.free(bytes);
+
+        var result = try demux.parse(std.testing.allocator, bytes, .{
+            .limits = corpus_limits,
+        });
+        defer result.deinit();
+
+        if (result.features.is_animation) continue;
+        const format = result.features.format orelse continue;
+        if (format != .lossy) continue;
+        const image_chunk = result.features.image_data orelse continue;
+
+        var parsed: frame_header.Parsed = undefined;
+        frame_header.parse(image_chunk.payload(bytes), &parsed) catch |err| {
+            std.debug.print("failed to parse VP8 frame header in {s}: {s}\n", .{
+                entry.name,
+                @errorName(err),
+            });
+            return err;
+        };
+
+        try std.testing.expectEqual(
+            result.features.canvas.width,
+            parsed.header.picture.dimensions.width,
+        );
+        try std.testing.expectEqual(
+            result.features.canvas.height,
+            parsed.header.picture.dimensions.height,
+        );
+
+        parsed_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
 }
 
 test "rejects corpus paths that escape the configured root" {
