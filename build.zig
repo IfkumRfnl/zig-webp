@@ -39,6 +39,25 @@ pub fn build(b: *std.Build) void {
     const decode_step = b.step("decode", "Decode a static lossless WebP to PAM");
     decode_step.dependOn(&run_decode_tool.step);
 
+    const alpha_tool = b.addExecutable(.{
+        .name = "zig-webp-alpha",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-alpha.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    b.installArtifact(alpha_tool);
+    const run_alpha_tool = b.addRunArtifact(alpha_tool);
+    if (b.args) |args| {
+        run_alpha_tool.addArgs(args);
+    }
+    const alpha_step = b.step("alpha", "Decode a WebP ALPH chunk to a raw alpha plane");
+    alpha_step.dependOn(&run_alpha_tool.step);
+
     const unit_tests = b.addTest(.{
         .root_module = webp_module,
     });

@@ -8,6 +8,8 @@ Usage:
   tools/webp-oracle.sh decode OUT_DIR FILE.webp [FILE.webp ...]
   tools/webp-oracle.sh compare-vp8l OUT_DIR FILE.webp [FILE.webp ...]
   tools/webp-oracle.sh compare-vp8l-corpus OUT_DIR [CORPUS_DIR]
+  tools/webp-oracle.sh compare-alpha OUT_DIR FILE.webp [FILE.webp ...]
+  tools/webp-oracle.sh compare-alpha-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
 
@@ -118,6 +120,79 @@ compare_vp8l_files() {
     fi
 }
 
+# Compares decoded ALPH planes against the alpha region of dwebp's stacked
+# YUV+alpha PGM output. Files without a static ALPH chunk are skipped via the
+# tool's dedicated exit code 3.
+compare_alpha_files() {
+    out_dir=$1
+    shift
+
+    if ! has_tool dwebp; then
+        printf 'dwebp\tSKIP: not installed\n' >&2
+        return 0
+    fi
+
+    alpha_tool=zig-out/bin/zig-webp-alpha
+    if ! zig build >/dev/null 2>&1 || [ ! -x "$alpha_tool" ]; then
+        printf 'FAIL\tzig build did not produce %s\n' "$alpha_tool" >&2
+        return 1
+    fi
+
+    mkdir -p "$out_dir"
+    compared=0
+    failed=0
+    skipped=0
+    for file in "$@"; do
+        if [ ! -f "$file" ]; then
+            printf 'FAIL\tmissing\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        base=$(basename "$file")
+        stem=${base%.*}
+        oracle="$out_dir/$stem.dwebp.pgm"
+        actual="$out_dir/$stem.zig-webp.raw"
+
+        status=0
+        "$alpha_tool" "$file" "$actual" >"$out_dir/$stem.zig-webp.log" 2>&1 || status=$?
+        if [ "$status" -eq 3 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [ "$status" -ne 0 ]; then
+            printf 'FAIL\tzig-webp-alpha\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        if ! dwebp -alpha "$file" -pgm -o "$oracle" >"$out_dir/$stem.dwebp.log" 2>&1; then
+            printf 'FAIL\tdwebp\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        plane_bytes=$(wc -c <"$actual")
+        plane_bytes=$((plane_bytes))
+        compared=$((compared + 1))
+        if tail -c "$plane_bytes" "$oracle" | cmp -s - "$actual"; then
+            printf 'OK\t%s\n' "$file"
+        else
+            printf 'DIFF\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+        fi
+    done
+
+    printf 'summary\tcompared=%s\tskipped=%s\tfailed=%s\n' "$compared" "$skipped" "$failed"
+    if [ "$compared" -eq 0 ]; then
+        printf 'FAIL\tno ALPH files compared\n' >&2
+        return 1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        return 1
+    fi
+}
+
 mode=${1:-check}
 case "$mode" in
     check)
@@ -155,6 +230,26 @@ case "$mode" in
         out_dir=$2
         corpus_dir=${3:-references/libwebp-test-data}
         compare_vp8l_files "$out_dir" "$corpus_dir"/*.webp
+        ;;
+
+    compare-alpha)
+        if [ "$#" -lt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        shift 2
+        compare_alpha_files "$out_dir" "$@"
+        ;;
+
+    compare-alpha-corpus)
+        if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        corpus_dir=${3:-references/libwebp-test-data}
+        compare_alpha_files "$out_dir" "$corpus_dir"/*.webp
         ;;
 
     encode)
