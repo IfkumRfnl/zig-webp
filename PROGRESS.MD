@@ -88,7 +88,16 @@ across partitions) and `BoolReader.init` no longer fails. A corpus test
 decodes every coefficient of all 88 lossy still files end-to-end (modes,
 per-row partition selection, contexts) without error.
 
-Not yet started: intra prediction, inverse transforms, loop filtering,
+The inverse transforms are implemented in `src/vp8/transform.zig`: the
+exact-integer inverse 4x4 DCT (columns then rows, lone `(x+4)>>3` rounder,
+Q16 constants 20091/35468 with the K-1 split) fused with add-to-prediction
+and unconditional [0,255] clamping, and the inverse Walsh-Hadamard transform
+for Y2 with its distinct (0,3)/(1,2) butterfly pairing and `(x+3)>>3`
+rounder. Arithmetic uses wrapping i32 ops so hostile wrapped-i16
+coefficients cannot panic. Unit vectors were generated independently from
+the RFC pseudocode (twice) rather than from reference C code.
+
+Not yet started: intra prediction, loop filtering, frame reconstruction,
 YUV output, and the `compare-yuv` oracle mode.
 
 ## Completed Steps
