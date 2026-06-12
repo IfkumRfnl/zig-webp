@@ -97,8 +97,18 @@ rounder. Arithmetic uses wrapping i32 ops so hostile wrapped-i16
 coefficients cannot panic. Unit vectors were generated independently from
 the RFC pseudocode (twice) rather than from reference C code.
 
-Not yet started: intra prediction, loop filtering, frame reconstruction,
-YUV output, and the `compare-yuv` oracle mode.
+Intra prediction kernels are implemented in `src/vp8/prediction.zig` as
+pure functions over explicit neighbor values: 16x16 luma and 8x8 chroma
+DC (with the edge-variant denominators and the 128 no-neighbor case),
+V/H/TM, and all ten 4x4 B_PRED modes including the B_VL final-pixel
+exceptions and the RFC's `svg2p` typo resolution. Unit vectors were
+computed independently from the RFC formula tables; synthetic-border
+identities (127/129) are covered. Neighbor gathering (frame edges, the
+fixed top-right rule for subblocks 3/7/11/15) belongs to the
+reconstruction slice.
+
+Not yet started: loop filtering, frame reconstruction, YUV output, and
+the `compare-yuv` oracle mode.
 
 ## Completed Steps
 
