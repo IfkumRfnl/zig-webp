@@ -24,6 +24,7 @@ pub const vp8_frame_header = @import("vp8/frame_header.zig");
 pub const vp8_modes = @import("vp8/modes.zig");
 pub const vp8_quant = @import("vp8/quant.zig");
 pub const vp8_token_probs = @import("vp8/token_probs.zig");
+pub const vp8_tokens = @import("vp8/tokens.zig");
 pub const vp8l_header = @import("vp8l/header.zig");
 pub const vp8l_color_cache = @import("vp8l/color_cache.zig");
 pub const vp8l_decoder = @import("vp8l/decoder.zig");
@@ -77,6 +78,8 @@ pub const VP8PictureHeader = vp8_frame_header.PictureHeader;
 pub const VP8SubblockMode = vp8_modes.SubblockMode;
 pub const VP8TokenPartitions = vp8_frame_header.TokenPartitions;
 pub const VP8TokenProbabilityTable = vp8_token_probs.Table;
+pub const VP8MacroblockCoefficients = vp8_tokens.MacroblockCoefficients;
+pub const VP8NonzeroFlags = vp8_tokens.NonzeroFlags;
 pub const VP8LARGBPixel = vp8l_pixel.Pixel;
 pub const VP8LColorCache = vp8l_color_cache.Cache;
 pub const VP8LDecodeResult = vp8l_decoder.Result;
@@ -175,7 +178,7 @@ test "root exposes composable Step 2 bitstream infrastructure" {
     try bool_writer_instance.writeBool(40, 1);
     try bool_writer_instance.writeBool(200, 0);
 
-    var bool_reader_instance = try VP8BoolReader.init(try bool_writer_instance.finish());
+    var bool_reader_instance = VP8BoolReader.init(try bool_writer_instance.finish());
     try std.testing.expectEqual(@as(u1, 1), try bool_reader_instance.readBool(40));
     try std.testing.expectEqual(@as(u1, 0), try bool_reader_instance.readBool(200));
 

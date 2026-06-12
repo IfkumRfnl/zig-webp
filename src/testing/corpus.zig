@@ -404,6 +404,109 @@ test "parses VP8 macroblock prediction records from the committed corpus" {
     try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
 }
 
+test "decodes VP8 coefficient tokens from the committed corpus" {
+    const bool_reader = @import("../vp8/bool_reader.zig");
+    const frame_header = @import("../vp8/frame_header.zig");
+    const modes = @import("../vp8/modes.zig");
+    const quant = @import("../vp8/quant.zig");
+    const tokens = @import("../vp8/tokens.zig");
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, default_root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        error.NotDir => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.close(io);
+
+    const corpus_limits = limits.ResourceLimits{
+        .output_pixels_max = std.math.maxInt(u32),
+        .animation_canvas_pixels_max = std.math.maxInt(u32),
+    };
+
+    var parsed_count: u32 = 0;
+    var iterator = root.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
+
+        const bytes = try readFileAlloc(std.testing.allocator, entry.name, .{
+            .limits = corpus_limits,
+        });
+        defer std.testing.allocator.free(bytes);
+
+        var result = try demux.parse(std.testing.allocator, bytes, .{
+            .limits = corpus_limits,
+        });
+        defer result.deinit();
+
+        if (result.features.is_animation) continue;
+        const format = result.features.format orelse continue;
+        if (format != .lossy) continue;
+        const image_chunk = result.features.image_data orelse continue;
+
+        var parsed: frame_header.Parsed = undefined;
+        try frame_header.parse(image_chunk.payload(bytes), &parsed);
+
+        const grid = modes.MacroblockGrid.init(parsed.header.picture.dimensions);
+        const macroblocks = try std.testing.allocator.alloc(
+            modes.Macroblock,
+            grid.macroblockCount(),
+        );
+        defer std.testing.allocator.free(macroblocks);
+        try modes.parseKeyFrameModes(&parsed.macroblock_reader, &parsed.header, macroblocks);
+
+        const factors = quant.segmentFactors(&parsed.header);
+
+        var partition_readers: [frame_header.token_partition_count_max]bool_reader.BoolReader =
+            undefined;
+        for (0..parsed.token_partitions.count) |index| {
+            partition_readers[index] =
+                bool_reader.BoolReader.init(parsed.token_partitions.slices[index]);
+        }
+
+        const above = try std.testing.allocator.alloc(tokens.NonzeroFlags, grid.columns);
+        defer std.testing.allocator.free(above);
+        @memset(above, tokens.NonzeroFlags.zero);
+
+        var coefficients: tokens.MacroblockCoefficients = undefined;
+        var row: u32 = 0;
+        while (row < grid.rows) : (row += 1) {
+            const reader = &partition_readers[row % parsed.token_partitions.count];
+            var left = tokens.NonzeroFlags.zero;
+            var column: u32 = 0;
+            while (column < grid.columns) : (column += 1) {
+                const macroblock = macroblocks[row * grid.columns + column];
+                const options = tokens.MacroblockOptions{
+                    .probabilities = &parsed.header.coefficient_probabilities,
+                    .factors = &factors[macroblock.segment_id],
+                    .has_y2 = macroblock.luma_mode != .subblocks,
+                    .skip = parsed.header.skip_enabled and macroblock.skip,
+                };
+                _ = tokens.decodeMacroblock(
+                    reader,
+                    options,
+                    &left,
+                    &above[column],
+                    &coefficients,
+                ) catch |err| {
+                    std.debug.print("token decode failed in {s} at row {d} col {d}: {s}\n", .{
+                        entry.name,
+                        row,
+                        column,
+                        @errorName(err),
+                    });
+                    return err;
+                };
+            }
+        }
+
+        parsed_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
+}
+
 test "decoded corpus planes match committed SHA-256 hashes" {
     {
         const io = std.Io.Threaded.global_single_threaded.io();

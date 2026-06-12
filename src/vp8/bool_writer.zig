@@ -367,7 +367,7 @@ test "VP8 bool writer round trips mixed probability bools through reader" {
     }
     const encoded = try writer.finish();
 
-    var reader = try bool_reader.BoolReader.init(encoded);
+    var reader = bool_reader.BoolReader.init(encoded);
     for (items) |item| {
         try std.testing.expectEqual(
             item.value,
@@ -398,7 +398,7 @@ test "VP8 bool writer round trips a longer deterministic bool sequence" {
     }
     const encoded = try writer.finish();
 
-    var reader = try bool_reader.BoolReader.init(encoded);
+    var reader = bool_reader.BoolReader.init(encoded);
     for (items) |item| {
         try std.testing.expectEqual(
             item.value,
@@ -422,7 +422,7 @@ test "VP8 bool writer round trips literals and probability helpers" {
     try writer.writeProbability7(1);
     const encoded = try writer.finish();
 
-    var reader = try bool_reader.BoolReader.init(encoded);
+    var reader = bool_reader.BoolReader.init(encoded);
     try std.testing.expectEqual(@as(u32, 0xb0), try reader.readLiteral(8));
     try std.testing.expectEqual(@as(i32, -5), try reader.readSignedLiteral(4));
     try std.testing.expectEqual(@as(i32, 5), try reader.readSignedLiteral(4));
