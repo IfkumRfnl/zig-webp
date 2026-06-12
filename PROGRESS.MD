@@ -67,9 +67,15 @@ mode trees and the 10x10x9 `kf_bmode_prob` table are transcribed from RFC
 records for all 88 lossy still files in the committed corpus parse without
 error, and a fuzz smoke target covers the record parser.
 
-Not yet started: dequantization, coefficient token decode, intra prediction,
-inverse transforms, loop filtering, YUV output, and the `compare-yuv`
-oracle mode.
+Dequantization factor resolution is implemented in `src/vp8/quant.zig`: the
+RFC 6386 section 14.1 dc/ac lookup tables (cross-checked value-for-value
+against `references/libwebp` and `references/ffmpeg`), index clamping,
+per-segment quantizer resolution (absolute and relative), the y2_dc doubling,
+the y2_ac 155/100 scaling with its floor of 8 (comptime-verified equivalent
+to libwebp's fixed-point form), and the uv_dc saturation at 132.
+
+Not yet started: coefficient token decode, intra prediction, inverse
+transforms, loop filtering, YUV output, and the `compare-yuv` oracle mode.
 
 ## Completed Steps
 
