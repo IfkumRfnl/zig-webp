@@ -29,7 +29,8 @@ so CI needs no `dwebp`. The hashes lock the decoded planes that matched
 Fuzz smoke targets are in place for every public decode entry point: strict
 demux (`src/demux.zig`), VP8L still-image decode (`src/vp8l/decoder.zig`),
 alpha plane decode (`src/alpha.zig`), VP8 key-frame header parsing
-(`src/vp8/frame_header.zig`), and the public static decode composition
+(`src/vp8/frame_header.zig`), VP8 macroblock prediction record parsing
+(`src/vp8/modes.zig`), and the public static decode composition
 (`src/decode.zig`). Each target uses `std.testing.fuzz` with a valid corpus
 seed (framed via `src/testing/fuzz.zig` so seeds reach the parser
 byte-for-byte) and runs under plain `zig build test` as a corpus +
@@ -52,11 +53,21 @@ DCT coefficient probability updates, and the skip probability. The RFC 6386
 default and update token probability tables live in
 `src/vp8/token_probs.zig`, transcribed from the normative tables and
 cross-checked value-for-value between `references/libwebp` and
-`references/ffmpeg` before committing. The returned reader is positioned at
-the macroblock prediction records for the next slice. All 88 lossy still
-files in the committed corpus parse with dimensions matching demux features.
+`references/ffmpeg` before committing. All 88 lossy still files in the
+committed corpus parse with dimensions matching demux features.
 
-Not yet started: macroblock mode parsing, dequantization, intra prediction,
+Macroblock prediction record parsing is implemented in `src/vp8/modes.zig`
+on top of a generic RFC 6386 treed read added to the boolean reader:
+per-macroblock segment ids, coefficient-skip flags, key-frame 16x16 luma and
+chroma intra modes, and B_PRED subblock modes with above/left contexts
+(including the derived contexts that 16x16 modes contribute). The key-frame
+mode trees and the 10x10x9 `kf_bmode_prob` table are transcribed from RFC
+6386 and were cross-checked value-for-value against `references/libwebp` and
+`references/ffmpeg` under their permuted mode enumerations. Prediction
+records for all 88 lossy still files in the committed corpus parse without
+error, and a fuzz smoke target covers the record parser.
+
+Not yet started: dequantization, coefficient token decode, intra prediction,
 inverse transforms, loop filtering, YUV output, and the `compare-yuv`
 oracle mode.
 

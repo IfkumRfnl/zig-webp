@@ -134,6 +134,33 @@ pub const BoolReader = struct {
         return signed_value;
     }
 
+    /// RFC 6386 section 8 treed read. `tree` holds pairs of branch entries:
+    /// positive entries are even indices of the next pair, and nonpositive
+    /// entries are negated leaf values. The probability for the pair at even
+    /// index `i` is `probabilities[i / 2]`.
+    pub fn readTree(
+        self: *BoolReader,
+        tree: []const i8,
+        probabilities: []const Probability,
+    ) Error!u8 {
+        assert(tree.len >= 2);
+        assert(tree.len == 2 * probabilities.len);
+
+        var node_index: usize = 0;
+        // A well-formed tree reaches a leaf within one read per branch pair.
+        var reads_done: usize = 0;
+        while (reads_done < probabilities.len) : (reads_done += 1) {
+            assert(node_index % 2 == 0);
+            assert(node_index + 1 < tree.len);
+
+            const bit = try self.readBool(probabilities[node_index / 2]);
+            const entry = tree[node_index + bit];
+            if (entry <= 0) return @intCast(-entry);
+            node_index = @intCast(entry);
+        }
+        unreachable;
+    }
+
     pub fn readProbability(self: *BoolReader) Error!Probability {
         return @intCast(try self.readLiteral(8));
     }
@@ -238,6 +265,52 @@ test "VP8 bool reader reads signed literals and probability helpers" {
     try std.testing.expectEqual(
         @as(Probability, 1),
         try zero_probability_reader.readProbability7(),
+    );
+}
+
+test "VP8 bool reader walks coding trees to leaf values" {
+    // Four-leaf balanced tree shaped like the RFC 6386 mb_segment_tree:
+    // "00" = 0, "01" = 1, "10" = 2, "11" = 3. With even probabilities,
+    // readBit and readTree consume identical bit patterns, so the leaf for
+    // each two-bit prefix is predictable from the raw input bits.
+    const tree = [6]i8{ 2, 4, 0, -1, -2, -3 };
+    const probabilities = [3]u8{ 128, 128, 128 };
+
+    var reader = try BoolReader.init(&.{ 0b00_01_10_11, 0x00, 0x00 });
+    try std.testing.expectEqual(@as(u8, 0), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 1), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 2), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 3), try reader.readTree(&tree, &probabilities));
+}
+
+test "VP8 bool reader reads unbalanced tree leaves at differing depths" {
+    // Skewed tree shaped like the RFC uv_mode_tree: "0" = 7, "10" = 6,
+    // "110" = 8, "111" = 9. The input bytes hold the concatenated paths
+    // 0 10 110 111 followed by zero padding.
+    const tree = [6]i8{ -7, 2, -6, 4, -8, -9 };
+    const probabilities = [3]u8{ 128, 128, 128 };
+
+    var reader = try BoolReader.init(&.{ 0b01011011, 0b10000000, 0x00 });
+    try std.testing.expectEqual(@as(u8, 7), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 6), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 8), try reader.readTree(&tree, &probabilities));
+    try std.testing.expectEqual(@as(u8, 9), try reader.readTree(&tree, &probabilities));
+}
+
+test "VP8 bool reader reports truncation inside a tree read" {
+    const tree = [6]i8{ 2, 4, 0, -1, -2, -3 };
+    const probabilities = [3]u8{ 128, 128, 128 };
+
+    // Zero bits shift one normalization bit each after the first read, so
+    // eight reads park the reader one bit short of needing a third byte.
+    var reader = try BoolReader.init(&.{ 0x00, 0x00 });
+    var drained: u32 = 0;
+    while (drained < 8) : (drained += 1) {
+        _ = try reader.readBit();
+    }
+    try std.testing.expectError(
+        error.TruncatedBitstream,
+        reader.readTree(&tree, &probabilities),
     );
 }
 

@@ -338,6 +338,72 @@ test "parses VP8 frame headers from the committed corpus" {
     try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
 }
 
+test "parses VP8 macroblock prediction records from the committed corpus" {
+    const frame_header = @import("../vp8/frame_header.zig");
+    const modes = @import("../vp8/modes.zig");
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, default_root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        error.NotDir => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.close(io);
+
+    const corpus_limits = limits.ResourceLimits{
+        .output_pixels_max = std.math.maxInt(u32),
+        .animation_canvas_pixels_max = std.math.maxInt(u32),
+    };
+
+    var parsed_count: u32 = 0;
+    var iterator = root.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
+
+        const bytes = try readFileAlloc(std.testing.allocator, entry.name, .{
+            .limits = corpus_limits,
+        });
+        defer std.testing.allocator.free(bytes);
+
+        var result = try demux.parse(std.testing.allocator, bytes, .{
+            .limits = corpus_limits,
+        });
+        defer result.deinit();
+
+        if (result.features.is_animation) continue;
+        const format = result.features.format orelse continue;
+        if (format != .lossy) continue;
+        const image_chunk = result.features.image_data orelse continue;
+
+        var parsed: frame_header.Parsed = undefined;
+        try frame_header.parse(image_chunk.payload(bytes), &parsed);
+
+        const grid = modes.MacroblockGrid.init(parsed.header.picture.dimensions);
+        const macroblocks = try std.testing.allocator.alloc(
+            modes.Macroblock,
+            grid.macroblockCount(),
+        );
+        defer std.testing.allocator.free(macroblocks);
+
+        modes.parseKeyFrameModes(
+            &parsed.macroblock_reader,
+            &parsed.header,
+            macroblocks,
+        ) catch |err| {
+            std.debug.print("failed to parse VP8 prediction records in {s}: {s}\n", .{
+                entry.name,
+                @errorName(err),
+            });
+            return err;
+        };
+
+        parsed_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
+}
+
 test "decoded corpus planes match committed SHA-256 hashes" {
     {
         const io = std.Io.Threaded.global_single_threaded.io();
