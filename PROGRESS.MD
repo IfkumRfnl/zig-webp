@@ -107,8 +107,20 @@ identities (127/129) are covered. Neighbor gathering (frame edges, the
 fixed top-right rule for subblocks 3/7/11/15) belongs to the
 reconstruction slice.
 
-Not yet started: loop filtering, frame reconstruction, YUV output, and
-the `compare-yuv` oracle mode.
+Full-frame reconstruction is implemented in `src/vp8/decoder.zig`: the
+whole-frame decode loop (persistent per-partition token readers selected by
+row, nonzero contexts, Y2 WHT scatter before luma IDCTs), a bordered
+scratch macroblock with the synthetic 127/129 edges, left-sample rotation
+including the above-left corner, top-sample snapshots taken from the
+unfiltered reconstruction, the fixed top-right rule for right-edge
+subblocks, B_PRED predict/add interleaving, and macroblock-padded plane
+output with ceil-rounded chroma crop dimensions. The `zig build yuv` tool
+(`--nofilter` only until the loop filter lands) and the
+`compare-yuv-nofilter` / `compare-yuv-nofilter-corpus` oracle modes mirror
+the alpha tooling.
+
+Not yet started: loop filtering (next), the plain `compare-yuv` gate,
+YUV-to-RGB conversion, and alpha composition over lossy color.
 
 ## Completed Steps
 
@@ -170,6 +182,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 |---|---|---|
 | 2026-06-11 | VP8L still-image decode vs `dwebp` PAM output | Matched all 43 VP8L files in `references/libwebp-test-data`; 88 non-lossless files skipped. |
 | 2026-06-12 | ALPH plane decode vs `dwebp -alpha -pgm` | Matched all 18 ALPH-bearing files byte-for-byte (both compression methods, all four filters, color cache); 113 non-ALPH files skipped. |
+| 2026-06-12 | Pre-loop-filter VP8 reconstruction vs `dwebp -nofilter -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 43 locally generated `cwebp` files (qualities 10-95, segments, filter/sharpness settings, odd dimensions down to 1x1); 43 non-lossy corpus files skipped. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

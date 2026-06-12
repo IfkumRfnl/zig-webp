@@ -507,6 +507,64 @@ test "decodes VP8 coefficient tokens from the committed corpus" {
     try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), parsed_count);
 }
 
+test "reconstructs VP8 frames from the committed corpus" {
+    const decoder = @import("../vp8/decoder.zig");
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, default_root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        error.NotDir => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.close(io);
+
+    const corpus_limits = limits.ResourceLimits{
+        .output_pixels_max = std.math.maxInt(u32),
+        .animation_canvas_pixels_max = std.math.maxInt(u32),
+    };
+
+    var decoded_count: u32 = 0;
+    var iterator = root.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
+
+        const bytes = try readFileAlloc(std.testing.allocator, entry.name, .{
+            .limits = corpus_limits,
+        });
+        defer std.testing.allocator.free(bytes);
+
+        var result = try demux.parse(std.testing.allocator, bytes, .{
+            .limits = corpus_limits,
+        });
+        defer result.deinit();
+
+        if (result.features.is_animation) continue;
+        const format = result.features.format orelse continue;
+        if (format != .lossy) continue;
+        const image_chunk = result.features.image_data orelse continue;
+
+        var frame = decoder.decodeFrame(
+            std.testing.allocator,
+            image_chunk.payload(bytes),
+        ) catch |err| {
+            std.debug.print("reconstruction failed for {s}: {s}\n", .{
+                entry.name,
+                @errorName(err),
+            });
+            return err;
+        };
+        defer frame.deinit();
+
+        try std.testing.expectEqual(result.features.canvas.width, frame.width);
+        try std.testing.expectEqual(result.features.canvas.height, frame.height);
+
+        decoded_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, default_lossy_still_file_count), decoded_count);
+}
+
 test "decoded corpus planes match committed SHA-256 hashes" {
     {
         const io = std.Io.Threaded.global_single_threaded.io();
