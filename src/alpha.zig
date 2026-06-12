@@ -3,8 +3,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const bit_writer = @import("bit_writer.zig");
 const errors = @import("errors.zig");
 const image = @import("image.zig");
+const vp8l_decoder = @import("vp8l/decoder.zig");
+const vp8l_pixel = @import("vp8l/pixel.zig");
 
 pub const header_size = 1;
 
@@ -54,7 +57,9 @@ pub fn parseHeader(payload: []const u8) errors.Error!Header {
 }
 
 /// Decodes a full ALPH chunk payload (header byte included) into `output`,
-/// which receives one alpha byte per pixel in row-major order.
+/// which receives one alpha byte per pixel in row-major order. Only
+/// uncompressed payloads decode without an allocator; use `decodePlaneAlloc`
+/// for VP8L-compressed alpha.
 pub fn decodePlane(
     payload: []const u8,
     dimensions: image.Dimensions,
@@ -68,6 +73,97 @@ pub fn decodePlane(
     }
 
     return header;
+}
+
+/// Decodes a full ALPH chunk payload (header byte included) into `output`,
+/// covering both uncompressed and VP8L-compressed alpha streams. The
+/// allocator only backs scratch buffers for the VP8L path; `output` stays
+/// caller-owned.
+pub fn decodePlaneAlloc(
+    gpa: std.mem.Allocator,
+    payload: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+) errors.Error!Header {
+    const header = try parseHeader(payload);
+
+    switch (header.compression) {
+        .none => try decodeRaw(header, payload[header_size..], dimensions, output),
+        .lossless => try decodeLossless(
+            gpa,
+            header,
+            payload[header_size..],
+            dimensions,
+            output,
+        ),
+    }
+
+    return header;
+}
+
+/// Decodes a VP8L-compressed alpha stream: a headerless VP8L image-data
+/// stream whose green channel carries the alpha values, optionally followed
+/// by in-place row unfiltering with the ALPH header filter.
+fn decodeLossless(
+    gpa: std.mem.Allocator,
+    header: Header,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+) errors.Error!void {
+    const pixel_count: usize = @intCast(try dimensions.pixelCount());
+    if (output.len < pixel_count) return error.OutputTooLarge;
+
+    const argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    defer gpa.free(argb_pixels);
+
+    // Capacity for one color table (256 entries plus rounding) or
+    // subsampled predictor/color transform blocks, matching the public
+    // static decode composition.
+    const transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, pixel_count + 257);
+    defer gpa.free(transform_pixels);
+
+    const entropy_image = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    defer gpa.free(entropy_image);
+
+    var buffers = vp8l_decoder.WorkBuffers{
+        .transform_pixels = transform_pixels,
+        .entropy_image = entropy_image,
+    };
+    _ = try vp8l_decoder.decodeImageStreamAlloc(
+        gpa,
+        stream,
+        dimensions,
+        argb_pixels,
+        &buffers,
+    );
+
+    const plane = output[0..pixel_count];
+    for (argb_pixels, plane) |value, *sample| {
+        sample.* = vp8l_pixel.green(value);
+    }
+
+    unfilterPlaneInPlace(header.filter, plane, dimensions);
+}
+
+fn unfilterPlaneInPlace(
+    filter: Filter,
+    plane: []u8,
+    dimensions: image.Dimensions,
+) void {
+    if (filter == .none) return;
+
+    const width: usize = dimensions.width;
+    const height: usize = dimensions.height;
+    assert(plane.len == width * height);
+
+    var prev_row: ?[]const u8 = null;
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const row = plane[y * width ..][0..width];
+        unfilterRow(filter, prev_row, row, row);
+        prev_row = row;
+    }
 }
 
 /// Decodes an uncompressed alpha stream (the ALPH payload after the header
@@ -280,7 +376,7 @@ test "rejects truncated and undersized raw alpha buffers" {
     _ = try decodePlane(&trailing, dimensions, &output);
 }
 
-test "rejects lossless alpha compression until implemented" {
+test "allocator-free decode rejects lossless alpha compression" {
     const dimensions = try image.Dimensions.init(1, 1);
     var output: [1]u8 = undefined;
     const payload = [_]u8{ 0b01, 0x2f };
@@ -289,6 +385,79 @@ test "rejects lossless alpha compression until implemented" {
         error.UnsupportedAlphaCompression,
         decodePlane(&payload, dimensions, &output),
     );
+}
+
+test "decodes VP8L-compressed alpha with no filter" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var payload: [32]u8 = undefined;
+    const encoded = try makeConstantLosslessAlpha(&payload, .none, 77);
+
+    var output: [2]u8 = undefined;
+    const header = try decodePlaneAlloc(
+        std.testing.allocator,
+        encoded,
+        dimensions,
+        &output,
+    );
+
+    try std.testing.expectEqual(Compression.lossless, header.compression);
+    try std.testing.expectEqual(Filter.none, header.filter);
+    try std.testing.expectEqualSlices(u8, &.{ 77, 77 }, &output);
+}
+
+test "decodes VP8L-compressed alpha with horizontal filter" {
+    const dimensions = try image.Dimensions.init(2, 2);
+    var payload: [32]u8 = undefined;
+    const encoded = try makeConstantLosslessAlpha(&payload, .horizontal, 3);
+
+    var output: [4]u8 = undefined;
+    _ = try decodePlaneAlloc(std.testing.allocator, encoded, dimensions, &output);
+
+    // The VP8L stream decodes residual 3 everywhere; rows then unfilter in
+    // place: row 0 accumulates from 0, row 1 starts from the sample above.
+    try std.testing.expectEqualSlices(u8, &.{ 3, 6, 6, 9 }, &output);
+}
+
+test "rejects truncated VP8L-compressed alpha streams" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    const payload = [_]u8{0b01};
+
+    var output: [2]u8 = undefined;
+    try std.testing.expectError(
+        error.TruncatedBitstream,
+        decodePlaneAlloc(std.testing.allocator, &payload, dimensions, &output),
+    );
+}
+
+/// Test-only writer for a lossless ALPH payload holding a headerless VP8L
+/// stream whose green channel is a constant residual value.
+fn makeConstantLosslessAlpha(
+    out: []u8,
+    filter: Filter,
+    green: u8,
+) errors.Error![]const u8 {
+    out[0] = @as(u8, @intFromEnum(Compression.lossless)) |
+        (@as(u8, @intFromEnum(filter)) << 2);
+
+    var writer = bit_writer.BitWriter.init(out[header_size..]);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writer.writeBit(0);
+    try writeSimplePrefixCode(&writer, green);
+    try writeSimplePrefixCode(&writer, 0);
+    try writeSimplePrefixCode(&writer, 0);
+    try writeSimplePrefixCode(&writer, 255);
+    try writeSimplePrefixCode(&writer, 0);
+    const stream = try writer.finish();
+
+    return out[0 .. header_size + stream.len];
+}
+
+fn writeSimplePrefixCode(writer: *bit_writer.BitWriter, symbol: u8) errors.Error!void {
+    try writer.writeBit(1);
+    try writer.writeBit(0);
+    try writer.writeBit(if (symbol <= 1) 0 else 1);
+    try writer.writeBits(symbol, if (symbol <= 1) 1 else 8);
 }
 
 /// Test-only forward filter applying the spec predictors in encode direction.

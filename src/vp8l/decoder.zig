@@ -71,6 +71,28 @@ pub fn decodeARGBAlloc(
     return decodeARGBInternal(gpa, payload, output, buffers);
 }
 
+/// Decodes a headerless VP8L image-data stream (transform list included)
+/// with externally supplied dimensions, as used by VP8L-compressed ALPH
+/// chunk payloads.
+pub fn decodeImageStream(
+    data: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!entropy.DecodeSummary {
+    return decodeImageStreamInternal(null, data, dimensions, output, buffers);
+}
+
+pub fn decodeImageStreamAlloc(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!entropy.DecodeSummary {
+    return decodeImageStreamInternal(gpa, data, dimensions, output, buffers);
+}
+
 fn decodeARGBInternal(
     gpa: ?std.mem.Allocator,
     payload: []const u8,
@@ -78,9 +100,29 @@ fn decodeARGBInternal(
     buffers: *WorkBuffers,
 ) errors.Error!Result {
     const parsed_header = try header.parse(payload);
+    const entropy_summary = try decodeImageStreamInternal(
+        gpa,
+        payload[header.byte_count..],
+        parsed_header.dimensions,
+        output,
+        buffers,
+    );
 
-    var reader = bit_reader.BitReader.init(payload[header.byte_count..]);
-    var transform_reader = transform.ListReader.init(parsed_header.dimensions);
+    return .{
+        .header = parsed_header,
+        .entropy_summary = entropy_summary,
+    };
+}
+
+fn decodeImageStreamInternal(
+    gpa: ?std.mem.Allocator,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!entropy.DecodeSummary {
+    var reader = bit_reader.BitReader.init(stream);
+    var transform_reader = transform.ListReader.init(dimensions);
     var transforms: [transform.transform_count_max]transform.Transform = undefined;
     var transform_data: [transform.transform_count_max]TransformData = undefined;
     var transform_dimensions: [transform.transform_count_max]image.Dimensions = undefined;
@@ -143,10 +185,7 @@ fn decodeARGBInternal(
         );
     }
 
-    return .{
-        .header = parsed_header,
-        .entropy_summary = entropy_summary,
-    };
+    return entropy_summary;
 }
 
 fn decodeMainImage(

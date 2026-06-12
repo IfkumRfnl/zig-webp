@@ -13,9 +13,9 @@ streams. Raw VP8L payload decode supports subtract-green, predictor, color, and
 color-indexing transforms, plus allocator-backed main-image meta-prefix/group
 stores. Static lossless WebP decode is available for still VP8L images and
 matches `dwebp -pam` on the local `libwebp-test-data` VP8L corpus. ALPH chunk
-header parsing and uncompressed alpha-plane decode with all four alpha filters
-are available; VP8L-compressed alpha, lossy decode, and animation are not
-available yet.
+alpha-plane decode is available for both uncompressed and VP8L-compressed
+streams with all four alpha filters, matching `dwebp` alpha output on the
+local corpus; lossy decode and animation are not available yet.
 
 ## Goals
 
