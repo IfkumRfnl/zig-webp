@@ -74,8 +74,22 @@ per-segment quantizer resolution (absolute and relative), the y2_dc doubling,
 the y2_ac 155/100 scaling with its floor of 8 (comptime-verified equivalent
 to libwebp's fixed-point form), and the uv_dc saturation at 132.
 
-Not yet started: coefficient token decode, intra prediction, inverse
-transforms, loop filtering, YUV output, and the `compare-yuv` oracle mode.
+Coefficient token decode is implemented in `src/vp8/tokens.zig`: the RFC
+6386 section 13 token tree as explicit branches, coefficient bands with the
+position-16 sentinel, zigzag scatter, extra-bit categories with MSB-first
+probabilities (cat6 reaching 2114; the RFC's "67 - 2048" comment is wrong),
+sign bits, dequantize-at-store with wrapping i16 semantics, per-plane
+first-coefficient handling (Y-after-Y2 starts at 1), left/above nonzero
+contexts at subblock granularity, the skipped-macroblock rule that preserves
+Y2 context for B_PRED macroblocks, and implicit-skip reporting for the loop
+filter. The boolean reader now zero-pads short initial loads (tiny final
+token partitions are valid; `vp80-05-sharpness-1430.webp` splits 4 bytes
+across partitions) and `BoolReader.init` no longer fails. A corpus test
+decodes every coefficient of all 88 lossy still files end-to-end (modes,
+per-row partition selection, contexts) without error.
+
+Not yet started: intra prediction, inverse transforms, loop filtering,
+YUV output, and the `compare-yuv` oracle mode.
 
 ## Completed Steps
 

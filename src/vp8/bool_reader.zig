@@ -19,14 +19,18 @@ pub const BoolReader = struct {
     value: u32,
     bit_count: u4,
 
-    pub fn init(bytes: []const u8) Error!BoolReader {
-        if (bytes.len < 2) return error.TruncatedBitstream;
-
+    /// Initialization cannot fail: short inputs (down to zero bytes) have
+    /// their 16-bit preload zero-padded, mirroring libwebp's lazy loading
+    /// where tiny final token partitions are valid. Reads that need a byte
+    /// beyond the input still fail with error.TruncatedBitstream.
+    pub fn init(bytes: []const u8) BoolReader {
+        const byte_0: u32 = if (bytes.len > 0) bytes[0] else 0;
+        const byte_1: u32 = if (bytes.len > 1) bytes[1] else 0;
         return .{
             .bytes = bytes,
-            .offset = 2,
+            .offset = @min(bytes.len, 2),
             .range = range_max,
-            .value = (@as(u32, bytes[0]) << 8) | bytes[1],
+            .value = (byte_0 << 8) | byte_1,
             .bit_count = 0,
         };
     }
@@ -213,7 +217,7 @@ comptime {
 
 test "VP8 bool reader initializes from the first sixteen input bits" {
     const bytes = [_]u8{ 0x12, 0x34, 0x56 };
-    var reader = try BoolReader.init(&bytes);
+    var reader = BoolReader.init(&bytes);
 
     try std.testing.expectEqual(@as(usize, 2), reader.loadedBytes());
     try std.testing.expectEqual(@as(usize, 1), reader.remainingBytes());
@@ -222,14 +226,29 @@ test "VP8 bool reader initializes from the first sixteen input bits" {
     try std.testing.expectEqual(@as(u32, 0x1234), reader.value);
 }
 
-test "VP8 bool reader requires two bytes of initial value" {
-    try std.testing.expectError(error.TruncatedBitstream, BoolReader.init(&.{}));
-    try std.testing.expectError(error.TruncatedBitstream, BoolReader.init(&.{0}));
+test "VP8 bool reader zero-pads short initial loads" {
+    // Tiny valid token partitions (down to zero bytes) must initialize;
+    // only reads that need a byte beyond the input fail.
+    var empty_reader = BoolReader.init(&.{});
+    try std.testing.expectEqual(@as(u32, 0), empty_reader.value);
+    try std.testing.expectEqual(@as(usize, 0), empty_reader.loadedBytes());
+
+    // The zero-padded preload carries eight shift-free zero flags: the
+    // first read keeps the range at 128 and each following read shifts one
+    // bit, so the ninth read is the first to need a real byte.
+    var reads_done: u32 = 0;
+    while (reads_done < 8) : (reads_done += 1) {
+        try std.testing.expectEqual(@as(u1, 0), try empty_reader.readBit());
+    }
+    try std.testing.expectError(error.TruncatedBitstream, empty_reader.readBit());
+
+    var one_byte_reader = BoolReader.init(&.{0x80});
+    try std.testing.expectEqual(@as(u1, 1), try one_byte_reader.readBit());
 }
 
 test "VP8 bool reader reads even-probability flags from high-order input bits" {
     const bytes = [_]u8{ 0xb0, 0x00, 0x00 };
-    var reader = try BoolReader.init(&bytes);
+    var reader = BoolReader.init(&bytes);
 
     try std.testing.expectEqual(@as(u32, 0b1011), try reader.readLiteral(4));
     try std.testing.expectEqual(@as(u1, 0), try reader.readBit());
@@ -239,29 +258,29 @@ test "VP8 bool reader reads even-probability flags from high-order input bits" {
 }
 
 test "VP8 bool reader handles biased probabilities" {
-    var low_reader = try BoolReader.init(&.{ 0x01, 0x00 });
+    var low_reader = BoolReader.init(&.{ 0x01, 0x00 });
     try std.testing.expectEqual(@as(u1, 1), try low_reader.readBool(0));
 
-    var high_reader = try BoolReader.init(&.{ 0xfe, 0x01 });
+    var high_reader = BoolReader.init(&.{ 0xfe, 0x01 });
     try std.testing.expectEqual(@as(u1, 1), try high_reader.readBool(255));
 
-    var zero_reader = try BoolReader.init(&.{ 0x00, 0xff });
+    var zero_reader = BoolReader.init(&.{ 0x00, 0xff });
     try std.testing.expectEqual(@as(u1, 0), try zero_reader.readBool(0));
 }
 
 test "VP8 bool reader reads signed literals and probability helpers" {
-    var signed_reader = try BoolReader.init(&.{ 0x5c, 0x00, 0x00 });
+    var signed_reader = BoolReader.init(&.{ 0x5c, 0x00, 0x00 });
     try std.testing.expectEqual(@as(i32, -5), try signed_reader.readSignedLiteral(4));
     try std.testing.expectEqual(@as(u1, 1), try signed_reader.readBit());
 
-    var zero_signed_reader = try BoolReader.init(&.{ 0x04, 0x00, 0x00 });
+    var zero_signed_reader = BoolReader.init(&.{ 0x04, 0x00, 0x00 });
     try std.testing.expectEqual(@as(i32, 0), try zero_signed_reader.readSignedLiteral(4));
     try std.testing.expectEqual(@as(u1, 1), try zero_signed_reader.readBit());
 
-    var probability_reader = try BoolReader.init(&.{ 0x54, 0x00, 0x00 });
+    var probability_reader = BoolReader.init(&.{ 0x54, 0x00, 0x00 });
     try std.testing.expectEqual(@as(Probability, 84), try probability_reader.readProbability7());
 
-    var zero_probability_reader = try BoolReader.init(&.{ 0x00, 0x00, 0x00 });
+    var zero_probability_reader = BoolReader.init(&.{ 0x00, 0x00, 0x00 });
     try std.testing.expectEqual(
         @as(Probability, 1),
         try zero_probability_reader.readProbability7(),
@@ -276,7 +295,7 @@ test "VP8 bool reader walks coding trees to leaf values" {
     const tree = [6]i8{ 2, 4, 0, -1, -2, -3 };
     const probabilities = [3]u8{ 128, 128, 128 };
 
-    var reader = try BoolReader.init(&.{ 0b00_01_10_11, 0x00, 0x00 });
+    var reader = BoolReader.init(&.{ 0b00_01_10_11, 0x00, 0x00 });
     try std.testing.expectEqual(@as(u8, 0), try reader.readTree(&tree, &probabilities));
     try std.testing.expectEqual(@as(u8, 1), try reader.readTree(&tree, &probabilities));
     try std.testing.expectEqual(@as(u8, 2), try reader.readTree(&tree, &probabilities));
@@ -290,7 +309,7 @@ test "VP8 bool reader reads unbalanced tree leaves at differing depths" {
     const tree = [6]i8{ -7, 2, -6, 4, -8, -9 };
     const probabilities = [3]u8{ 128, 128, 128 };
 
-    var reader = try BoolReader.init(&.{ 0b01011011, 0b10000000, 0x00 });
+    var reader = BoolReader.init(&.{ 0b01011011, 0b10000000, 0x00 });
     try std.testing.expectEqual(@as(u8, 7), try reader.readTree(&tree, &probabilities));
     try std.testing.expectEqual(@as(u8, 6), try reader.readTree(&tree, &probabilities));
     try std.testing.expectEqual(@as(u8, 8), try reader.readTree(&tree, &probabilities));
@@ -303,7 +322,7 @@ test "VP8 bool reader reports truncation inside a tree read" {
 
     // Zero bits shift one normalization bit each after the first read, so
     // eight reads park the reader one bit short of needing a third byte.
-    var reader = try BoolReader.init(&.{ 0x00, 0x00 });
+    var reader = BoolReader.init(&.{ 0x00, 0x00 });
     var drained: u32 = 0;
     while (drained < 8) : (drained += 1) {
         _ = try reader.readBit();
@@ -315,7 +334,7 @@ test "VP8 bool reader reports truncation inside a tree read" {
 }
 
 test "VP8 bool reader reports invalid literal widths" {
-    var reader = try BoolReader.init(&.{ 0x00, 0x00, 0x00 });
+    var reader = BoolReader.init(&.{ 0x00, 0x00, 0x00 });
 
     try std.testing.expectError(error.InvalidBitCount, reader.readLiteral(33));
     try std.testing.expectError(error.InvalidBitCount, reader.readSignedLiteral(32));
@@ -324,7 +343,7 @@ test "VP8 bool reader reports invalid literal widths" {
 
 test "VP8 bool reader reports truncation without advancing state" {
     const bytes = [_]u8{ 0x00, 0x00 };
-    var reader = try BoolReader.init(&bytes);
+    var reader = BoolReader.init(&bytes);
 
     try std.testing.expectError(error.TruncatedBitstream, reader.readLiteral(9));
     try std.testing.expectEqual(@as(usize, 2), reader.loadedBytes());

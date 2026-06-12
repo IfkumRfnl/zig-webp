@@ -119,7 +119,7 @@ pub fn parse(payload: []const u8, parsed: *Parsed) Error!void {
     }
 
     const first_partition_end = header_byte_count + parsed.header.tag.first_partition_size;
-    var reader = try bool_reader.BoolReader.init(payload[header_byte_count..first_partition_end]);
+    var reader = bool_reader.BoolReader.init(payload[header_byte_count..first_partition_end]);
 
     parsed.header.color_space = try reader.readBit();
     parsed.header.clamping_type = try reader.readBit();
@@ -710,7 +710,7 @@ test "rejects declared token partition sizes that overrun the payload" {
     try writer.writeLiteral(1, 2); // Two token partitions.
     const partial = try writer.finish();
 
-    var reader = try bool_reader.BoolReader.init(partial);
+    var reader = bool_reader.BoolReader.init(partial);
     _ = try reader.readBit(); // Color space.
     _ = try reader.readBit(); // Clamping.
     _ = try parseSegmentation(&reader);

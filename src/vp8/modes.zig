@@ -628,7 +628,7 @@ test "derives subblock contexts from 16x16 luma modes" {
     );
 
     const encoded = try writer.finish();
-    var reader = try bool_reader.BoolReader.init(encoded);
+    var reader = bool_reader.BoolReader.init(encoded);
 
     var macroblocks: [2]Macroblock = undefined;
     try parseKeyFrameModes(&reader, &header, &macroblocks);
@@ -732,7 +732,7 @@ test "round-trips prediction records across a mixed grid" {
     try writer.writeLiteral(0x5, 4);
     const encoded = try writer.finish();
 
-    var reader = try bool_reader.BoolReader.init(encoded);
+    var reader = bool_reader.BoolReader.init(encoded);
     var macroblocks: [6]Macroblock = undefined;
     try parseKeyFrameModes(&reader, &header, &macroblocks);
 
@@ -755,7 +755,7 @@ test "rejects truncated prediction records" {
 
     // An all-ones value drains range fast (every read takes the low-
     // probability branch), so two bytes cannot carry even one record.
-    var reader = try bool_reader.BoolReader.init(&.{ 0xff, 0xff });
+    var reader = bool_reader.BoolReader.init(&.{ 0xff, 0xff });
     var macroblocks: [2]Macroblock = undefined;
     try std.testing.expectError(
         error.TruncatedBitstream,
@@ -821,7 +821,7 @@ fn fuzzParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const input_len = smith.slice(&input_buffer);
 
     const header = fuzzHeader();
-    var reader = bool_reader.BoolReader.init(input_buffer[0..input_len]) catch return;
+    var reader = bool_reader.BoolReader.init(input_buffer[0..input_len]);
     var macroblocks: [fuzz_macroblock_count]Macroblock = undefined;
     parseKeyFrameModes(&reader, &header, &macroblocks) catch return;
 }
