@@ -22,6 +22,7 @@ pub const vp8_bool_reader = @import("vp8/bool_reader.zig");
 pub const vp8_bool_writer = @import("vp8/bool_writer.zig");
 pub const vp8_frame_header = @import("vp8/frame_header.zig");
 pub const vp8_modes = @import("vp8/modes.zig");
+pub const vp8_prediction = @import("vp8/prediction.zig");
 pub const vp8_quant = @import("vp8/quant.zig");
 pub const vp8_token_probs = @import("vp8/token_probs.zig");
 pub const vp8_tokens = @import("vp8/tokens.zig");
