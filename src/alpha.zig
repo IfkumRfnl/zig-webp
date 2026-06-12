@@ -493,3 +493,28 @@ fn forwardFilterPlane(
         }
     }
 }
+
+test "fuzz alpha plane decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    // A valid seed: uncompressed, unfiltered header byte plus an 8x8 plane.
+    const plane_payload = [_]u8{0} ++ [_]u8{0x80} ** 64;
+    var seed_buffer: [plane_payload.len + testing_fuzz.slice_length_prefix_size]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, &plane_payload);
+
+    try std.testing.fuzz({}, fuzzDecodePlaneOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzDecodePlaneOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [1024]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+
+    const dimensions = try image.Dimensions.init(8, 8);
+    var output: [64]u8 = undefined;
+    _ = decodePlaneAlloc(
+        std.testing.allocator,
+        input_buffer[0..input_len],
+        dimensions,
+        &output,
+    ) catch return;
+}

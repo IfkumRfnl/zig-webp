@@ -354,17 +354,16 @@ input.
 
 ## Near-Term Work Items
 
-1. Add fuzz smoke targets for strict demux, VP8L decode, and alpha decode
-   using Zig's built-in fuzzer, runnable from `zig build`, before VP8
-   decoder work begins.
-2. Add CI: `zig fmt --check .` and `zig build test` on every pull request,
+1. Add CI: `zig fmt --check .` and `zig build test` on every pull request,
    plus hash-based corpus regression using committed SHA-256 hashes of
    known-good decoded planes so CI needs no `dwebp`.
+2. Continue step 5 reconstruction: macroblock mode parsing, dequantization,
+   intra prediction, inverse transforms, and loop filtering on top of the
+   landed frame header parser.
 3. Add a `compare-yuv` mode to `tools/webp-oracle.sh` backed by a YUV
-   plane-dump build target, mirroring the existing alpha tooling.
-4. Start step 5 reconstruction: VP8 frame header parsing on top of the
-   existing boolean reader, with unit and invalid-input tests.
-5. Once step 5 reaches full-frame reconstruction, compose alpha over lossy
+   plane-dump build target, mirroring the existing alpha tooling, as soon
+   as reconstruction can emit YUV planes for the tool to dump.
+4. Once step 5 reaches full-frame reconstruction, compose alpha over lossy
    color to close out the step 4 remainder.
 
 This order keeps early work testable and prevents the project from becoming

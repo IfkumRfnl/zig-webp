@@ -14,6 +14,21 @@ needs the VP8 decoder. Step 5 reconstruction has started: key-frame header
 parsing is in place (see below). The near-term fuzzing and CI items listed
 in `PLAN.MD` remain open and should land before reconstruction goes deeper.
 
+## Cross-Cutting Practices
+
+Fuzz smoke targets are in place for every public decode entry point: strict
+demux (`src/demux.zig`), VP8L still-image decode (`src/vp8l/decoder.zig`),
+alpha plane decode (`src/alpha.zig`), VP8 key-frame header parsing
+(`src/vp8/frame_header.zig`), and the public static decode composition
+(`src/decode.zig`). Each target uses `std.testing.fuzz` with a valid corpus
+seed (framed via `src/testing/fuzz.zig` so seeds reach the parser
+byte-for-byte) and runs under plain `zig build test` as a corpus +
+empty-input smoke pass with leak detection. Coverage-guided runs via
+`zig build test --fuzz` are currently blocked by an upstream Zig 0.16.0
+bug: the bundled `lib/compiler/test_runner.zig` fails to compile under fuzz
+instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
+Revisit when the toolchain updates.
+
 ## In Progress
 
 ### Step 5 — VP8 Lossy Decoder

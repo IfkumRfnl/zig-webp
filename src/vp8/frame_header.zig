@@ -724,3 +724,28 @@ test "rejects declared token partition sizes that overrun the payload" {
         parseTokenPartitions(&reader, &oversized),
     );
 }
+
+test "fuzz VP8 key-frame header parsing" {
+    const testing_fuzz = @import("../testing/fuzz.zig");
+
+    var compressed_buffer: [128]u8 = undefined;
+    var writer = bool_writer.BoolWriter.init(&compressed_buffer);
+    try writeMinimalCompressedHeader(&writer);
+    const compressed = try writer.finish();
+
+    var payload_buffer: [192]u8 = undefined;
+    const seed_payload = assemblePayload(&payload_buffer, compressed, &.{0xee});
+
+    var seed_buffer: [256]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, seed_payload);
+
+    try std.testing.fuzz({}, fuzzParseOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [1024]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+
+    var parsed: Parsed = undefined;
+    parse(input_buffer[0..input_len], &parsed) catch return;
+}

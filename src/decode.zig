@@ -362,3 +362,40 @@ test "static decode applies allocation limit to meta-prefix group storage" {
         }),
     );
 }
+
+test "fuzz public static decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    var seed_buffer: [128]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, encoded);
+
+    try std.testing.fuzz({}, fuzzDecodeStaticOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzDecodeStaticOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [2048]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+
+    var decoded = decodeStatic(std.testing.allocator, input_buffer[0..input_len], .{
+        .limits = .{
+            .output_pixels_max = 1 << 16,
+            .allocation_bytes_max = 1 << 22,
+        },
+    }) catch return;
+    decoded.deinit();
+}
