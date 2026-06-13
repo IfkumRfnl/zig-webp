@@ -1,13 +1,13 @@
-//! VP8 key-frame reconstruction (RFC 6386 sections 12 through 14).
+//! VP8 key-frame reconstruction (RFC 6386 sections 12 through 15).
 //!
 //! Orchestrates the already-implemented stages — frame header, prediction
 //! records, per-segment dequantization, token decode, intra prediction, and
-//! inverse transforms — into full-frame YUV reconstruction. The loop filter
-//! is not applied yet: output currently matches `dwebp -nofilter -yuv`
-//! (which disables the in-loop filter and nothing else); the filter pass is
-//! the next slice and runs strictly after whole-frame reconstruction, which
-//! is provably bit-identical to libwebp's row pipeline because intra
-//! prediction only ever reads unfiltered pixels.
+//! inverse transforms — into full-frame YUV reconstruction, then applies the
+//! in-loop deblocking filter as a final pass (`loop_filter.zig`). Running the
+//! filter strictly after whole-frame reconstruction is bit-identical to
+//! libwebp's row pipeline because intra prediction only ever reads unfiltered
+//! pixels (the above row is snapshotted before any filtering touches it).
+//! Filtering can be disabled via `DecodeOptions` to match `dwebp -nofilter`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,6 +15,7 @@ const assert = std.debug.assert;
 const bool_reader = @import("bool_reader.zig");
 const errors = @import("../errors.zig");
 const frame_header = @import("frame_header.zig");
+const loop_filter = @import("loop_filter.zig");
 const modes = @import("modes.zig");
 const prediction = @import("prediction.zig");
 const quant = @import("quant.zig");
@@ -22,6 +23,13 @@ const tokens = @import("tokens.zig");
 const transform = @import("transform.zig");
 
 pub const Error = errors.Error;
+
+/// Decode-time options for the VP8 reconstruction path.
+pub const DecodeOptions = struct {
+    /// Apply the RFC 6386 section 15 in-loop deblocking filter as a final
+    /// pass. Set false for `dwebp -nofilter`-equivalent output.
+    apply_loop_filter: bool,
+};
 
 pub const macroblock_size = 16;
 pub const chroma_block_size = 8;
@@ -58,19 +66,41 @@ pub const Frame = struct {
 };
 
 /// Decodes a complete `VP8 ` chunk payload (frame header through pixels).
-pub fn decodeFrame(gpa: std.mem.Allocator, payload: []const u8) Error!Frame {
+pub fn decodeFrame(
+    gpa: std.mem.Allocator,
+    payload: []const u8,
+    options: DecodeOptions,
+) Error!Frame {
     var parsed: frame_header.Parsed = undefined;
     try frame_header.parse(payload, &parsed);
-    return decodeFrameParsed(gpa, &parsed);
+    return decodeFrameParsed(gpa, &parsed, options);
 }
 
-pub fn decodeFrameParsed(gpa: std.mem.Allocator, parsed: *frame_header.Parsed) Error!Frame {
+pub fn decodeFrameParsed(
+    gpa: std.mem.Allocator,
+    parsed: *frame_header.Parsed,
+    options: DecodeOptions,
+) Error!Frame {
     const header = &parsed.header;
     const grid = modes.MacroblockGrid.init(header.picture.dimensions);
 
     const macroblocks = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
     defer gpa.free(macroblocks);
     try modes.parseKeyFrameModes(&parsed.macroblock_reader, header, macroblocks);
+
+    const filter_type = if (options.apply_loop_filter)
+        loop_filter.filterType(header)
+    else
+        loop_filter.Type.none;
+    const will_filter = filter_type != .none;
+
+    // Residual presence per macroblock feeds the loop filter's interior-edge
+    // decision; only allocated when a filter pass will actually run.
+    const has_nonzero: []bool = if (will_filter)
+        try gpa.alloc(bool, grid.macroblockCount())
+    else
+        &.{};
+    defer if (will_filter) gpa.free(has_nonzero);
 
     const factors = quant.segmentFactors(header);
 
@@ -123,20 +153,22 @@ pub fn decodeFrameParsed(gpa: std.mem.Allocator, parsed: *frame_header.Parsed) E
         while (column < grid.columns) : (column += 1) {
             const macroblock = &macroblocks[row * grid.columns + column];
             const has_y2 = macroblock.luma_mode != .subblocks;
-            const options = tokens.MacroblockOptions{
+            const token_options = tokens.MacroblockOptions{
                 .probabilities = &header.coefficient_probabilities,
                 .factors = &factors[macroblock.segment_id],
                 .has_y2 = has_y2,
                 .skip = header.skip_enabled and macroblock.skip,
             };
-            // The implicit-skip result will feed the loop filter slice.
-            _ = try tokens.decodeMacroblock(
+            const any_nonzero = try tokens.decodeMacroblock(
                 reader,
-                options,
+                token_options,
                 &left_flags,
                 &above_flags[column],
                 &coefficients,
             );
+            if (will_filter) {
+                has_nonzero[row * grid.columns + column] = any_nonzero;
+            }
 
             if (has_y2) {
                 // Scatter the inverse WHT of the Y2 block into the DC slot
@@ -160,6 +192,19 @@ pub fn decodeFrameParsed(gpa: std.mem.Allocator, parsed: *frame_header.Parsed) E
             scratch.copyOut(&frame, column, row);
             scratch.stashTopSamples(&top_samples[column]);
         }
+    }
+
+    // The deblocking filter runs only after the whole frame is reconstructed
+    // and every above-row snapshot has been taken from unfiltered pixels.
+    if (will_filter) {
+        const strengths = loop_filter.computeStrengths(header);
+        loop_filter.applyFrame(.{
+            .luma = frame.luma,
+            .chroma_u = frame.chroma_u,
+            .chroma_v = frame.chroma_v,
+            .luma_stride = frame.luma_stride,
+            .chroma_stride = frame.chroma_stride,
+        }, grid, macroblocks, has_nonzero, &strengths, filter_type);
     }
 
     return frame;
@@ -535,7 +580,7 @@ test "reconstructs a skipped DC-mode frame as flat 128" {
     var payload_buffer: [600]u8 = undefined;
     const payload = try assembleSkippedFramePayload(&payload_buffer, 16, 16, 1, &.{0});
 
-    var frame = try decodeFrame(std.testing.allocator, payload);
+    var frame = try decodeFrame(std.testing.allocator, payload, .{ .apply_loop_filter = true });
     defer frame.deinit();
 
     try std.testing.expectEqual(@as(u32, 16), frame.width);
@@ -553,7 +598,7 @@ test "reconstructs neighbor-fed prediction across macroblocks" {
     var payload_buffer: [600]u8 = undefined;
     const payload = try assembleSkippedFramePayload(&payload_buffer, 32, 16, 2, &.{ 0, 1 });
 
-    var frame = try decodeFrame(std.testing.allocator, payload);
+    var frame = try decodeFrame(std.testing.allocator, payload, .{ .apply_loop_filter = true });
     defer frame.deinit();
 
     for (0..16) |row| {
@@ -599,6 +644,8 @@ fn fuzzDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const grid = modes.MacroblockGrid.init(parsed.header.picture.dimensions);
     if (grid.macroblockCount() > 64) return;
 
-    var frame = decodeFrameParsed(std.testing.allocator, &parsed) catch return;
+    var frame = decodeFrameParsed(std.testing.allocator, &parsed, .{
+        .apply_loop_filter = true,
+    }) catch return;
     frame.deinit();
 }

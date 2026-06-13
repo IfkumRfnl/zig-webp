@@ -27,17 +27,9 @@ pub fn main(init: std.process.Init) !void {
             io,
             "usage: zig-webp-yuv [--nofilter] INPUT.webp OUTPUT.raw\n" ++
                 "Writes decoded Y, U, V planes (cropped, tightly packed) like\n" ++
-                "`dwebp -yuv` without the appended alpha plane.\n" ++
+                "`dwebp -yuv` without the appended alpha plane. Pass --nofilter\n" ++
+                "to skip the in-loop deblocking filter (matches `dwebp -nofilter`).\n" ++
                 "Exits 3 when the file is not a static lossy image.\n",
-        );
-        std.process.exit(2);
-    }
-    if (!nofilter) {
-        // The loop filter is not implemented yet; refuse to emit output
-        // that could not match plain `dwebp -yuv`.
-        try std.Io.File.stderr().writeStreamingAll(
-            io,
-            "error: only --nofilter output is supported until the loop filter lands\n",
         );
         std.process.exit(2);
     }
@@ -72,7 +64,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(not_lossy_exit_code);
     };
 
-    var frame = try webp.vp8_decoder.decodeFrame(gpa, image_chunk.payload(bytes));
+    var frame = try webp.vp8_decoder.decodeFrame(gpa, image_chunk.payload(bytes), .{
+        .apply_loop_filter = !nofilter,
+    });
     defer frame.deinit();
 
     const chroma_width = frame.chromaWidth();
