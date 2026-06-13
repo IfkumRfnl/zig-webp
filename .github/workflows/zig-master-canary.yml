@@ -1,0 +1,47 @@
+name: Zig master canary
+
+# Early warning for toolchain breakage, and a watch on the upstream bug
+# that blocks coverage-guided fuzzing on 0.16.0 (see PROGRESS.MD). This
+# workflow is informational: it never gates pull requests.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # weekly, Monday 05:17 UTC
+  workflow_dispatch:
+
+jobs:
+  canary:
+    name: Build and test on Zig master
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Zig version
+        run: zig version
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Run tests
+        run: zig build test
+
+      # Probes whether the upstream fuzz-runner compile bug is fixed.
+      # While the bug persists this step fails fast at compile time; once
+      # fixed, fuzzing starts and the bounded timeout exits 124, which we
+      # treat as success ("fuzzing ran").
+      - name: Probe coverage-guided fuzzing
+        run: |
+          set +e
+          timeout 120 zig build test --fuzz
+          status=$?
+          if [ "$status" = "124" ]; then
+            echo "Fuzzing ran until the time bound: upstream blocker appears FIXED."
+            exit 0
+          fi
+          echo "fuzz probe exit: $status (non-124 means still blocked or test failure)"
+          exit "$status"
