@@ -518,3 +518,23 @@ fn fuzzDecodePlaneOne(_: void, smith: *std.testing.Smith) anyerror!void {
         &output,
     ) catch return;
 }
+
+fn decodePlaneAllocationProbe(gpa: std.mem.Allocator, payload: []const u8) !void {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var output: [2]u8 = undefined;
+    _ = try decodePlaneAlloc(gpa, payload, dimensions, &output);
+}
+
+test "compressed alpha decode survives allocation failure at every site" {
+    // Exercise the VP8L-compressed branch (decodeLossless), which makes the
+    // allocations; the uncompressed branch allocates nothing. The probe's
+    // 2x1 dimensions match this single-color stream.
+    var payload: [32]u8 = undefined;
+    const encoded = try makeConstantLosslessAlpha(&payload, .none, 77);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodePlaneAllocationProbe,
+        .{encoded},
+    );
+}

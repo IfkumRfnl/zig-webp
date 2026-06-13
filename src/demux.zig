@@ -1223,3 +1223,64 @@ fn fuzzParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var result = parse(std.testing.allocator, input_buffer[0..input_len], .{}) catch return;
     result.deinit();
 }
+
+fn parseAllocationProbe(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    var result = try parse(gpa, bytes, .{});
+    result.deinit();
+}
+
+fn parseFeaturesAllocationProbe(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    // parseFeatures returns a features.Summary by value (no owned allocations);
+    // it parses into a Result internally and frees it before returning.
+    _ = try parseFeatures(gpa, bytes, .{});
+}
+
+// Builds a simple WebP carrying a VP8 frame plus an ancillary comment chunk so
+// both the chunk list and the unknown-chunk list allocate.
+fn makeAllocationProbeFile(bytes: []u8) []const u8 {
+    const vp8 = makeSimpleVP8(1, 1);
+    const comment = "test1x1";
+    const riff_size = 4 +
+        (container.chunk_header_size + vp8.len) +
+        (container.chunk_header_size + comment.len + 1);
+    assert(bytes.len == 8 + riff_size);
+    @memcpy(bytes[0..4], "RIFF");
+    container.writeLittleU32(bytes[4..8], riff_size);
+    @memcpy(bytes[8..12], "WEBP");
+    var offset: usize = 12;
+    writeChunk(bytes, &offset, "VP8 ", &vp8);
+    writeChunk(bytes, &offset, "ICMT", comment);
+    return bytes;
+}
+
+test "demux parse survives allocation failure at every site" {
+    const vp8 = makeSimpleVP8(1, 1);
+    const comment = "test1x1";
+    const riff_size = 4 +
+        (container.chunk_header_size + vp8.len) +
+        (container.chunk_header_size + comment.len + 1);
+    var bytes: [8 + riff_size]u8 = undefined;
+    const file = makeAllocationProbeFile(&bytes);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseAllocationProbe,
+        .{file},
+    );
+}
+
+test "demux parseFeatures survives allocation failure at every site" {
+    const vp8 = makeSimpleVP8(1, 1);
+    const comment = "test1x1";
+    const riff_size = 4 +
+        (container.chunk_header_size + vp8.len) +
+        (container.chunk_header_size + comment.len + 1);
+    var bytes: [8 + riff_size]u8 = undefined;
+    const file = makeAllocationProbeFile(&bytes);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseFeaturesAllocationProbe,
+        .{file},
+    );
+}

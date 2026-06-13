@@ -584,3 +584,21 @@ test "rejects invalid alpha payloads" {
         }, .{}),
     );
 }
+
+fn encodeStaticAllocationProbe(gpa: std.mem.Allocator, static_image: StaticImage) !void {
+    const encoded = try encodeStatic(gpa, static_image, .{});
+    gpa.free(encoded);
+}
+
+test "static encode survives allocation failure at every site" {
+    const vp8 = makeSimpleVP8(8, 6);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        encodeStaticAllocationProbe,
+        .{StaticImage{
+            .canvas = try image.Dimensions.init(8, 6),
+            .format = .lossy,
+            .bitstream = &vp8,
+        }},
+    );
+}

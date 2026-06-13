@@ -399,3 +399,49 @@ fn fuzzDecodeStaticOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }) catch return;
     decoded.deinit();
 }
+
+fn decodeStaticAllocationProbe(gpa: std.mem.Allocator, encoded: []const u8) !void {
+    var decoded = try decodeStatic(gpa, encoded, .{});
+    decoded.deinit();
+}
+
+test "static decode survives allocation failure at every site" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeStaticAllocationProbe,
+        .{encoded},
+    );
+}
+
+test "meta-prefix static decode survives allocation failure at every site" {
+    const dimensions = try image.Dimensions.init(3, 1);
+    var vp8l_payload: [64]u8 = undefined;
+    const bitstream = try makeMetaPrefixVP8L(&vp8l_payload, dimensions);
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeStaticAllocationProbe,
+        .{encoded},
+    );
+}
