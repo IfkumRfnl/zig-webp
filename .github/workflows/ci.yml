@@ -19,6 +19,11 @@ jobs:
       - name: Check formatting
         run: zig fmt --check .
 
+      # Compiles the library and the four CLI tools that back
+      # tools/webp-oracle.sh, so tool breakage cannot merge silently.
+      - name: Compile library and tools
+        run: zig build check
+
       # The unit test suite includes the hash-based corpus regression:
       # decoded RGBA and alpha planes of the committed corpus are compared
       # against SHA-256 hashes in testdata/corpus-hashes.tsv, so CI needs

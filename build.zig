@@ -18,9 +18,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(webp_library);
 
-    const check_step = b.step("check", "Compile the library");
-    check_step.dependOn(&webp_library.step);
-
     const decode_tool = b.addExecutable(.{
         .name = "zig-webp-decode",
         .root_module = b.createModule(.{
@@ -98,6 +95,13 @@ pub fn build(b: *std.Build) void {
         "Regenerate testdata/corpus-hashes.tsv from decoded corpus planes",
     );
     corpus_hashes_step.dependOn(&run_corpus_hashes_tool.step);
+
+    const check_step = b.step("check", "Compile the library and tools");
+    check_step.dependOn(&webp_library.step);
+    check_step.dependOn(&decode_tool.step);
+    check_step.dependOn(&alpha_tool.step);
+    check_step.dependOn(&yuv_tool.step);
+    check_step.dependOn(&corpus_hashes_tool.step);
 
     const unit_tests = b.addTest(.{
         .root_module = webp_module,
