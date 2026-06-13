@@ -122,6 +122,9 @@ These run continuously from now on rather than as scheduled steps.
 
 ## Proposed Module Layout
 
+Files marked `(planned: …)` do not exist yet; every other path is on disk
+today. Run `find src -name '*.zig' | sort` for the live tree.
+
 ```text
 src/root.zig
 src/container.zig
@@ -129,30 +132,45 @@ src/demux.zig
 src/mux.zig
 src/features.zig
 src/image.zig
-src/pixel.zig
-src/color.zig
+src/vp8l/pixel.zig
+src/color.zig              (planned: step 5 YUV-to-RGB)
 src/bit_reader.zig
 src/bit_writer.zig
 src/alpha.zig
 src/animation.zig
 src/metadata.zig
+src/options.zig
+src/limits.zig
+src/errors.zig
+src/decode.zig
 src/vp8/bool_reader.zig
 src/vp8/bool_writer.zig
 src/vp8/decoder.zig
-src/vp8/encoder.zig
-src/vp8/frame.zig
+src/vp8/encoder.zig        (planned: step 8)
+src/vp8/frame_header.zig
+src/vp8/modes.zig
 src/vp8/prediction.zig
 src/vp8/transform.zig
-src/vp8/loop_filter.zig
+src/vp8/loop_filter.zig    (planned: step 5)
 src/vp8/quant.zig
+src/vp8/tokens.zig
+src/vp8/token_probs.zig
 src/vp8l/decoder.zig
-src/vp8l/encoder.zig
+src/vp8l/encoder.zig       (planned: step 7)
 src/vp8l/huffman.zig
-src/vp8l/lz77.zig
+src/vp8l/lz77.zig          (planned: step 7)
 src/vp8l/transform.zig
+src/vp8l/inverse_transform.zig
 src/vp8l/color_cache.zig
+src/vp8l/entropy.zig
+src/vp8l/header.zig
+src/vp8l/image_data.zig
+src/vp8l/meta_prefix.zig
+src/vp8l/prefix_groups.zig
+src/testing.zig
 src/testing/corpus.zig
-src/testing/metrics.zig
+src/testing/fuzz.zig
+src/testing/metrics.zig    (planned: step 10)
 ```
 
 Fuzz targets live alongside the tests of the module they exercise, using

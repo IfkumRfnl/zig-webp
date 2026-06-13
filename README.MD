@@ -3,19 +3,16 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
-Status: VP8L decoder groundwork in progress. The current library exposes
-bounded public option, limit, image-buffer, metadata, animation-frame,
-feature-probing, RIFF/WebP demux, static mux, bitstream, VP8 boolean coder, and
-VP8L header/transform/Huffman image-data APIs. A limited raw VP8L path can
-materialize no-transform, single-prefix-group ARGB payloads and parse
-meta-prefix entropy images, prefix-code group storage, and multi-group entropy
-streams. Raw VP8L payload decode supports subtract-green, predictor, color, and
-color-indexing transforms, plus allocator-backed main-image meta-prefix/group
-stores. Static lossless WebP decode is available for still VP8L images and
-matches `dwebp -pam` on the local `libwebp-test-data` VP8L corpus. ALPH chunk
-alpha-plane decode is available for both uncompressed and VP8L-compressed
-streams with all four alpha filters, matching `dwebp` alpha output on the
-local corpus; lossy decode and animation are not available yet.
+Status: static lossless (VP8L) decode and ALPH alpha-plane decode are
+complete and match `dwebp` byte-for-byte on the local `libwebp-test-data`
+corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
+streams). The VP8 lossy decoder has reached full-frame pre-loop-filter
+reconstruction, byte-exact against `dwebp -nofilter -yuv` for all 88 lossy
+corpus files plus locally generated `cwebp` files; loop filtering,
+YUV-to-RGB conversion, alpha composition over lossy color, and animation
+decode are not available yet. The library also exposes bounded option and
+limit types, image buffers, metadata, animation-frame and feature probing,
+RIFF/WebP demux, static mux, and the VP8/VP8L bitstream infrastructure.
 
 ## Goals
 
@@ -23,6 +20,10 @@ local corpus; lossy decode and animation are not available yet.
 - Keep the implementation portable and dependency-free: no C, no system
   libraries, and no vendored codecs.
 - Favor explicit, bounded parsing paths suitable for fuzzing and audit.
+
+Scope boundaries (no streaming decode, no inter-frame VP8, no ICC
+application, no C ABI yet) and the full roadmap with acceptance gates live
+in `PLAN.MD`; current status and dated oracle results live in `PROGRESS.MD`.
 
 ## Use
 
