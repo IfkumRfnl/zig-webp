@@ -1,4 +1,17 @@
-//! Public module surface for zig-webp.
+//! Public module surface for zig-webp, a zero-dependency WebP codec.
+//!
+//! Most callers need only a handful of names:
+//! - `decodeStatic` — decode a complete WebP file to pixels
+//!   (still lossless only at present; see PLAN.MD step 5 for lossy).
+//! - `parseFeatures` — probe dimensions/format/alpha/animation/metadata
+//!   without decoding pixels.
+//! - `parseWebP` — strict RIFF demux to chunk locations.
+//! - `encodeStatic` — mux an existing VP8/VP8L bitstream into a WebP file.
+//! - `ResourceLimits` / `DecoderOptions` — bound untrusted-input handling.
+//!
+//! The `vp8_*` and `vp8l_*` exports expose codec internals for tooling,
+//! tests, and advanced callers; their APIs are less stable than the
+//! functions above.
 
 const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
@@ -53,19 +66,32 @@ pub const ChunkHeader = container.ChunkHeader;
 pub const ChunkKind = container.ChunkKind;
 pub const ChunkLocation = container.ChunkLocation;
 pub const ContainerHeader = container.ContainerHeader;
+/// Decode-time options: resource limits and output pixel format.
 pub const DecoderOptions = options.DecoderOptions;
 pub const DemuxOptions = demux.Options;
+/// Result of `parseWebP`: chunk locations, features, and metadata; the
+/// caller owns it and must call `deinit`.
 pub const DemuxResult = demux.Result;
+/// Validated image width and height in pixels.
 pub const Dimensions = image.Dimensions;
+/// Forward-looking encode options; no encode path consumes these yet
+/// (encoders are PLAN.MD steps 7-8).
 pub const EncoderOptions = options.EncoderOptions;
+/// The error set returned by every fallible entry point.
 pub const Error = errors.Error;
+/// Coarse failure class for an `Error`, for callers that branch on it.
 pub const ErrorCategory = errors.Category;
+/// By-value feature probe: dimensions, format, alpha, animation, metadata.
 pub const FeatureSummary = features.Summary;
 pub const FourCC = container.FourCC;
+/// A decoded pixel plane with its dimensions, stride, and format.
 pub const ImageBuffer = image.Buffer;
+/// Borrowed metadata chunk payloads (ICCP/EXIF/XMP) carried by a file.
 pub const MetadataPayloads = metadata.RawPayloads;
 pub const MuxOptions = mux.Options;
+/// Bounds on input size and allocation for handling untrusted input.
 pub const ResourceLimits = limits.ResourceLimits;
+/// Inputs to `encodeStatic`: a canvas plus an already-encoded bitstream.
 pub const StaticImage = mux.StaticImage;
 pub const VP8BoolReader = vp8_bool_reader.BoolReader;
 pub const VP8BoolWriter = vp8_bool_writer.BoolWriter;
@@ -104,22 +130,31 @@ pub const VP8LTransformListReader = vp8l_transform.ListReader;
 pub const chunk_header_size = container.chunk_header_size;
 pub const riff_header_size = container.riff_header_size;
 
+/// Maps any `Error` to its coarse `ErrorCategory` failure class.
 pub fn errorCategory(err: Error) ErrorCategory {
     return errors.category(err);
 }
 
+/// Cheap, allocation-free check that `bytes` begins with the RIFF/WEBP
+/// signature; performs no validation beyond the magic.
 pub fn isWebP(bytes: []const u8) bool {
     return container.isWebP(bytes);
 }
 
+/// Bounded parse of the RIFF/WebP container header from a complete buffer.
 pub fn parseHeader(bytes: []const u8) Error!ContainerHeader {
     return container.parseHeader(bytes);
 }
 
+/// Bounded parse of a single chunk header from a complete buffer slice.
 pub fn parseChunkHeader(bytes: []const u8) Error!ChunkHeader {
     return container.parseChunkHeader(bytes);
 }
 
+/// Probes a complete WebP buffer for its features (dimensions, format,
+/// alpha, animation, metadata presence) without decoding any pixels.
+/// Strictly validates the container; allocation is bounded by
+/// `DemuxOptions.limits`. Returns the summary by value (nothing to free).
 pub fn parseFeatures(
     gpa: std.mem.Allocator,
     bytes: []const u8,
@@ -128,6 +163,10 @@ pub fn parseFeatures(
     return demux.parseFeatures(gpa, bytes, parse_options);
 }
 
+/// Strict RIFF/WebP demux of a complete buffer into chunk locations and
+/// features; rejects malformed chunk ordering and duplicate chunks. Does
+/// not decode pixels. The caller owns the result and must call
+/// `DemuxResult.deinit`.
 pub fn parseWebP(
     gpa: std.mem.Allocator,
     bytes: []const u8,
@@ -136,6 +175,9 @@ pub fn parseWebP(
     return demux.parse(gpa, bytes, parse_options);
 }
 
+/// Muxes an already-encoded VP8/VP8L bitstream (`StaticImage`) into a
+/// canonical WebP file. It does not encode pixels — bitstream encoders are
+/// future work. Returns caller-owned bytes (free with the same allocator).
 pub fn encodeStatic(
     gpa: std.mem.Allocator,
     static_image: StaticImage,
@@ -144,6 +186,12 @@ pub fn encodeStatic(
     return mux.encodeStatic(gpa, static_image, encode_options);
 }
 
+/// Decodes a complete WebP file into an owned pixel buffer. Currently
+/// still-lossless (VP8L) only: lossy inputs fail with
+/// `error.UnsupportedImageFormat` and animations with
+/// `error.UnsupportedAnimationDecode`. Allocation is budgeted against
+/// `DecoderOptions.limits.allocation_bytes_max`. The caller frees the
+/// result via `OwnedBuffer.deinit`.
 pub fn decodeStatic(
     gpa: std.mem.Allocator,
     bytes: []const u8,
