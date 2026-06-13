@@ -547,6 +547,7 @@ test "reconstructs VP8 frames from the committed corpus" {
         var frame = decoder.decodeFrame(
             std.testing.allocator,
             image_chunk.payload(bytes),
+            .{ .apply_loop_filter = true },
         ) catch |err| {
             std.debug.print("reconstruction failed for {s}: {s}\n", .{
                 entry.name,

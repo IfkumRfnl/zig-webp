@@ -6,11 +6,11 @@
 Status: static lossless (VP8L) decode and ALPH alpha-plane decode are
 complete and match `dwebp` byte-for-byte on the local `libwebp-test-data`
 corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
-streams). The VP8 lossy decoder has reached full-frame pre-loop-filter
-reconstruction, byte-exact against `dwebp -nofilter -yuv` for all 88 lossy
-corpus files plus locally generated `cwebp` files; loop filtering,
-YUV-to-RGB conversion, alpha composition over lossy color, and animation
-decode are not available yet. The library also exposes bounded option and
+streams). The VP8 lossy decoder reconstructs and deblocks full key frames,
+byte-exact against plain `dwebp -yuv` for all 88 lossy corpus files plus
+locally generated `cwebp` files (both the simple and normal in-loop
+filters); YUV-to-RGB conversion, alpha composition over lossy color, and
+animation decode are not available yet. The library also exposes bounded option and
 limit types, image buffers, metadata, animation-frame and feature probing,
 RIFF/WebP demux, static mux, and the VP8/VP8L bitstream infrastructure.
 

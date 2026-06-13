@@ -12,6 +12,8 @@ Usage:
   tools/webp-oracle.sh compare-alpha-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh compare-yuv-nofilter OUT_DIR FILE.webp [FILE.webp ...]
   tools/webp-oracle.sh compare-yuv-nofilter-corpus OUT_DIR [CORPUS_DIR]
+  tools/webp-oracle.sh compare-yuv OUT_DIR FILE.webp [FILE.webp ...]
+  tools/webp-oracle.sh compare-yuv-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
 
@@ -346,6 +348,26 @@ case "$mode" in
         out_dir=$2
         corpus_dir=${3:-references/libwebp-test-data}
         compare_yuv_files --nofilter "$out_dir" "$corpus_dir"/*.webp
+        ;;
+
+    compare-yuv)
+        if [ "$#" -lt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        shift 2
+        compare_yuv_files "" "$out_dir" "$@"
+        ;;
+
+    compare-yuv-corpus)
+        if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        corpus_dir=${3:-references/libwebp-test-data}
+        compare_yuv_files "" "$out_dir" "$corpus_dir"/*.webp
         ;;
 
     encode)
