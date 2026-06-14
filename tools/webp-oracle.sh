@@ -275,9 +275,9 @@ compare_yuv_files() {
     fi
 }
 
-# Compares fancy-upsampled RGBA against `dwebp -pam`. Both tools emit the same
-# PAM header, so whole files are compared. Non-lossy and alpha-bearing files
-# (which need the separate alpha-composition stage) are skipped via exit 3.
+# Compares fancy-upsampled RGBA (with composed ALPH alpha) against `dwebp -pam`.
+# Both tools emit the same PAM header, so whole files are compared. Non-lossy
+# files are skipped via exit 3.
 compare_rgb_files() {
     filter_flag=$1
     out_dir=$2

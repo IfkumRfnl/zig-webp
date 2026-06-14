@@ -27,10 +27,11 @@ pub fn main(init: std.process.Init) !void {
             io,
             "usage: zig-webp-rgb [--nofilter] INPUT.webp OUTPUT.pam\n" ++
                 "Decodes a static lossy WebP to RGBA via fancy chroma upsampling\n" ++
-                "and writes a PAM file, matching `dwebp -pam`. Pass --nofilter to\n" ++
-                "skip the in-loop deblocking filter (matches `dwebp -nofilter`).\n" ++
-                "Exits 3 when the file is not a static lossy image, or carries\n" ++
-                "alpha (alpha composition is a separate stage).\n",
+                "and writes a PAM file, matching `dwebp -pam`. A decoded ALPH\n" ++
+                "plane, if present, is composed into the alpha channel. Pass\n" ++
+                "--nofilter to skip the in-loop deblocking filter (matches\n" ++
+                "`dwebp -nofilter`). Exits 3 when the file is not a static lossy\n" ++
+                "image.\n",
         );
         std.process.exit(2);
     }
@@ -54,14 +55,10 @@ pub fn main(init: std.process.Init) !void {
     });
     defer parsed.deinit();
 
-    // Alpha-bearing lossy files would need the (not-yet-implemented) alpha
-    // composition pass to match `dwebp -pam`'s composited output, so skip them
-    // here just like non-lossy inputs.
     const skip = parsed.features.is_animation or
-        (parsed.features.format orelse .lossless) != .lossy or
-        parsed.features.has_alpha;
+        (parsed.features.format orelse .lossless) != .lossy;
     if (skip) {
-        try std.Io.File.stderr().writeStreamingAll(io, "not a static lossy image without alpha\n");
+        try std.Io.File.stderr().writeStreamingAll(io, "not a static lossy image\n");
         std.process.exit(skip_exit_code);
     }
     const image_chunk = parsed.features.image_data orelse {
@@ -88,6 +85,21 @@ pub fn main(init: std.process.Init) !void {
         .width = frame.width,
         .height = frame.height,
     }, rgba, row_bytes);
+
+    // Compose the decoded ALPH plane over the opaque alpha `upsampleFancy`
+    // wrote, so the output matches `dwebp -pam`'s composited RGBA.
+    if (parsed.features.alpha) |location| {
+        const pixel_count = @as(usize, frame.width) * @as(usize, frame.height);
+        const alpha_plane = try gpa.alloc(u8, pixel_count);
+        defer gpa.free(alpha_plane);
+        _ = try webp.alpha.decodePlaneAlloc(
+            gpa,
+            location.payload(bytes),
+            parsed.features.canvas,
+            alpha_plane,
+        );
+        for (alpha_plane, 0..) |sample, i| rgba[i * channels + 3] = sample;
+    }
 
     const header = try std.fmt.allocPrint(
         gpa,

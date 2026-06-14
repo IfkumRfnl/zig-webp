@@ -16,7 +16,7 @@ pub const default_lossy_still_file_count = 88;
 
 pub const hash_manifest_root_path = "testdata";
 pub const hash_manifest_file_name = "corpus-hashes.tsv";
-pub const default_hash_row_count = 61;
+pub const default_hash_row_count = 149;
 
 pub const PlaneHashKind = enum {
     rgba,
@@ -31,12 +31,17 @@ pub const plane_hash_demux_limits = limits.ResourceLimits{
 };
 
 /// Hashes the RGBA output of the public static decode path so the committed
-/// manifest locks the decoded pixels that matched `dwebp` byte-for-byte.
-pub fn hashStillLosslessRGBA(
+/// manifest locks the decoded pixels that matched `dwebp` byte-for-byte. Covers
+/// both lossless and lossy stills (the latter with composed ALPH alpha); the
+/// relaxed limits keep the hash about pixel correctness, not limit enforcement.
+pub fn hashStillRGBA(
     gpa: std.mem.Allocator,
     file_bytes: []const u8,
 ) errors.Error![Sha256.digest_length]u8 {
-    var decoded = try decode.decodeStatic(gpa, file_bytes, .{ .output_format = .rgba });
+    var decoded = try decode.decodeStatic(gpa, file_bytes, .{
+        .output_format = .rgba,
+        .limits = plane_hash_demux_limits,
+    });
     defer decoded.deinit();
 
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -606,7 +611,7 @@ test "decoded corpus planes match committed SHA-256 hashes" {
         defer std.testing.allocator.free(file_bytes);
 
         const digest = switch (kind) {
-            .rgba => hashStillLosslessRGBA(std.testing.allocator, file_bytes),
+            .rgba => hashStillRGBA(std.testing.allocator, file_bytes),
             .alpha => hashAlphaPlane(std.testing.allocator, file_bytes),
         } catch |err| {
             std.debug.print("failed to decode {s} ({s}): {s}\n", .{
