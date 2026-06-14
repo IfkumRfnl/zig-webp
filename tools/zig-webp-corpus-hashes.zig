@@ -65,9 +65,9 @@ pub fn main(init: std.process.Init) !void {
 
         if (parsed.features.is_animation) continue;
 
-        const format = parsed.features.format orelse continue;
-        if (format == .lossless and parsed.features.image_data != null) {
-            const digest = try corpus.hashStillLosslessRGBA(gpa, file_bytes);
+        _ = parsed.features.format orelse continue;
+        if (parsed.features.image_data != null) {
+            const digest = try corpus.hashStillRGBA(gpa, file_bytes);
             try manifest.writer.print("{s}\trgba\t{s}\n", .{
                 file_name,
                 &std.fmt.bytesToHex(digest, .lower),

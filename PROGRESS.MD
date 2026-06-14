@@ -4,28 +4,27 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-13
+Last updated: 2026-06-14
 
 ## Current Position
 
-Steps 0 through 4 are complete for their static scopes. Composing decoded
-alpha planes over lossy VP8 color output is folded into step 5 because it
-needs the VP8 decoder. Step 5 is well underway: full key-frame decode now
-runs from header through the in-loop deblocking filter, byte-exact against
-plain `dwebp -yuv` (see below), and the YUV-to-RGB conversion layer with
-fancy chroma upsampling matches `dwebp -pam` byte-for-byte for lossy files
-without alpha. Composing alpha over lossy color, and wiring the lossy path
-into the public `decodeStatic`, remain before the step closes.
+Steps 0 through 5 are complete for their static scopes. The VP8 lossy decoder
+runs end-to-end through the public `decodeStatic`: full key-frame decode
+(header through the in-loop deblocking filter, byte-exact against plain
+`dwebp -yuv`), YUV-to-RGB with fancy chroma upsampling, and composition of the
+decoded ALPH plane over lossy color — all byte-exact against `dwebp -pam` for
+every lossy file in the corpus, including lossy+alpha (see Oracle Results).
+Next is step 6 (extended decode and animation).
 
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
 (`.github/workflows/ci.yml`): `zig fmt --check .` and `zig build test` on
 Zig 0.16.0. The test suite includes a hash-based corpus regression
-(`src/testing/corpus.zig`): decoded RGBA planes of all 43 still lossless
-files and decoded alpha planes of all 18 ALPH-bearing files (61 rows) are
-compared against committed SHA-256 hashes in `testdata/corpus-hashes.tsv`,
-so CI needs no `dwebp`. The hashes lock the decoded planes that matched
+(`src/testing/corpus.zig`): decoded RGBA planes of all 131 still images (43
+lossless and 88 lossy, the latter with composed ALPH alpha) and decoded alpha
+planes of all 18 ALPH-bearing files (149 rows) are compared against committed
+SHA-256 hashes in `testdata/corpus-hashes.tsv`, so CI needs no `dwebp`. The hashes lock the decoded planes that matched
 `dwebp` byte-for-byte in the dated oracle runs below; regenerate with
 `zig build corpus-hashes` only after a fresh corpus-wide oracle run.
 
@@ -43,7 +42,7 @@ bug: the bundled `lib/compiler/test_runner.zig` fails to compile under fuzz
 instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
-## In Progress
+## Recently Completed
 
 ### Step 5 — VP8 Lossy Decoder
 
@@ -149,8 +148,13 @@ the `compare-rgb` / `compare-rgb-corpus` oracle modes (plus their
 `-nofilter` variants) mirror the YUV tooling; they skip alpha-bearing lossy
 files, which need the alpha-composition stage to match `dwebp -pam`.
 
-Not yet started: composing decoded alpha planes over lossy color, and wiring
-the lossy path into the public `decodeStatic` (still lossless-only).
+The public `decodeStatic` decodes lossy stills end-to-end: it reconstructs the
+YUV frame, converts with fancy upsampling, and composes the decoded ALPH plane
+(when present and the output format carries alpha) verbatim over the result —
+lossy WebP uses straight, non-premultiplied alpha, so RGB is left untouched.
+The `compare-rgb` oracle and the `zig-webp-rgb` tool no longer skip
+alpha-bearing files. Lossless and lossy stills are byte-exact against the
+committed plane hashes, closing the step 5 decode gate.
 
 ## Completed Steps
 
@@ -215,6 +219,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-12 | Pre-loop-filter VP8 reconstruction vs `dwebp -nofilter -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 43 locally generated `cwebp` files (qualities 10-95, segments, filter/sharpness settings, odd dimensions down to 1x1); 43 non-lossy corpus files skipped. |
 | 2026-06-13 | Filtered VP8 decode vs plain `dwebp -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 31 locally generated `cwebp` files exercising both the simple (`-nostrong`) and normal (`-strong`) filters, filter strengths 0/20/60, qualities 8-92, sharpness 0/4/7, and odd dimensions down to 1x1; 43 non-lossy corpus files skipped. The `-nofilter` oracle still matches. |
 | 2026-06-14 | VP8 YUV-to-RGB + fancy upsampling vs `dwebp -pam` | Matched all 70 lossy-without-alpha still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), plus 84 locally generated `cwebp` files (two-axis gradients at odd dimensions 1x1 through 64x48, qualities 5-95, simple and normal filters, segments + sharpness 7); 61 non-lossy / lossy+alpha corpus files skipped. The `-nofilter` oracle matches all 154 too. |
+| 2026-06-14 | Composited lossy RGBA (with ALPH alpha) vs `dwebp -pam` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), now including all 18 lossy+alpha files via ALPH composition, plus 18 locally generated `cwebp` lossy+alpha files (RGBA gradients at odd dimensions 1x1 through 64x48, qualities 30-95, alpha quality 60-100, full-range alpha); 43 non-lossy corpus files skipped. Both the filtered and `-nofilter` oracle modes match. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

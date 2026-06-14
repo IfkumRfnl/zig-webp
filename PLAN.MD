@@ -183,14 +183,15 @@ single-frame codec internals.
 
 ## Implementation Order
 
-### 0–4. Completed Foundations
+### 0–5. Completed Foundations
 
 Step 0 (project foundation), step 1 (RIFF/WebP container), step 2 (core
-bitstream infrastructure), step 3 (VP8L lossless decoder), and step 4 (alpha
-chunk decode) are complete for their static scopes. See `PROGRESS.MD` for
-what each delivered and the dated corpus results. One remainder moves
-forward: composing decoded alpha planes over lossy VP8 color output is part
-of step 5's gate, because it cannot land before the VP8 decoder.
+bitstream infrastructure), step 3 (VP8L lossless decoder), step 4 (alpha
+chunk decode), and step 5 (VP8 lossy decoder, including alpha composition over
+lossy color and the lossy path through the public `decodeStatic`) are complete
+for their static scopes. See `PROGRESS.MD` for what each delivered, the dated
+corpus results, and the step 5 acceptance gate. The step 5 spec below is
+retained as the record of that gate.
 
 ### 5. VP8 Lossy Decoder
 
@@ -372,15 +373,18 @@ input.
 
 ## Near-Term Work Items
 
-1. Compose decoded alpha planes over lossy VP8 color and enforce the VP8X
-   alpha-flag rules, closing out the step 4 remainder. This unblocks the
-   lossy+alpha files currently skipped by the `compare-rgb` oracle.
-2. Wire the lossy path into the public `decodeStatic` (still lossless-only
-   today) once alpha composition lands, so lossy files decode to RGBA
-   end-to-end through one entry point, and lock the results with corpus
-   plane hashes mirroring the lossless rows.
-3. Validate composited lossy+alpha RGBA against `dwebp -pam` and extend the
-   `compare-rgb` corpus run to stop skipping alpha-bearing files.
+Step 5 is closed: the lossy decoder runs end-to-end through `decodeStatic`
+with ALPH composition, byte-exact against `dwebp -pam` across the lossy corpus
+(including lossy+alpha) and locked by committed plane hashes. Next is step 6
+(extended decode and animation):
+
+1. Enforce `VP8X` feature-flag and extended chunk-ordering rules on the decode
+   path, beyond what strict demux already validates.
+2. Decode animated WebP (`ANIM`/`ANMF`): frame rectangles, durations, dispose
+   and blend methods, background color, and loop count, reusing the static
+   VP8/VP8L/alpha decoders per frame.
+3. Provide both frame-iteration and fully-composited output APIs, and preserve
+   metadata extraction for still and animated files.
 
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
