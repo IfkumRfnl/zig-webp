@@ -7,11 +7,12 @@ const limits = @import("limits.zig");
 pub const DecoderOptions = struct {
     limits: limits.ResourceLimits = .{},
     output_format: image.PixelFormat = .rgba,
-    /// Not yet honored: metadata chunks are currently always exposed via
-    /// demux results. Reserved for the step 6 extended-decode work.
+    /// Not yet honored: metadata chunks are always exposed via demux results
+    /// (`parseWebP`). Reserved for a future metadata-bearing decode result.
     preserve_metadata: bool = true,
-    /// Not yet honored: animated inputs currently fail static decode with
-    /// `error.UnsupportedAnimationDecode`. Reserved for step 6.
+    /// Not yet honored: `decodeStatic` always rejects animated inputs with
+    /// `error.UnsupportedAnimationDecode`; decode animations via
+    /// `decodeAnimation` / `AnimationDecoder` instead.
     decode_animation: bool = true,
 };
 

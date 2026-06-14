@@ -134,6 +134,28 @@ pub fn build(b: *std.Build) void {
     );
     corpus_hashes_step.dependOn(&run_corpus_hashes_tool.step);
 
+    const anim_hashes_tool = b.addExecutable(.{
+        .name = "zig-webp-anim-hashes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-anim-hashes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    const run_anim_hashes_tool = b.addRunArtifact(anim_hashes_tool);
+    run_anim_hashes_tool.setCwd(b.path("."));
+    if (b.args) |args| {
+        run_anim_hashes_tool.addArgs(args);
+    }
+    const anim_hashes_step = b.step(
+        "anim-hashes",
+        "Regenerate testdata/animation/hashes.tsv from composited frames",
+    );
+    anim_hashes_step.dependOn(&run_anim_hashes_tool.step);
+
     const check_step = b.step("check", "Compile the library and tools");
     check_step.dependOn(&webp_library.step);
     check_step.dependOn(&decode_tool.step);
@@ -142,6 +164,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&rgb_tool.step);
     check_step.dependOn(&anim_tool.step);
     check_step.dependOn(&corpus_hashes_tool.step);
+    check_step.dependOn(&anim_hashes_tool.step);
 
     const unit_tests = b.addTest(.{
         .root_module = webp_module,

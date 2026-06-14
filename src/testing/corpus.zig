@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const alpha_decode = @import("../alpha.zig");
+const animation_decode = @import("../animation_decode.zig");
 const decode = @import("../decode.zig");
 const demux = @import("../demux.zig");
 const errors = @import("../errors.zig");
@@ -17,6 +18,10 @@ pub const default_lossy_still_file_count = 88;
 pub const hash_manifest_root_path = "testdata";
 pub const hash_manifest_file_name = "corpus-hashes.tsv";
 pub const default_hash_row_count = 149;
+
+pub const default_animation_root_path = "testdata/animation";
+pub const animation_hash_manifest_file_name = "hashes.tsv";
+pub const default_animation_file_count = 8;
 
 pub const PlaneHashKind = enum {
     rgba,
@@ -68,6 +73,32 @@ pub fn hashAlphaPlane(
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(plane, &digest, .{});
     return digest;
+}
+
+pub const AnimationHash = struct {
+    digest: [Sha256.digest_length]u8,
+    frame_count: u32,
+};
+
+/// Hashes every composited frame of an animation (canvas-sized RGBA,
+/// concatenated in order) so the manifest locks the composited output that
+/// matched `anim_dump` byte-for-byte.
+pub fn hashAnimation(
+    gpa: std.mem.Allocator,
+    file_bytes: []const u8,
+) errors.Error!AnimationHash {
+    var animated = try animation_decode.decodeAnimationAlloc(gpa, file_bytes, .{
+        .output_format = .rgba,
+        .limits = plane_hash_demux_limits,
+    });
+    defer animated.deinit();
+
+    var hasher = Sha256.init(.{});
+    for (animated.frames) |frame| hasher.update(frame.buffer.pixels);
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .digest = digest, .frame_count = @intCast(animated.frames.len) };
 }
 
 pub const Options = struct {
@@ -632,6 +663,72 @@ test "decoded corpus planes match committed SHA-256 hashes" {
     }
 
     try std.testing.expectEqual(@as(u32, default_hash_row_count), verified_count);
+}
+
+test "composited animation frames match committed SHA-256 hashes" {
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var root = std.Io.Dir.cwd().openDir(io, default_animation_root_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            error.NotDir => return error.SkipZigTest,
+            else => return err,
+        };
+        root.close(io);
+    }
+
+    // The manifest ships with the repository; failing (not skipping) on a
+    // missing or malformed manifest keeps CI honest.
+    const manifest = try readFileAlloc(std.testing.allocator, animation_hash_manifest_file_name, .{
+        .root_path = default_animation_root_path,
+    });
+    defer std.testing.allocator.free(manifest);
+
+    var verified_count: u32 = 0;
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (line[0] == '#') continue;
+
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const file_name = fields.next() orelse return error.TestUnexpectedResult;
+        const frame_text = fields.next() orelse return error.TestUnexpectedResult;
+        const expected_hex = fields.next() orelse return error.TestUnexpectedResult;
+        if (fields.next() != null) return error.TestUnexpectedResult;
+
+        const expected_frames = std.fmt.parseInt(u32, frame_text, 10) catch {
+            return error.TestUnexpectedResult;
+        };
+
+        const file_bytes = try readFileAlloc(std.testing.allocator, file_name, .{
+            .root_path = default_animation_root_path,
+            .limits = plane_hash_demux_limits,
+        });
+        defer std.testing.allocator.free(file_bytes);
+
+        const result = hashAnimation(std.testing.allocator, file_bytes) catch |err| {
+            std.debug.print("failed to decode animation {s}: {s}\n", .{ file_name, @errorName(err) });
+            return err;
+        };
+
+        if (result.frame_count != expected_frames) {
+            std.debug.print("frame count mismatch for {s}: {d} != {d}\n", .{
+                file_name,
+                result.frame_count,
+                expected_frames,
+            });
+            return error.TestUnexpectedResult;
+        }
+
+        const actual_hex = std.fmt.bytesToHex(result.digest, .lower);
+        if (!std.mem.eql(u8, expected_hex, &actual_hex)) {
+            std.debug.print("animation hash mismatch for {s}\n", .{file_name});
+            return error.TestUnexpectedResult;
+        }
+
+        verified_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, default_animation_file_count), verified_count);
 }
 
 test "rejects corpus paths that escape the configured root" {
