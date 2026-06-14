@@ -93,6 +93,25 @@ pub fn build(b: *std.Build) void {
     const rgb_step = b.step("rgb", "Decode a lossy WebP to RGBA (fancy upsampling) as PAM");
     rgb_step.dependOn(&run_rgb_tool.step);
 
+    const anim_tool = b.addExecutable(.{
+        .name = "zig-webp-anim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-anim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    b.installArtifact(anim_tool);
+    const run_anim_tool = b.addRunArtifact(anim_tool);
+    if (b.args) |args| {
+        run_anim_tool.addArgs(args);
+    }
+    const anim_step = b.step("anim", "Decode an animated WebP to per-frame PAM files");
+    anim_step.dependOn(&run_anim_tool.step);
+
     const corpus_hashes_tool = b.addExecutable(.{
         .name = "zig-webp-corpus-hashes",
         .root_module = b.createModule(.{
@@ -121,6 +140,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&alpha_tool.step);
     check_step.dependOn(&yuv_tool.step);
     check_step.dependOn(&rgb_tool.step);
+    check_step.dependOn(&anim_tool.step);
     check_step.dependOn(&corpus_hashes_tool.step);
 
     const unit_tests = b.addTest(.{

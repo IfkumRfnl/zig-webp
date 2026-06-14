@@ -18,6 +18,8 @@ Usage:
   tools/webp-oracle.sh compare-rgb-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh compare-rgb-nofilter OUT_DIR FILE.webp [FILE.webp ...]
   tools/webp-oracle.sh compare-rgb-nofilter-corpus OUT_DIR [CORPUS_DIR]
+  tools/webp-oracle.sh compare-anim OUT_DIR FILE.webp [FILE.webp ...]
+  tools/webp-oracle.sh compare-anim-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
 
@@ -348,6 +350,96 @@ compare_rgb_files() {
     fi
 }
 
+# Compares composited animation frames against `anim_dump -pam`, frame by
+# frame. Both emit canvas-sized RGBA PAM with identical headers, so whole files
+# are compared. Non-animated files are skipped via the tool's exit code 3.
+compare_anim_files() {
+    out_dir=$1
+    shift
+
+    if ! has_tool anim_dump; then
+        printf 'anim_dump\tSKIP: not installed\n' >&2
+        return 0
+    fi
+
+    anim_tool=zig-out/bin/zig-webp-anim
+    if ! zig build >/dev/null 2>&1 || [ ! -x "$anim_tool" ]; then
+        printf 'FAIL\tzig build did not produce %s\n' "$anim_tool" >&2
+        return 1
+    fi
+
+    mkdir -p "$out_dir"
+    compared=0
+    failed=0
+    skipped=0
+    for file in "$@"; do
+        if [ ! -f "$file" ]; then
+            printf 'FAIL\tmissing\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        base=$(basename "$file")
+        stem=${base%.*}
+        oracle_dir="$out_dir/$stem.oracle"
+        actual_dir="$out_dir/$stem.actual"
+        rm -rf "$oracle_dir" "$actual_dir"
+        mkdir -p "$oracle_dir" "$actual_dir"
+
+        status=0
+        "$anim_tool" "$file" "$actual_dir" >"$out_dir/$stem.zig-webp.log" 2>&1 || status=$?
+        if [ "$status" -eq 3 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [ "$status" -ne 0 ]; then
+            printf 'FAIL\tzig-webp-anim\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        if ! anim_dump -pam -folder "$oracle_dir" -prefix dump_ "$file" \
+            >"$out_dir/$stem.anim_dump.log" 2>&1; then
+            printf 'FAIL\tanim_dump\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        file_failed=0
+        frame_index=0
+        for actual_frame in "$actual_dir"/frame_*.pam; do
+            oracle_frame=$(printf '%s/dump_%04d.pam' "$oracle_dir" "$frame_index")
+            if [ ! -f "$oracle_frame" ]; then
+                printf 'FAIL\tanim_dump missing frame %s\t%s\n' "$frame_index" "$file" >&2
+                file_failed=1
+                break
+            fi
+            if ! cmp -s "$oracle_frame" "$actual_frame"; then
+                printf 'DIFF\tframe %s\t%s\n' "$frame_index" "$file" >&2
+                file_failed=1
+                break
+            fi
+            frame_index=$((frame_index + 1))
+        done
+
+        compared=$((compared + 1))
+        if [ "$file_failed" -eq 0 ]; then
+            printf 'OK\t%s\t(%s frames)\n' "$file" "$frame_index"
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    printf 'summary\tcompared=%s\tskipped=%s\tfailed=%s\n' "$compared" "$skipped" "$failed"
+    if [ "$compared" -eq 0 ]; then
+        printf 'FAIL\tno animated files compared\n' >&2
+        return 1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        return 1
+    fi
+}
+
 mode=${1:-check}
 case "$mode" in
     check)
@@ -485,6 +577,26 @@ case "$mode" in
         out_dir=$2
         corpus_dir=${3:-references/libwebp-test-data}
         compare_rgb_files --nofilter "$out_dir" "$corpus_dir"/*.webp
+        ;;
+
+    compare-anim)
+        if [ "$#" -lt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        shift 2
+        compare_anim_files "$out_dir" "$@"
+        ;;
+
+    compare-anim-corpus)
+        if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        corpus_dir=${3:-references/libwebp-test-data}
+        compare_anim_files "$out_dir" "$corpus_dir"/*.webp
         ;;
 
     encode)

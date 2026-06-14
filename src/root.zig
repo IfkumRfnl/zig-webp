@@ -18,6 +18,7 @@ const corpus_tests = @import("testing/corpus.zig");
 
 pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
+pub const animation_decode = @import("animation_decode.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
 pub const color = @import("color.zig");
@@ -59,6 +60,17 @@ pub const AlphaFilter = alpha.Filter;
 pub const AlphaHeader = alpha.Header;
 pub const AlphaPreprocessing = alpha.Preprocessing;
 pub const AnimationFrame = animation.Frame;
+/// Streaming animated-WebP decoder: composites one frame at a time onto a
+/// reused canvas (bounded memory). The caller owns it and must `deinit`.
+pub const AnimationDecoder = animation_decode.Decoder;
+/// Global animation properties (canvas, frame count, loop count, background).
+pub const AnimationInfo = animation_decode.Info;
+/// One composited animation frame; from `AnimationDecoder.next` its pixels
+/// borrow the decoder's canvas, from `decodeAnimation` they are owned.
+pub const CompositedFrame = animation_decode.Frame;
+/// Result of `decodeAnimation`: every composited frame as its own buffer.
+pub const DecodedAnimation = animation_decode.OwnedAnimation;
+pub const DecodedAnimationFrame = animation_decode.OwnedFrame;
 pub const BitReader = bit_reader.BitReader;
 pub const BitWriter = bit_writer.BitWriter;
 pub const ByteReader = bit_reader.ByteReader;
@@ -201,6 +213,21 @@ pub fn decodeStatic(
     decode_options: DecoderOptions,
 ) Error!image.OwnedBuffer {
     return decode.decodeStatic(gpa, bytes, decode_options);
+}
+
+/// Decodes an animated WebP into composited per-frame buffers, matching
+/// libwebp's `WebPAnimDecoder`/`anim_dump`: a transparent canvas with spec
+/// keyframe, blend, and dispose rules. Each frame is reconstructed through the
+/// static VP8/VP8L/alpha decoders. Requires a 4-channel `output_format`; still
+/// images fail with `error.NotAnimated`. For bounded per-frame memory, drive
+/// `AnimationDecoder` directly. The caller frees the result via
+/// `DecodedAnimation.deinit`.
+pub fn decodeAnimation(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    decode_options: DecoderOptions,
+) Error!DecodedAnimation {
+    return animation_decode.decodeAnimationAlloc(gpa, bytes, decode_options);
 }
 
 test "root exposes WebP container helpers" {
