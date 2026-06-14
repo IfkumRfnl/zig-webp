@@ -20,6 +20,7 @@ pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
+pub const color = @import("color.zig");
 pub const container = @import("container.zig");
 pub const decode = @import("decode.zig");
 pub const demux = @import("demux.zig");
@@ -65,6 +66,8 @@ pub const ByteWriter = bit_writer.ByteWriter;
 pub const ChunkHeader = container.ChunkHeader;
 pub const ChunkKind = container.ChunkKind;
 pub const ChunkLocation = container.ChunkLocation;
+/// Borrowed VP8 YUV 4:2:0 planes accepted by `color.upsampleFancy`.
+pub const ColorPlanes = color.Planes;
 pub const ContainerHeader = container.ContainerHeader;
 /// Decode-time options: resource limits and output pixel format.
 pub const DecoderOptions = options.DecoderOptions;

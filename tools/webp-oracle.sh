@@ -14,6 +14,10 @@ Usage:
   tools/webp-oracle.sh compare-yuv-nofilter-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh compare-yuv OUT_DIR FILE.webp [FILE.webp ...]
   tools/webp-oracle.sh compare-yuv-corpus OUT_DIR [CORPUS_DIR]
+  tools/webp-oracle.sh compare-rgb OUT_DIR FILE.webp [FILE.webp ...]
+  tools/webp-oracle.sh compare-rgb-corpus OUT_DIR [CORPUS_DIR]
+  tools/webp-oracle.sh compare-rgb-nofilter OUT_DIR FILE.webp [FILE.webp ...]
+  tools/webp-oracle.sh compare-rgb-nofilter-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
 
@@ -271,6 +275,79 @@ compare_yuv_files() {
     fi
 }
 
+# Compares fancy-upsampled RGBA against `dwebp -pam`. Both tools emit the same
+# PAM header, so whole files are compared. Non-lossy and alpha-bearing files
+# (which need the separate alpha-composition stage) are skipped via exit 3.
+compare_rgb_files() {
+    filter_flag=$1
+    out_dir=$2
+    shift 2
+
+    if ! has_tool dwebp; then
+        printf 'dwebp\tSKIP: not installed\n' >&2
+        return 0
+    fi
+
+    rgb_tool=zig-out/bin/zig-webp-rgb
+    if ! zig build >/dev/null 2>&1 || [ ! -x "$rgb_tool" ]; then
+        printf 'FAIL\tzig build did not produce %s\n' "$rgb_tool" >&2
+        return 1
+    fi
+
+    mkdir -p "$out_dir"
+    compared=0
+    failed=0
+    skipped=0
+    for file in "$@"; do
+        if [ ! -f "$file" ]; then
+            printf 'FAIL\tmissing\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        base=$(basename "$file")
+        stem=${base%.*}
+        oracle="$out_dir/$stem.dwebp.pam"
+        actual="$out_dir/$stem.zig-webp.pam"
+
+        status=0
+        "$rgb_tool" $filter_flag "$file" "$actual" >"$out_dir/$stem.zig-webp.log" 2>&1 || status=$?
+        if [ "$status" -eq 3 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [ "$status" -ne 0 ]; then
+            printf 'FAIL\tzig-webp-rgb\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        dwebp_filter_flag=${filter_flag#-}
+        if ! dwebp $dwebp_filter_flag -pam "$file" -o "$oracle" >"$out_dir/$stem.dwebp.log" 2>&1; then
+            printf 'FAIL\tdwebp\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+
+        compared=$((compared + 1))
+        if cmp -s "$oracle" "$actual"; then
+            printf 'OK\t%s\n' "$file"
+        else
+            printf 'DIFF\t%s\n' "$file" >&2
+            failed=$((failed + 1))
+        fi
+    done
+
+    printf 'summary\tcompared=%s\tskipped=%s\tfailed=%s\n' "$compared" "$skipped" "$failed"
+    if [ "$compared" -eq 0 ]; then
+        printf 'FAIL\tno lossy files compared\n' >&2
+        return 1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        return 1
+    fi
+}
+
 mode=${1:-check}
 case "$mode" in
     check)
@@ -368,6 +445,46 @@ case "$mode" in
         out_dir=$2
         corpus_dir=${3:-references/libwebp-test-data}
         compare_yuv_files "" "$out_dir" "$corpus_dir"/*.webp
+        ;;
+
+    compare-rgb)
+        if [ "$#" -lt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        shift 2
+        compare_rgb_files "" "$out_dir" "$@"
+        ;;
+
+    compare-rgb-corpus)
+        if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        corpus_dir=${3:-references/libwebp-test-data}
+        compare_rgb_files "" "$out_dir" "$corpus_dir"/*.webp
+        ;;
+
+    compare-rgb-nofilter)
+        if [ "$#" -lt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        shift 2
+        compare_rgb_files --nofilter "$out_dir" "$@"
+        ;;
+
+    compare-rgb-nofilter-corpus)
+        if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            usage >&2
+            exit 2
+        fi
+        out_dir=$2
+        corpus_dir=${3:-references/libwebp-test-data}
+        compare_rgb_files --nofilter "$out_dir" "$corpus_dir"/*.webp
         ;;
 
     encode)

@@ -74,6 +74,25 @@ pub fn build(b: *std.Build) void {
     const yuv_step = b.step("yuv", "Decode a lossy WebP to raw YUV planes");
     yuv_step.dependOn(&run_yuv_tool.step);
 
+    const rgb_tool = b.addExecutable(.{
+        .name = "zig-webp-rgb",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zig-webp-rgb.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "webp", .module = webp_module },
+            },
+        }),
+    });
+    b.installArtifact(rgb_tool);
+    const run_rgb_tool = b.addRunArtifact(rgb_tool);
+    if (b.args) |args| {
+        run_rgb_tool.addArgs(args);
+    }
+    const rgb_step = b.step("rgb", "Decode a lossy WebP to RGBA (fancy upsampling) as PAM");
+    rgb_step.dependOn(&run_rgb_tool.step);
+
     const corpus_hashes_tool = b.addExecutable(.{
         .name = "zig-webp-corpus-hashes",
         .root_module = b.createModule(.{
@@ -101,6 +120,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&decode_tool.step);
     check_step.dependOn(&alpha_tool.step);
     check_step.dependOn(&yuv_tool.step);
+    check_step.dependOn(&rgb_tool.step);
     check_step.dependOn(&corpus_hashes_tool.step);
 
     const unit_tests = b.addTest(.{

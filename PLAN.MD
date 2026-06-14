@@ -133,7 +133,7 @@ src/mux.zig
 src/features.zig
 src/image.zig
 src/vp8l/pixel.zig
-src/color.zig              (planned: step 5 YUV-to-RGB)
+src/color.zig
 src/bit_reader.zig
 src/bit_writer.zig
 src/alpha.zig
@@ -151,7 +151,7 @@ src/vp8/frame_header.zig
 src/vp8/modes.zig
 src/vp8/prediction.zig
 src/vp8/transform.zig
-src/vp8/loop_filter.zig    (planned: step 5)
+src/vp8/loop_filter.zig
 src/vp8/quant.zig
 src/vp8/tokens.zig
 src/vp8/token_probs.zig
@@ -372,14 +372,15 @@ input.
 
 ## Near-Term Work Items
 
-1. Continue step 5 reconstruction: macroblock mode parsing, dequantization,
-   intra prediction, inverse transforms, and loop filtering on top of the
-   landed frame header parser.
-2. Add a `compare-yuv` mode to `tools/webp-oracle.sh` backed by a YUV
-   plane-dump build target, mirroring the existing alpha tooling, as soon
-   as reconstruction can emit YUV planes for the tool to dump.
-3. Once step 5 reaches full-frame reconstruction, compose alpha over lossy
-   color to close out the step 4 remainder.
+1. Compose decoded alpha planes over lossy VP8 color and enforce the VP8X
+   alpha-flag rules, closing out the step 4 remainder. This unblocks the
+   lossy+alpha files currently skipped by the `compare-rgb` oracle.
+2. Wire the lossy path into the public `decodeStatic` (still lossless-only
+   today) once alpha composition lands, so lossy files decode to RGBA
+   end-to-end through one entry point, and lock the results with corpus
+   plane hashes mirroring the lossless rows.
+3. Validate composited lossy+alpha RGBA against `dwebp -pam` and extend the
+   `compare-rgb` corpus run to stop skipping alpha-bearing files.
 
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
