@@ -9,8 +9,11 @@ corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
 streams). The VP8 lossy decoder reconstructs and deblocks full key frames,
 byte-exact against plain `dwebp -yuv` for all 88 lossy corpus files plus
 locally generated `cwebp` files (both the simple and normal in-loop
-filters); YUV-to-RGB conversion, alpha composition over lossy color, and
-animation decode are not available yet. The library also exposes bounded option and
+filters), and its YUV-to-RGB conversion layer with fancy chroma upsampling
+matches `dwebp -pam` byte-for-byte for lossy files without alpha. Alpha
+composition over lossy color and animation decode are not available yet, and
+the public `decodeStatic` entry point is still lossless-only. The library
+also exposes bounded option and
 limit types, image buffers, metadata, animation-frame and feature probing,
 RIFF/WebP demux, static mux, and the VP8/VP8L bitstream infrastructure.
 
