@@ -145,8 +145,8 @@ to libwebp's scalar path. Because conversion is implementation-defined rather
 than RFC-fixed, correctness is pinned to `dwebp -pam` (which defaults to
 fancy upsampling) instead of to a spec formula. The `zig build rgb` tool and
 the `compare-rgb` / `compare-rgb-corpus` oracle modes (plus their
-`-nofilter` variants) mirror the YUV tooling; they skip alpha-bearing lossy
-files, which need the alpha-composition stage to match `dwebp -pam`.
+`-nofilter` variants) mirror the YUV tooling; alpha-bearing lossy files are
+handled by the alpha-composition stage described next.
 
 The public `decodeStatic` decodes lossy stills end-to-end: it reconstructs the
 YUV frame, converts with fancy upsampling, and composes the decoded ALPH plane
