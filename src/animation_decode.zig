@@ -630,3 +630,32 @@ test "rejects still images and non-alpha output formats" {
     try appendChunk(&still, gpa, "VP8L", still_vp8l);
     try testing.expectError(error.NotAnimated, Decoder.init(gpa, still.items, .{}));
 }
+
+test "fuzz animation decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const file = try buildAnimation(testing.allocator, 4, 4, &.{
+        .{ .x = 0, .y = 0, .width = 4, .height = 4, .color = .{ 255, 0, 0, 255 }, .blend = .replace },
+        .{ .x = 2, .y = 2, .width = 2, .height = 2, .color = .{ 0, 255, 0, 64 }, .dispose = .background },
+    });
+    defer testing.allocator.free(file);
+
+    var seed_buffer: [512]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, file);
+
+    try std.testing.fuzz({}, fuzzAnimationOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzAnimationOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [4096]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+
+    var animated = decodeAnimationAlloc(testing.allocator, input_buffer[0..input_len], .{
+        .limits = .{
+            .output_pixels_max = 1 << 16,
+            .animation_canvas_pixels_max = 1 << 16,
+            .allocation_bytes_max = 1 << 24,
+        },
+    }) catch return;
+    animated.deinit();
+}

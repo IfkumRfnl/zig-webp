@@ -138,6 +138,7 @@ src/bit_reader.zig
 src/bit_writer.zig
 src/alpha.zig
 src/animation.zig
+src/animation_decode.zig
 src/metadata.zig
 src/options.zig
 src/limits.zig
@@ -373,18 +374,22 @@ input.
 
 ## Near-Term Work Items
 
-Step 5 is closed: the lossy decoder runs end-to-end through `decodeStatic`
-with ALPH composition, byte-exact against `dwebp -pam` across the lossy corpus
-(including lossy+alpha) and locked by committed plane hashes. Next is step 6
-(extended decode and animation):
+Step 6 is closed: animated WebP decodes through `decodeAnimation` (all
+composited frames) and the streaming `AnimationDecoder`, reusing the static
+VP8/VP8L/alpha decoders per frame and compositing with the spec's
+keyframe/blend/dispose rules — byte-exact against `anim_dump` and locked by
+committed frame hashes. The `VP8X` feature-flag and extended chunk-ordering
+rules were already enforced by strict demux, and metadata extraction works for
+still and animated files via the demux result. Next is step 7 (VP8L lossless
+encoder):
 
-1. Enforce `VP8X` feature-flag and extended chunk-ordering rules on the decode
-   path, beyond what strict demux already validates.
-2. Decode animated WebP (`ANIM`/`ANMF`): frame rectangles, durations, dispose
-   and blend methods, background color, and loop count, reusing the static
-   VP8/VP8L/alpha decoders per frame.
-3. Provide both frame-iteration and fully-composited output APIs, and preserve
-   metadata extraction for still and animated files.
+1. Mux still VP8L images, then build the VP8L bit writer and canonical Huffman
+   writer with basic literal output.
+2. Add LZ77 matches, the subtract-green transform, and palette/predictor/color
+   transforms.
+3. Add entropy image / multiple Huffman groups, then optional color cache and
+   near-lossless preprocessing, gating on the validity and size targets in
+   step 7 above.
 
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.

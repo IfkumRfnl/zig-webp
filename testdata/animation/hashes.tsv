@@ -1,0 +1,12 @@
+# SHA-256 hashes of zig-webp composited animation frames, one
+# tab-separated row (file, frame count, hash) per animation.
+# Regenerate with `zig build anim-hashes` only after a corpus-wide
+# `compare-anim` oracle run confirms the composited frames.
+blend_bg_dispose.webp	3	a28a2e214ea125bf20d7a628352e682f05cbb62bf409035e2e4e1ce1402d142a
+blend_disjoint_dispose.webp	4	bb962f49e8d58d4399fe628cf94e6e94be60477e2340bfe2e522321f20a84077
+dispose_none_matrix.webp	4	2ffd08eeb24e6bf64a695d8d863b2ad7bc4a5085a2de1c0bdb758cfb117e4ec9
+large_mixed_canvas.webp	4	6446e86359225d626570c27538aa523275efe46cffd27962bcbf52ce9ab7821b
+lossless_auto.webp	4	769371c10c447e3cd85af7c240554b25bbb46c0e417b8277acc4c0c29a616cb6
+lossy_alpha_odd.webp	3	c594a03b6c5bcb17233c5cd3f0a97a97c2960e5acd1ff014df8600a75cb59869
+lossy_frames.webp	3	8e302f8279cd6f0e0bc33b897ab84a5b6c7369879caa1c7a4d009e9d963a4d02
+mixed_frames.webp	4	5beafff024c36896a862ef9871c7577454b4556d663ca6a13821e8bc3a0c166b

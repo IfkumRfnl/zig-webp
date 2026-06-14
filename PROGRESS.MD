@@ -8,13 +8,15 @@ Last updated: 2026-06-14
 
 ## Current Position
 
-Steps 0 through 5 are complete for their static scopes. The VP8 lossy decoder
+Steps 0 through 6 are complete for their decode scopes. The VP8 lossy decoder
 runs end-to-end through the public `decodeStatic`: full key-frame decode
 (header through the in-loop deblocking filter, byte-exact against plain
 `dwebp -yuv`), YUV-to-RGB with fancy chroma upsampling, and composition of the
 decoded ALPH plane over lossy color — all byte-exact against `dwebp -pam` for
 every lossy file in the corpus, including lossy+alpha (see Oracle Results).
-Next is step 6 (extended decode and animation).
+Animated WebP now decodes through `decodeAnimation` (all composited frames) and
+the streaming `AnimationDecoder`, byte-exact against libwebp's `anim_dump` on a
+generated animation corpus. Next is step 7 (VP8L lossless encoder).
 
 ## Cross-Cutting Practices
 
@@ -26,14 +28,18 @@ lossless and 88 lossy, the latter with composed ALPH alpha) and decoded alpha
 planes of all 18 ALPH-bearing files (149 rows) are compared against committed
 SHA-256 hashes in `testdata/corpus-hashes.tsv`, so CI needs no `dwebp`. The hashes lock the decoded planes that matched
 `dwebp` byte-for-byte in the dated oracle runs below; regenerate with
-`zig build corpus-hashes` only after a fresh corpus-wide oracle run.
+`zig build corpus-hashes` only after a fresh corpus-wide oracle run. A parallel
+manifest `testdata/animation/hashes.tsv` locks the composited frames of the 8
+committed animations (29 frames total) against `anim_dump`; regenerate with
+`zig build anim-hashes` after a fresh `compare-anim` run.
 
 Fuzz smoke targets are in place for every public decode entry point: strict
 demux (`src/demux.zig`), VP8L still-image decode (`src/vp8l/decoder.zig`),
 alpha plane decode (`src/alpha.zig`), VP8 key-frame header parsing
 (`src/vp8/frame_header.zig`), VP8 macroblock prediction record parsing
-(`src/vp8/modes.zig`), and the public static decode composition
-(`src/decode.zig`). Each target uses `std.testing.fuzz` with a valid corpus
+(`src/vp8/modes.zig`), the public static decode composition
+(`src/decode.zig`), and animated decode composition
+(`src/animation_decode.zig`). Each target uses `std.testing.fuzz` with a valid corpus
 seed (framed via `src/testing/fuzz.zig` so seeds reach the parser
 byte-for-byte) and runs under plain `zig build test` as a corpus +
 empty-input smoke pass with leak detection. Coverage-guided runs via
@@ -43,6 +49,38 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 6 — Extended Decode and Animation
+
+Animated WebP decode is implemented in `src/animation_decode.zig`, composing
+frames onto a canvas to match libwebp's `anim_dump` byte-for-byte. The
+container layer (`src/demux.zig`) already enforced the `VP8X` feature flags and
+extended chunk-ordering rules and parsed `ANIM`/`ANMF` (frame rectangles,
+durations, dispose/blend methods, background color, loop count) into
+`animation.Info`/`animation.Frame`; step 6 adds the pixel decode and
+compositing on top.
+
+Each frame is reconstructed through the shared still decoder
+(`decode.decodeImage`, extracted in the first step-6 slice so VP8/VP8L/alpha is
+reused rather than duplicated). Compositing replicates libwebp exactly: a
+transparent-canvas start (the `ANIM` background color is informational only),
+keyframe detection that clears the canvas, source-over non-premultiplied alpha
+blend (blend method 0) or verbatim copy (method 1), the skip of blending inside
+a previous frame's background-disposed rectangle, dispose-to-background between
+frames, and the zeroing of fully transparent pixels' RGB (libwebp's animation
+decoder, unlike `-exact` static decode, does not preserve it). The blend math
+is the integer `BlendPixelNonPremult` approximation libwebp uses for
+`MODE_RGBA`.
+
+Two public entry points share the compositor: `decodeAnimation` returns every
+composited frame as its own buffer, and the streaming `AnimationDecoder`
+(`init`/`next`/`reset`/`info`/`deinit`) yields one frame at a time over a reused
+canvas for bounded memory. A new `error.NotAnimated` rejects still inputs;
+animation requires a 4-channel output format. The `zig build anim` tool and the
+`compare-anim` / `compare-anim-corpus` oracle modes mirror the still tooling,
+and `tools/zig-webp-anim-hashes.zig` (`zig build anim-hashes`) regenerates the
+committed frame-hash manifest. A fuzz smoke target covers the animation entry
+point.
 
 ### Step 5 — VP8 Lossy Decoder
 
@@ -220,6 +258,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-13 | Filtered VP8 decode vs plain `dwebp -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 31 locally generated `cwebp` files exercising both the simple (`-nostrong`) and normal (`-strong`) filters, filter strengths 0/20/60, qualities 8-92, sharpness 0/4/7, and odd dimensions down to 1x1; 43 non-lossy corpus files skipped. The `-nofilter` oracle still matches. |
 | 2026-06-14 | VP8 YUV-to-RGB + fancy upsampling vs `dwebp -pam` | Matched all 70 lossy-without-alpha still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), plus 84 locally generated `cwebp` files (two-axis gradients at odd dimensions 1x1 through 64x48, qualities 5-95, simple and normal filters, segments + sharpness 7); 61 non-lossy / lossy+alpha corpus files skipped. The `-nofilter` oracle matches all 154 too. |
 | 2026-06-14 | Composited lossy RGBA (with ALPH alpha) vs `dwebp -pam` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), now including all 18 lossy+alpha files via ALPH composition, plus 18 locally generated `cwebp` lossy+alpha files (RGBA gradients at odd dimensions 1x1 through 64x48, qualities 30-95, alpha quality 60-100, full-range alpha); 43 non-lossy corpus files skipped. Both the filtered and `-nofilter` oracle modes match. |
+| 2026-06-14 | Composited animation frames vs `anim_dump -pam` (libwebp 1.5.0) | Matched 14 locally generated animations byte-for-byte across all composited frames (`img2webp` lossless/lossy/mixed plus `webpmux`-assembled frames): every dispose×blend combination, full-canvas and sub-rect frames, binary and gradient alpha, background-dispose with overlapping and disjoint rectangles, and canvases from 2x1 to 100x80. The 8 most representative (29 frames) are committed under `testdata/animation` with SHA-256 frame hashes in `testdata/animation/hashes.tsv`. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
