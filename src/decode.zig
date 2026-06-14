@@ -9,6 +9,7 @@ const color = @import("color.zig");
 const container = @import("container.zig");
 const demux = @import("demux.zig");
 const errors = @import("errors.zig");
+const features = @import("features.zig");
 const image = @import("image.zig");
 const mux = @import("mux.zig");
 const options = @import("options.zig");
@@ -30,21 +31,56 @@ pub fn decodeStatic(
     if (parsed.features.is_animation) return error.UnsupportedAnimationDecode;
 
     const format = parsed.features.format orelse return error.MissingImageData;
-    return switch (format) {
-        .lossless => decodeLossless(gpa, bytes, &parsed, decode_options),
-        .lossy => decodeLossy(gpa, bytes, &parsed, decode_options),
+    const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
+
+    return decodeImage(gpa, .{
+        .format = format,
+        .bitstream = image_chunk.payload(bytes),
+        .alpha = if (parsed.features.alpha) |location| location.payload(bytes) else null,
+        .dimensions = parsed.features.canvas,
+    }, decode_options);
+}
+
+/// A single still image's bitstream plus the chunk-level context needed to
+/// decode it, independent of how the container located them. Both the public
+/// static decode path and the per-frame animation decoder build one of these
+/// and hand it to `decodeImage`, so animation reuses the still codecs through
+/// this interface rather than reaching into VP8/VP8L internals.
+pub const ImageSource = struct {
+    /// Lossy (`VP8 `) or lossless (`VP8L`) coding of `bitstream`.
+    format: features.FormatKind,
+    /// The raw VP8/VP8L bitstream payload (without its RIFF chunk header).
+    bitstream: []const u8,
+    /// Optional separate ALPH payload. Only meaningful for lossy images;
+    /// lossless carries its own alpha and ignores this field.
+    alpha: ?[]const u8 = null,
+    /// Output dimensions. Must equal the bitstream's own dimensions; the
+    /// container guarantees this for stills and for animation frame rects.
+    dimensions: image.Dimensions,
+};
+
+/// Decodes one still image (lossy or lossless, with optional separate ALPH)
+/// into an owned pixel buffer in `decode_options.output_format`. This is the
+/// shared primitive behind `decodeStatic` and per-frame animation decode.
+/// The caller frees the result via `OwnedBuffer.deinit`.
+pub fn decodeImage(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    decode_options: options.DecoderOptions,
+) errors.Error!image.OwnedBuffer {
+    return switch (source.format) {
+        .lossless => decodeLossless(gpa, source, decode_options),
+        .lossy => decodeLossy(gpa, source, decode_options),
     };
 }
 
 fn decodeLossless(
     gpa: std.mem.Allocator,
-    bytes: []const u8,
-    parsed: *const demux.Result,
+    source: ImageSource,
     decode_options: options.DecoderOptions,
 ) errors.Error!image.OwnedBuffer {
-    const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
-    const payload = image_chunk.payload(bytes);
-    const dimensions = parsed.features.canvas;
+    const payload = source.bitstream;
+    const dimensions = source.dimensions;
     const pixel_count = try dimensions.pixelCount();
 
     var allocation_bytes: u64 = 0;
@@ -106,12 +142,10 @@ fn decodeLossless(
 
 fn decodeLossy(
     gpa: std.mem.Allocator,
-    bytes: []const u8,
-    parsed: *const demux.Result,
+    source: ImageSource,
     decode_options: options.DecoderOptions,
 ) errors.Error!image.OwnedBuffer {
-    const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
-    const dimensions = parsed.features.canvas;
+    const dimensions = source.dimensions;
     const format = decode_options.output_format;
 
     var allocation_bytes: u64 = 0;
@@ -119,9 +153,9 @@ fn decodeLossy(
     const output_count = try reserveElements(u8, output_len, &allocation_bytes, decode_options);
 
     // Reconstruct the YUV planes (key-frame decode through the in-loop filter,
-    // matching plain `dwebp`). The frame's own dimensions equal `canvas`: demux
-    // rejects any VP8X canvas that disagrees with the VP8 frame header.
-    var frame = try vp8_decoder.decodeFrame(gpa, image_chunk.payload(bytes), .{
+    // matching plain `dwebp`). The frame's own dimensions equal `dimensions`:
+    // the container rejects any canvas/rect that disagrees with the VP8 header.
+    var frame = try vp8_decoder.decodeFrame(gpa, source.bitstream, .{
         .apply_loop_filter = true,
     });
     defer frame.deinit();
@@ -145,12 +179,12 @@ fn decodeLossy(
     // it when the file carries one and the output format has an alpha channel.
     // RGB output drops alpha, matching libwebp.
     if (format.channelCount() == 4) {
-        if (parsed.features.alpha) |location| {
+        if (source.alpha) |alpha_payload| {
             const pixel_count: usize = @intCast(try dimensions.pixelCount());
             const alpha_count = try reserveElements(u8, pixel_count, &allocation_bytes, decode_options);
             const alpha_plane = try gpa.alloc(u8, alpha_count);
             defer gpa.free(alpha_plane);
-            _ = try alpha.decodePlaneAlloc(gpa, location.payload(bytes), dimensions, alpha_plane);
+            _ = try alpha.decodePlaneAlloc(gpa, alpha_payload, dimensions, alpha_plane);
             composeAlpha(out, format, stride, dimensions, alpha_plane);
         }
     }
@@ -406,6 +440,29 @@ test "decodes a simple lossless WebP to RGBA" {
     try std.testing.expectEqual(dimensions, decoded.buffer.dimensions);
     try std.testing.expectEqual(image.PixelFormat.rgba, decoded.buffer.format);
     try std.testing.expectEqual(@as(u32, 8), decoded.buffer.stride);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 1, 2, 3, 4 }, decoded.buffer.pixels);
+}
+
+test "decodeImage decodes a raw lossless bitstream without a container" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+
+    // Feed the primitive the raw VP8L bitstream directly (no RIFF wrapper), as
+    // the animation frame decoder will once it locates a frame's sub-chunk.
+    var decoded = try decodeImage(std.testing.allocator, .{
+        .format = .lossless,
+        .bitstream = bitstream,
+        .dimensions = dimensions,
+    }, .{});
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(dimensions, decoded.buffer.dimensions);
+    try std.testing.expectEqual(image.PixelFormat.rgba, decoded.buffer.format);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 1, 2, 3, 4 }, decoded.buffer.pixels);
 }
 
