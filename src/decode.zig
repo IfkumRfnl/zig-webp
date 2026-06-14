@@ -3,13 +3,16 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const alpha = @import("alpha.zig");
 const bit_writer = @import("bit_writer.zig");
+const color = @import("color.zig");
 const container = @import("container.zig");
 const demux = @import("demux.zig");
 const errors = @import("errors.zig");
 const image = @import("image.zig");
 const mux = @import("mux.zig");
 const options = @import("options.zig");
+const vp8_decoder = @import("vp8/decoder.zig");
 const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
@@ -27,8 +30,18 @@ pub fn decodeStatic(
     if (parsed.features.is_animation) return error.UnsupportedAnimationDecode;
 
     const format = parsed.features.format orelse return error.MissingImageData;
-    if (format != .lossless) return error.UnsupportedImageFormat;
+    return switch (format) {
+        .lossless => decodeLossless(gpa, bytes, &parsed, decode_options),
+        .lossy => decodeLossy(gpa, bytes, &parsed, decode_options),
+    };
+}
 
+fn decodeLossless(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    parsed: *const demux.Result,
+    decode_options: options.DecoderOptions,
+) errors.Error!image.OwnedBuffer {
     const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
     const payload = image_chunk.payload(bytes);
     const dimensions = parsed.features.canvas;
@@ -89,6 +102,100 @@ pub fn decodeStatic(
             .format = decode_options.output_format,
         },
     };
+}
+
+fn decodeLossy(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    parsed: *const demux.Result,
+    decode_options: options.DecoderOptions,
+) errors.Error!image.OwnedBuffer {
+    const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
+    const dimensions = parsed.features.canvas;
+    const format = decode_options.output_format;
+
+    var allocation_bytes: u64 = 0;
+    const output_len = try outputByteLength(dimensions, format);
+    const output_count = try reserveElements(u8, output_len, &allocation_bytes, decode_options);
+
+    // Reconstruct the YUV planes (key-frame decode through the in-loop filter,
+    // matching plain `dwebp`). The frame's own dimensions equal `canvas`: demux
+    // rejects any VP8X canvas that disagrees with the VP8 frame header.
+    var frame = try vp8_decoder.decodeFrame(gpa, image_chunk.payload(bytes), .{
+        .apply_loop_filter = true,
+    });
+    defer frame.deinit();
+
+    const out = try gpa.alloc(u8, output_count);
+    errdefer gpa.free(out);
+
+    const stride: u32 = @intCast(try rowByteLength(dimensions, format));
+
+    color.upsampleFancy(format, .{
+        .luma = frame.luma,
+        .chroma_u = frame.chroma_u,
+        .chroma_v = frame.chroma_v,
+        .luma_stride = frame.luma_stride,
+        .chroma_stride = frame.chroma_stride,
+        .width = frame.width,
+        .height = frame.height,
+    }, out, stride);
+
+    // `upsampleFancy` writes opaque alpha; compose the decoded ALPH plane over
+    // it when the file carries one and the output format has an alpha channel.
+    // RGB output drops alpha, matching libwebp.
+    if (format.channelCount() == 4) {
+        if (parsed.features.alpha) |location| {
+            const pixel_count: usize = @intCast(try dimensions.pixelCount());
+            const alpha_count = try reserveElements(u8, pixel_count, &allocation_bytes, decode_options);
+            const alpha_plane = try gpa.alloc(u8, alpha_count);
+            defer gpa.free(alpha_plane);
+            _ = try alpha.decodePlaneAlloc(gpa, location.payload(bytes), dimensions, alpha_plane);
+            composeAlpha(out, format, stride, dimensions, alpha_plane);
+        }
+    }
+
+    return .{
+        .gpa = gpa,
+        .buffer = .{
+            .pixels = out,
+            .dimensions = dimensions,
+            .stride = stride,
+            .format = format,
+        },
+    };
+}
+
+/// Overwrites the alpha channel of a freshly converted lossy frame with the
+/// decoded ALPH plane (one byte per pixel, row-major). The plane is placed
+/// verbatim; lossy WebP carries straight (non-premultiplied) alpha, so RGB is
+/// left untouched.
+fn composeAlpha(
+    out: []u8,
+    format: image.PixelFormat,
+    stride: u32,
+    dimensions: image.Dimensions,
+    alpha_plane: []const u8,
+) void {
+    const channels = 4;
+    const alpha_offset: usize = switch (format) {
+        .rgba, .bgra => 3,
+        .argb => 0,
+        .rgb => unreachable,
+    };
+
+    const width: usize = dimensions.width;
+    const height: usize = dimensions.height;
+    assert(alpha_plane.len == width * height);
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const out_row = out[y * stride ..][0 .. width * channels];
+        const alpha_row = alpha_plane[y * width ..][0..width];
+        for (alpha_row, 0..) |sample, x| {
+            out_row[x * channels + alpha_offset] = sample;
+        }
+    }
 }
 
 fn reserveElements(
@@ -327,19 +434,57 @@ test "decodes a simple lossless WebP to requested BGRA" {
     try std.testing.expectEqualSlices(u8, &.{ 3, 2, 1, 4 }, decoded.buffer.pixels);
 }
 
-test "static decode rejects unsupported lossy WebP" {
-    const vp8 = [_]u8{ 0x10, 0, 0, 0x9d, 0x01, 0x2a, 1, 0, 1, 0 };
-    const encoded = try mux.encodeStatic(std.testing.allocator, .{
-        .canvas = try image.Dimensions.init(1, 1),
-        .format = .lossy,
-        .bitstream = &vp8,
-    }, .{});
-    defer std.testing.allocator.free(encoded);
+test "decodes a lossy WebP to opaque RGBA" {
+    const corpus = @import("testing/corpus.zig");
 
-    try std.testing.expectError(
-        error.UnsupportedImageFormat,
-        decodeStatic(std.testing.allocator, encoded, .{}),
-    );
+    const bytes = corpus.readFileAlloc(std.testing.allocator, "test.webp", .{}) catch |err| switch (err) {
+        error.CorpusUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(bytes);
+
+    var decoded = try decodeStatic(std.testing.allocator, bytes, .{});
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(image.PixelFormat.rgba, decoded.buffer.format);
+
+    // A plain lossy file carries no ALPH chunk, so every pixel stays opaque.
+    var i: usize = 3;
+    while (i < decoded.buffer.pixels.len) : (i += 4) {
+        try std.testing.expectEqual(@as(u8, 255), decoded.buffer.pixels[i]);
+    }
+}
+
+test "composes alpha over lossy color" {
+    const corpus = @import("testing/corpus.zig");
+
+    const bytes = corpus.readFileAlloc(std.testing.allocator, "lossy_alpha1.webp", .{}) catch |err| switch (err) {
+        error.CorpusUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(bytes);
+
+    var decoded = try decodeStatic(std.testing.allocator, bytes, .{});
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(image.PixelFormat.rgba, decoded.buffer.format);
+
+    // Independently decode the ALPH plane and confirm every output alpha byte
+    // matches it: composition must place the decoded plane verbatim.
+    var parsed = try demux.parse(std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const location = parsed.features.alpha orelse return error.TestUnexpectedResult;
+    const dimensions = parsed.features.canvas;
+    const pixel_count: usize = @intCast(try dimensions.pixelCount());
+
+    const plane = try std.testing.allocator.alloc(u8, pixel_count);
+    defer std.testing.allocator.free(plane);
+    _ = try alpha.decodePlaneAlloc(std.testing.allocator, location.payload(bytes), dimensions, plane);
+
+    for (plane, 0..) |expected, idx| {
+        try std.testing.expectEqual(expected, decoded.buffer.pixels[idx * 4 + 3]);
+    }
 }
 
 test "static decode applies allocation limit to meta-prefix group storage" {
