@@ -4,15 +4,16 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 ## Current Position
 
 Steps 0 through 4 are complete for their static scopes. Composing decoded
 alpha planes over lossy VP8 color output is folded into step 5 because it
-needs the VP8 decoder. Step 5 reconstruction has started: key-frame header
-parsing is in place (see below). The near-term fuzzing and CI items listed
-in `PLAN.MD` remain open and should land before reconstruction goes deeper.
+needs the VP8 decoder. Step 5 is well underway: full key-frame decode now
+runs from header through the in-loop deblocking filter, byte-exact against
+plain `dwebp -yuv` (see below). YUV-to-RGB conversion and alpha composition
+over lossy color remain before the step closes.
 
 ## Cross-Cutting Practices
 
@@ -115,12 +116,27 @@ including the above-left corner, top-sample snapshots taken from the
 unfiltered reconstruction, the fixed top-right rule for right-edge
 subblocks, B_PRED predict/add interleaving, and macroblock-padded plane
 output with ceil-rounded chroma crop dimensions. The `zig build yuv` tool
-(`--nofilter` only until the loop filter lands) and the
-`compare-yuv-nofilter` / `compare-yuv-nofilter-corpus` oracle modes mirror
-the alpha tooling.
+and the `compare-yuv` / `compare-yuv-corpus` oracle modes (plus their
+`-nofilter` variants) mirror the alpha tooling.
 
-Not yet started: loop filtering (next), the plain `compare-yuv` gate,
-YUV-to-RGB conversion, and alpha composition over lossy color.
+The in-loop deblocking filter is implemented in `src/vp8/loop_filter.zig`
+(RFC 6386 section 15) and runs as a final pass over the reconstructed,
+macroblock-padded planes — deferring every edge to after whole-frame
+reconstruction is bit-identical to libwebp's row pipeline because intra
+prediction only ever reads the unfiltered above-row snapshot. The simple
+(2-tap) and normal (4/6-tap) kernels, the high-edge-variance and
+interior-smoothness tests, and the per-segment / per-prediction-size
+strength derivation (sharpness narrowing, loop-filter ref/mode deltas, and
+the `f_inner |= has-nonzero-coefficients` rule, where the nonzero flag is
+`decodeMacroblock`'s return) are transcribed from `references/libwebp` and
+cross-checked against the normative text. Macroblocks are filtered in raster
+order, each applying left / inner-vertical / top / inner-horizontal edge
+groups in libwebp's exact sequence. Decoding exposes
+`DecodeOptions{ .apply_loop_filter }` so the tool can still emit
+`dwebp -nofilter`-equivalent output for regression isolation.
+
+Not yet started: YUV-to-RGB conversion, and alpha composition over lossy
+color.
 
 ## Completed Steps
 
@@ -183,6 +199,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-11 | VP8L still-image decode vs `dwebp` PAM output | Matched all 43 VP8L files in `references/libwebp-test-data`; 88 non-lossless files skipped. |
 | 2026-06-12 | ALPH plane decode vs `dwebp -alpha -pgm` | Matched all 18 ALPH-bearing files byte-for-byte (both compression methods, all four filters, color cache); 113 non-ALPH files skipped. |
 | 2026-06-12 | Pre-loop-filter VP8 reconstruction vs `dwebp -nofilter -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 43 locally generated `cwebp` files (qualities 10-95, segments, filter/sharpness settings, odd dimensions down to 1x1); 43 non-lossy corpus files skipped. |
+| 2026-06-13 | Filtered VP8 decode vs plain `dwebp -yuv` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (Y, U, and V planes), plus 31 locally generated `cwebp` files exercising both the simple (`-nostrong`) and normal (`-strong`) filters, filter strengths 0/20/60, qualities 8-92, sharpness 0/4/7, and odd dimensions down to 1x1; 43 non-lossy corpus files skipped. The `-nofilter` oracle still matches. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
