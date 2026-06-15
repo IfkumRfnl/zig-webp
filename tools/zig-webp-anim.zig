@@ -1,27 +1,23 @@
 const std = @import("std");
 const webp = @import("webp");
+const cli = @import("cli_common");
 
 const skip_exit_code = 3;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-
-    if (args.len != 3) {
-        try std.Io.File.stderr().writeStreamingAll(
-            io,
+    const ctx = try cli.Cli.init(init);
+    if (ctx.args.len != 3) {
+        ctx.usageError(
             "usage: zig-webp-anim INPUT.webp OUT_DIR\n" ++
                 "Decodes an animated WebP and writes each composited frame as\n" ++
                 "OUT_DIR/frame_NNNN.pam (RGBA, zero-based, matching `anim_dump\n" ++
                 "-pam`). OUT_DIR must already exist. Exits 3 when the file is\n" ++
                 "not an animation.\n",
         );
-        std.process.exit(2);
     }
 
-    const input_path = args[1];
-    const out_dir = args[2];
+    const input_path = ctx.args[1];
+    const out_dir = ctx.args[2];
 
     const relaxed = webp.ResourceLimits{
         .output_pixels_max = std.math.maxInt(u32),
@@ -29,21 +25,22 @@ pub fn main(init: std.process.Init) !void {
         .allocation_bytes_max = std.math.maxInt(u64),
     };
 
+    // Read with the relaxed input limit rather than the shared default, so the
+    // animation corpus' larger files parse; hence this read stays inline.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io,
+        ctx.io,
         input_path,
-        gpa,
+        ctx.gpa,
         .limited64(relaxed.input_bytes_max),
     );
-    defer gpa.free(bytes);
+    defer ctx.gpa.free(bytes);
 
-    var animated = webp.decodeAnimation(gpa, bytes, .{
+    var animated = webp.decodeAnimation(ctx.gpa, bytes, .{
         .limits = relaxed,
         .output_format = .rgba,
     }) catch |err| switch (err) {
         error.NotAnimated => {
-            try std.Io.File.stderr().writeStreamingAll(io, "not an animation\n");
-            std.process.exit(skip_exit_code);
+            ctx.exitWithMessage("not an animation\n", skip_exit_code);
         },
         else => return err,
     };
@@ -51,30 +48,24 @@ pub fn main(init: std.process.Init) !void {
 
     const width = animated.info.canvas.width;
     const height = animated.info.canvas.height;
-    const header = try std.fmt.allocPrint(
-        gpa,
-        "P7\nWIDTH {d}\nHEIGHT {d}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
-        .{ width, height },
-    );
-    defer gpa.free(header);
+    const header = try cli.pamHeaderRgbaAlloc(ctx.gpa, width, height);
+    defer ctx.gpa.free(header);
 
     for (animated.frames, 0..) |frame, index| {
-        const path = try std.fmt.allocPrint(gpa, "{s}/frame_{d:0>4}.pam", .{ out_dir, index });
-        defer gpa.free(path);
+        const path = try std.fmt.allocPrint(ctx.gpa, "{s}/frame_{d:0>4}.pam", .{ out_dir, index });
+        defer ctx.gpa.free(path);
 
-        const pam = try gpa.alloc(u8, header.len + frame.buffer.pixels.len);
-        defer gpa.free(pam);
-        @memcpy(pam[0..header.len], header);
-        @memcpy(pam[header.len..], frame.buffer.pixels);
+        const pam = try cli.pamConcatAlloc(ctx.gpa, header, frame.buffer.pixels);
+        defer ctx.gpa.free(pam);
 
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = pam });
+        try ctx.writeOutput(path, pam);
     }
 
     const summary = try std.fmt.allocPrint(
-        gpa,
+        ctx.gpa,
         "frames {d}\n",
         .{animated.frames.len},
     );
-    defer gpa.free(summary);
-    try std.Io.File.stdout().writeStreamingAll(io, summary);
+    defer ctx.gpa.free(summary);
+    try ctx.writeStdout(summary);
 }
