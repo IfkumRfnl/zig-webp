@@ -37,6 +37,7 @@ pub const vp8_bool_reader = @import("vp8/bool_reader.zig");
 pub const vp8_bool_writer = @import("vp8/bool_writer.zig");
 pub const vp8_decoder = @import("vp8/decoder.zig");
 pub const vp8_frame_header = @import("vp8/frame_header.zig");
+pub const vp8_header = @import("vp8/header.zig");
 pub const vp8_modes = @import("vp8/modes.zig");
 pub const vp8_prediction = @import("vp8/prediction.zig");
 pub const vp8_quant = @import("vp8/quant.zig");

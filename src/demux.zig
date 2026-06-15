@@ -10,6 +10,7 @@ const features = @import("features.zig");
 const image = @import("image.zig");
 const limits = @import("limits.zig");
 const metadata = @import("metadata.zig");
+const vp8_header = @import("vp8/header.zig");
 const vp8l_header = @import("vp8l/header.zig");
 
 pub const Options = struct {
@@ -629,27 +630,11 @@ fn parseAnimationFrame(
 }
 
 fn parseVP8Info(payload: []const u8) errors.Error!BitstreamInfo {
-    if (payload.len < 10) return error.InvalidVP8Header;
-
-    const frame_tag = container.readLittleU24(payload[0..3]);
-    const key_frame = (frame_tag & 1) == 0;
-    const profile = (frame_tag >> 1) & 7;
-    const show_frame = ((frame_tag >> 4) & 1) == 1;
-    const first_partition_length: usize = @intCast(frame_tag >> 5);
-    if (!key_frame) return error.InvalidVP8Header;
-    if (profile > 3) return error.InvalidVP8Header;
-    if (!show_frame) return error.InvalidVP8Header;
-    if (first_partition_length >= payload.len) return error.InvalidVP8Header;
-    if (!std.mem.eql(u8, payload[3..6], &.{ 0x9d, 0x01, 0x2a })) {
-        return error.InvalidVP8Header;
-    }
-
-    const width = @as(u32, container.readLittleU16(payload[6..8]) & 0x3fff);
-    const height = @as(u32, container.readLittleU16(payload[8..10]) & 0x3fff);
+    const header = try vp8_header.parse(payload);
 
     return .{
         .format = .lossy,
-        .dimensions = try image.Dimensions.init(width, height),
+        .dimensions = header.dimensions,
         .has_alpha = false,
     };
 }
