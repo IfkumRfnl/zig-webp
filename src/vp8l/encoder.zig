@@ -9,23 +9,36 @@
 //!     bit-packing the decoder expects.
 //!   - A predictor transform and a color transform (single global block each).
 //!
-//! Every transform is decision-gated: it is applied only when an estimate says
-//! it shrinks the output, and the choice is encoded so the decoder inverts it.
-//! Each transform's forward step is the exact inverse of the corresponding
-//! `inverse_transform.zig` routine, so any combination round-trips bit-exactly
-//! through this project's decoder (proven by the corpus round-trip test).
+//! Slice 3 adds entropy-coding depth on top of slice 2's transforms:
+//!   - An optional color cache: the encoder simulates the decoder's cache as it
+//!     walks the LZ77 token stream and emits a cache-index green symbol whenever
+//!     the current literal pixel is already present at its hashed slot, exactly
+//!     inverting `color_cache.zig` + `entropy.zig`. Cache bits are decision-gated
+//!     by a real bit-cost estimate.
+//!   - An optional entropy image / multiple Huffman groups (meta-prefix): the
+//!     image is tiled into prefix blocks, blocks are clustered into a bounded set
+//!     of histogram groups, and the entropy image (group index per block) plus
+//!     per-group prefix codes are emitted, inverting `meta_prefix.zig` +
+//!     `prefix_groups.zig`. It is chosen only when its measured bit cost beats
+//!     the single-group encoding.
+//!
+//! Every transform and entropy choice is decision-gated and is the exact inverse
+//! of the corresponding decode routine, so any combination round-trips
+//! bit-exactly through this project's decoder (proven by the corpus round-trip
+//! test).
 //!
 //! The bitstream layout mirrors `decoder.zig` / `image_data.zig`:
 //!   - 5-byte VP8L image header;
 //!   - the transform list (each chosen transform, then a terminator 0 bit);
-//!   - the main image stream (no color cache, single prefix-code group): the
-//!     color-cache-present bit, the meta-prefix bit, five prefix codes, then
-//!     the entropy-coded token stream.
+//!   - the main image stream: the color-cache-present bit (+ 4 cache bits), the
+//!     meta-prefix bit (+ entropy image when present), the prefix-code group(s),
+//!     then the entropy-coded symbol stream.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
 const bit_writer = @import("../bit_writer.zig");
+const color_cache = @import("color_cache.zig");
 const container = @import("../container.zig");
 const errors = @import("../errors.zig");
 const forward_transform = @import("forward_transform.zig");
@@ -35,6 +48,7 @@ const huffman_writer = @import("huffman_writer.zig");
 const image = @import("../image.zig");
 const image_data = @import("image_data.zig");
 const lz77 = @import("lz77.zig");
+const meta_prefix = @import("meta_prefix.zig");
 const pixel = @import("pixel.zig");
 const transform = @import("transform.zig");
 
@@ -44,11 +58,24 @@ pub const Error = errors.Error;
 /// VP8L header limit.
 pub const dimension_max = header.dimension_limit;
 
-/// The green channel's full alphabet spans literals + length codes (no color
-/// cache symbols in this slice).
-const green_alphabet_size = huffman.literal_alphabet_size + huffman.length_code_count;
+/// The green channel's full alphabet spans literals + length codes, plus the
+/// color-cache symbols when a cache is in use. Sized to the maximum so the same
+/// working storage serves any chosen cache size.
+const green_alphabet_size_max = huffman.green_alphabet_size_max;
+const green_base_alphabet_size = huffman.literal_alphabet_size + huffman.length_code_count;
 const literal_alphabet_size = huffman.literal_alphabet_size;
 const distance_alphabet_size = huffman.distance_alphabet_size;
+
+/// Color-cache bit choices the encoder evaluates. 0 means "no cache".
+const color_cache_bits_candidates = [_]u4{ 0, 10 };
+
+/// Prefix bits (block-size log2) the encoder evaluates for the entropy image.
+/// Larger blocks mean fewer, cheaper-to-store groups; smaller blocks adapt
+/// faster. The values stay within the decoder's [2, 9] range.
+const meta_prefix_bits_candidates = [_]u4{ 3, 4, 5 };
+
+/// Upper bound on the number of distinct Huffman groups the clustering emits.
+const group_count_max_local: u32 = 16;
 
 /// Code-length-code alphabet size (19 meta symbols), reused for prefix-code
 /// descriptors.
@@ -135,11 +162,9 @@ const Encoder = struct {
         }
         try writer.writeBit(0); // no more transforms
 
-        // Main image stream: no color cache, single prefix-code group.
-        try writer.writeBit(0); // color cache present = 0
-        try writer.writeBit(0); // meta-prefix present = 0
-
-        try emitEntropyCoded(&writer, token_stream);
+        // Main image stream: choose the cheapest of single-group (with or
+        // without a color cache) and multi-group (entropy image) encodings.
+        try emitMainImage(self.gpa, &writer, main_dimensions, main_pixels, token_stream);
 
         const image_bytes = try writer.finish();
         const total_len = header.byte_count + image_bytes.len;
@@ -663,121 +688,722 @@ fn tokenize(
 
 // ---------------------------------------------------------------------------
 // Entropy coding of the token stream.
+//
+// The LZ77 token stream is first lowered to an "op stream" that already
+// accounts for the color cache (literal / copy / cache-index ops). Lowering
+// uses the materialized main-image pixels so the encoder's cache state matches
+// the decoder's exactly: the decoder inserts every emitted pixel (literals,
+// cache hits, and every pixel a copy reproduces), so the lowering inserts the
+// same pixels. Each op stores its starting pixel index so the block/group it
+// belongs to (for the entropy-image path) is derivable without a second walk.
+//
+// The op stream is encoded either as a single Huffman group or, when it wins on
+// a real bit-cost estimate, as multiple groups selected by an entropy image.
 // ---------------------------------------------------------------------------
 
-/// Per-channel canonical Huffman code working storage for the four literal
-/// channels and the distance channel.
-fn ChannelCode(comptime alphabet_size: usize) type {
-    return struct {
-        lengths: [alphabet_size]u8 = .{0} ** alphabet_size,
-        codes: [alphabet_size]u16 = .{0} ** alphabet_size,
+/// One lowered emission op plus the pixel index where it starts (used to pick
+/// the meta-prefix block/group). `green_symbol`-bearing payloads match what the
+/// decoder reads next after the green symbol.
+const Op = struct {
+    position: usize,
+    kind: Kind,
 
-        const Self = @This();
+    const Kind = union(enum) {
+        literal: pixel.Pixel,
+        copy: lz77.Copy,
+        cache: u16, // cache index in 0..cache_size
+    };
+};
 
-        fn code(self: *const Self) huffman_writer.Code {
-            return .{
-                .lengths = &self.lengths,
-                .codes = &self.codes,
-                .single_symbol = huffman_writer.singleSymbol(&self.lengths),
-            };
+/// Per-channel histograms for one Huffman group. The green histogram spans the
+/// full alphabet (literals + length codes + cache symbols).
+const Histogram = struct {
+    green: [green_alphabet_size_max]u32 = .{0} ** green_alphabet_size_max,
+    red: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
+    blue: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
+    alpha: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
+    distance: [distance_alphabet_size]u32 = .{0} ** distance_alphabet_size,
+
+    fn addOp(self: *Histogram, kind: Op.Kind) void {
+        switch (kind) {
+            .literal => |value| {
+                self.green[pixel.green(value)] += 1;
+                self.red[pixel.red(value)] += 1;
+                self.blue[pixel.blue(value)] += 1;
+                self.alpha[pixel.alpha(value)] += 1;
+            },
+            .copy => |copy| {
+                const length_prefix = lz77.prefixForValue(copy.length);
+                self.green[literal_alphabet_size + length_prefix.symbol] += 1;
+                const distance_code = lz77.distanceCodeForPixels(copy.distance);
+                const distance_prefix = lz77.prefixForValue(distance_code);
+                self.distance[distance_prefix.symbol] += 1;
+            },
+            .cache => |index| {
+                self.green[green_base_alphabet_size + index] += 1;
+            },
         }
+    }
+
+    fn merge(self: *Histogram, other: *const Histogram) void {
+        for (&self.green, other.green) |*dst, src| dst.* += src;
+        for (&self.red, other.red) |*dst, src| dst.* += src;
+        for (&self.blue, other.blue) |*dst, src| dst.* += src;
+        for (&self.alpha, other.alpha) |*dst, src| dst.* += src;
+        for (&self.distance, other.distance) |*dst, src| dst.* += src;
+    }
+};
+
+/// One group's built Huffman codes plus the green alphabet size in effect.
+const GroupCodes = struct {
+    green_lengths: [green_alphabet_size_max]u8 = .{0} ** green_alphabet_size_max,
+    green_codes: [green_alphabet_size_max]u16 = .{0} ** green_alphabet_size_max,
+    red_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
+    red_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
+    blue_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
+    blue_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
+    alpha_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
+    alpha_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
+    distance_lengths: [distance_alphabet_size]u8 = .{0} ** distance_alphabet_size,
+    distance_codes: [distance_alphabet_size]u16 = .{0} ** distance_alphabet_size,
+    green_alphabet_size: u16 = green_base_alphabet_size,
+
+    /// Builds the five codes from `hist`. The green code spans
+    /// `green_base_alphabet_size + cache_size`. Any channel histogram with no
+    /// populated symbol is given symbol 0 a count so the prefix code stays a
+    /// valid (decodable) single-leaf tree: this happens for the distance code
+    /// when there are no copies, and for the red/blue/alpha codes when every
+    /// pixel is a cache hit (e.g. a solid all-zero image whose first pixel hits
+    /// the zero-initialized cache, emitting no literals at all).
+    fn build(self: *GroupCodes, hist: *const Histogram, cache_size: u16) void {
+        self.green_alphabet_size = green_base_alphabet_size + cache_size;
+        assert(self.green_alphabet_size <= green_alphabet_size_max);
+
+        var green = hist.green;
+        var red = hist.red;
+        var blue = hist.blue;
+        var alpha = hist.alpha;
+        var distance = hist.distance;
+        if (sumCounts(green[0..self.green_alphabet_size]) == 0) green[0] = 1;
+        if (sumCounts(&red) == 0) red[0] = 1;
+        if (sumCounts(&blue) == 0) blue[0] = 1;
+        if (sumCounts(&alpha) == 0) alpha[0] = 1;
+        if (sumCounts(&distance) == 0) distance[0] = 1;
+
+        huffman_writer.build(
+            green[0..self.green_alphabet_size],
+            self.green_lengths[0..self.green_alphabet_size],
+            self.green_codes[0..self.green_alphabet_size],
+        );
+        huffman_writer.build(&red, &self.red_lengths, &self.red_codes);
+        huffman_writer.build(&blue, &self.blue_lengths, &self.blue_codes);
+        huffman_writer.build(&alpha, &self.alpha_lengths, &self.alpha_codes);
+        huffman_writer.build(&distance, &self.distance_lengths, &self.distance_codes);
+    }
+
+    fn greenCode(self: *const GroupCodes) huffman_writer.Code {
+        return codeOf(
+            self.green_lengths[0..self.green_alphabet_size],
+            self.green_codes[0..self.green_alphabet_size],
+        );
+    }
+    fn redCode(self: *const GroupCodes) huffman_writer.Code {
+        return codeOf(&self.red_lengths, &self.red_codes);
+    }
+    fn blueCode(self: *const GroupCodes) huffman_writer.Code {
+        return codeOf(&self.blue_lengths, &self.blue_codes);
+    }
+    fn alphaCode(self: *const GroupCodes) huffman_writer.Code {
+        return codeOf(&self.alpha_lengths, &self.alpha_codes);
+    }
+    fn distanceCode(self: *const GroupCodes) huffman_writer.Code {
+        return codeOf(&self.distance_lengths, &self.distance_codes);
+    }
+
+    /// Writes the five prefix-code descriptors in decoder order.
+    fn writeDescriptors(self: *const GroupCodes, writer: *bit_writer.BitWriter) Error!void {
+        try writeNormalPrefixCode(writer, self.green_lengths[0..self.green_alphabet_size]);
+        try writeNormalPrefixCode(writer, &self.red_lengths);
+        try writeNormalPrefixCode(writer, &self.blue_lengths);
+        try writeNormalPrefixCode(writer, &self.alpha_lengths);
+        try writeNormalPrefixCode(writer, &self.distance_lengths);
+    }
+};
+
+fn codeOf(lengths: []const u8, codes: []const u16) huffman_writer.Code {
+    return .{
+        .lengths = lengths,
+        .codes = codes,
+        .single_symbol = huffman_writer.singleSymbol(lengths),
     };
 }
 
-const GreenCode = ChannelCode(green_alphabet_size);
-const LiteralCode = ChannelCode(literal_alphabet_size);
-const DistanceCode = ChannelCode(distance_alphabet_size);
+/// Lowers the LZ77 token stream into the op stream in `ops_out`, simulating the
+/// decoder's color cache when `cache_bits > 0`. `pixels` is the materialized
+/// main image (the exact pixels the decoder reconstructs), used to feed every
+/// copied pixel into the cache so the cache state stays in lockstep with the
+/// decoder. A literal whose pixel already sits at its hashed cache slot is
+/// emitted as a cache reference. Returns the populated op slice (one op per
+/// token, so `ops_out.len >= tokens.len`).
+fn lowerOps(
+    tokens: []const lz77.Token,
+    pixels: []const pixel.Pixel,
+    cache_bits: u4,
+    ops_out: []Op,
+) []Op {
+    assert(ops_out.len >= tokens.len);
 
-fn emitEntropyCoded(
+    var cache: color_cache.Cache = .{};
+    const use_cache = cache_bits > 0;
+    if (use_cache) {
+        cache.bits = cache_bits;
+        cache.size = @as(u16, 1) << cache_bits;
+    }
+
+    var count: usize = 0;
+    var position: usize = 0;
+    for (tokens) |token| {
+        switch (token) {
+            .literal => |value| {
+                var kind: Op.Kind = .{ .literal = value };
+                if (use_cache) {
+                    const index = color_cache.hash(cache_bits, value);
+                    if (cache.entries[index] == value) kind = .{ .cache = index };
+                    cache.entries[index] = value;
+                }
+                ops_out[count] = .{ .position = position, .kind = kind };
+                count += 1;
+                position += 1;
+            },
+            .copy => |copy| {
+                ops_out[count] = .{ .position = position, .kind = .{ .copy = copy } };
+                count += 1;
+                if (use_cache) {
+                    const distance: usize = copy.distance;
+                    var k: usize = 0;
+                    while (k < copy.length) : (k += 1) {
+                        const value = pixels[position + k - distance];
+                        cache.entries[color_cache.hash(cache_bits, value)] = value;
+                    }
+                }
+                position += copy.length;
+            },
+        }
+    }
+
+    return ops_out[0..count];
+}
+
+/// Estimates the symbol-bit cost of encoding `hist` with codes built from it:
+/// the sum over symbols of count * code_length, across all five channels. Extra
+/// bits are added separately by the caller since they are code-independent.
+fn histogramSymbolBits(hist: *const Histogram, cache_size: u16) u64 {
+    var codes: GroupCodes = .{};
+    codes.build(hist, cache_size);
+
+    var bits: u64 = 0;
+    const green_n = green_base_alphabet_size + cache_size;
+    for (hist.green[0..green_n], 0..) |c, s| bits += @as(u64, c) * codes.green_lengths[s];
+    for (hist.red, 0..) |c, s| bits += @as(u64, c) * codes.red_lengths[s];
+    for (hist.blue, 0..) |c, s| bits += @as(u64, c) * codes.blue_lengths[s];
+    for (hist.alpha, 0..) |c, s| bits += @as(u64, c) * codes.alpha_lengths[s];
+    for (hist.distance, 0..) |c, s| bits += @as(u64, c) * codes.distance_lengths[s];
+    return bits;
+}
+
+/// The fixed extra-bit cost of an op stream (length + distance extra bits),
+/// which is independent of the Huffman codes and of the grouping.
+fn opStreamExtraBits(ops: []const Op) u64 {
+    var bits: u64 = 0;
+    for (ops) |op| {
+        switch (op.kind) {
+            .copy => |copy| {
+                bits += lz77.prefixForValue(copy.length).extra_bits;
+                bits += lz77.prefixForValue(lz77.distanceCodeForPixels(copy.distance)).extra_bits;
+            },
+            else => {},
+        }
+    }
+    return bits;
+}
+
+/// A coarse estimate of one group's prefix-code descriptor size in bits, so the
+/// cache/multi-group decisions are honest about per-group overhead. It charges
+/// ~8 bits per populated symbol plus a fixed base; the writer picks the cheaper
+/// of the simple/normal forms at emission, so only the magnitude matters here.
+fn descriptorOverheadEstimate(hist: *const Histogram, cache_size: u16) u64 {
+    var populated: u64 = 0;
+    const green_n = green_base_alphabet_size + cache_size;
+    for (hist.green[0..green_n]) |c| {
+        if (c != 0) populated += 1;
+    }
+    for (hist.red) |c| {
+        if (c != 0) populated += 1;
+    }
+    for (hist.blue) |c| {
+        if (c != 0) populated += 1;
+    }
+    for (hist.alpha) |c| {
+        if (c != 0) populated += 1;
+    }
+    for (hist.distance) |c| {
+        if (c != 0) populated += 1;
+    }
+    return populated * 8 + 60;
+}
+
+/// Emits one op under the given group codes (symbols + extra bits).
+fn emitOp(
     writer: *bit_writer.BitWriter,
+    codes: *const GroupCodes,
+    kind: Op.Kind,
+) Error!void {
+    switch (kind) {
+        .literal => |value| {
+            try codes.greenCode().writeSymbol(writer, pixel.green(value));
+            try codes.redCode().writeSymbol(writer, pixel.red(value));
+            try codes.blueCode().writeSymbol(writer, pixel.blue(value));
+            try codes.alphaCode().writeSymbol(writer, pixel.alpha(value));
+        },
+        .copy => |copy| {
+            const length_prefix = lz77.prefixForValue(copy.length);
+            try codes.greenCode().writeSymbol(writer, literal_alphabet_size + length_prefix.symbol);
+            if (length_prefix.extra_bits > 0) {
+                try writer.writeBits(length_prefix.extra_value, length_prefix.extra_bits);
+            }
+            const distance_code = lz77.distanceCodeForPixels(copy.distance);
+            const distance_prefix = lz77.prefixForValue(distance_code);
+            try codes.distanceCode().writeSymbol(writer, distance_prefix.symbol);
+            if (distance_prefix.extra_bits > 0) {
+                try writer.writeBits(distance_prefix.extra_value, distance_prefix.extra_bits);
+            }
+        },
+        .cache => |index| {
+            try codes.greenCode().writeSymbol(writer, green_base_alphabet_size + index);
+        },
+    }
+}
+
+fn cacheSizeFor(cache_bits: u4) u16 {
+    return if (cache_bits == 0) 0 else @as(u16, 1) << cache_bits;
+}
+
+/// Chooses and emits the cheapest main-image encoding. Each candidate (a
+/// single Huffman group with each candidate color-cache size, and a multi-group
+/// entropy-image encoding) is fully encoded into a scratch buffer so its exact
+/// size is known; the smallest candidate is then re-emitted into `writer`. This
+/// "measure-by-encoding" approach is exact, so a candidate is never chosen when
+/// it would enlarge the output — only genuine wins are kept.
+fn emitMainImage(
+    gpa: std.mem.Allocator,
+    writer: *bit_writer.BitWriter,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
     tokens: []const lz77.Token,
 ) Error!void {
-    // Histograms over each symbol stream.
-    var green_counts: [green_alphabet_size]u32 = .{0} ** green_alphabet_size;
-    var red_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
-    var blue_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
-    var alpha_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
-    var distance_counts: [distance_alphabet_size]u32 = .{0} ** distance_alphabet_size;
+    const ops_buffer = try gpa.alloc(Op, tokens.len);
+    defer gpa.free(ops_buffer);
 
-    for (tokens) |token| {
-        switch (token) {
-            .literal => |value| {
-                green_counts[pixel.green(value)] += 1;
-                red_counts[pixel.red(value)] += 1;
-                blue_counts[pixel.blue(value)] += 1;
-                alpha_counts[pixel.alpha(value)] += 1;
-            },
-            .copy => |copy| {
-                const length_prefix = lz77.prefixForValue(copy.length);
-                const green_symbol = literal_alphabet_size + length_prefix.symbol;
-                green_counts[green_symbol] += 1;
+    // Scratch buffer for trial encodings, generously sized to the worst case.
+    const scratch_capacity = try maxEncodedSize(dimensions);
+    const scratch = try gpa.alloc(u8, scratch_capacity);
+    defer gpa.free(scratch);
 
-                const distance_code = lz77.distanceCodeForPixels(copy.distance);
-                const distance_prefix = lz77.prefixForValue(distance_code);
-                distance_counts[distance_prefix.symbol] += 1;
-            },
+    // Find the best single-group color-cache size by real encoded size.
+    var best_cache_bits: u4 = 0;
+    var best_bits: usize = std.math.maxInt(usize);
+    for (color_cache_bits_candidates) |cache_bits| {
+        var trial = bit_writer.BitWriter.init(scratch);
+        try emitSingleGroup(&trial, pixels, tokens, cache_bits, ops_buffer);
+        const bits = bitLength(&trial);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_cache_bits = cache_bits;
         }
     }
 
-    // Ensure the distance code is always valid even if there are no copies: a
-    // single populated symbol is the minimal valid prefix code.
-    if (sumCounts(&distance_counts) == 0) distance_counts[0] = 1;
-
-    var green_code: GreenCode = .{};
-    var red_code: LiteralCode = .{};
-    var blue_code: LiteralCode = .{};
-    var alpha_code: LiteralCode = .{};
-    var distance_codes: DistanceCode = .{};
-
-    huffman_writer.build(&green_counts, &green_code.lengths, &green_code.codes);
-    huffman_writer.build(&red_counts, &red_code.lengths, &red_code.codes);
-    huffman_writer.build(&blue_counts, &blue_code.lengths, &blue_code.codes);
-    huffman_writer.build(&alpha_counts, &alpha_code.lengths, &alpha_code.codes);
-    huffman_writer.build(&distance_counts, &distance_codes.lengths, &distance_codes.codes);
-
-    // Five prefix codes, in decoder order: green, red, blue, alpha, distance.
-    try writeNormalPrefixCode(writer, &green_code.lengths);
-    try writeNormalPrefixCode(writer, &red_code.lengths);
-    try writeNormalPrefixCode(writer, &blue_code.lengths);
-    try writeNormalPrefixCode(writer, &alpha_code.lengths);
-    try writeNormalPrefixCode(writer, &distance_codes.lengths);
-
-    const g = green_code.code();
-    const r = red_code.code();
-    const b = blue_code.code();
-    const a = alpha_code.code();
-    const d = distance_codes.code();
-
-    for (tokens) |token| {
-        switch (token) {
-            .literal => |value| {
-                try g.writeSymbol(writer, pixel.green(value));
-                try r.writeSymbol(writer, pixel.red(value));
-                try b.writeSymbol(writer, pixel.blue(value));
-                try a.writeSymbol(writer, pixel.alpha(value));
-            },
-            .copy => |copy| {
-                const length_prefix = lz77.prefixForValue(copy.length);
-                try g.writeSymbol(writer, literal_alphabet_size + length_prefix.symbol);
-                if (length_prefix.extra_bits > 0) {
-                    try writer.writeBits(length_prefix.extra_value, length_prefix.extra_bits);
-                }
-
-                const distance_code = lz77.distanceCodeForPixels(copy.distance);
-                const distance_prefix = lz77.prefixForValue(distance_code);
-                try d.writeSymbol(writer, distance_prefix.symbol);
-                if (distance_prefix.extra_bits > 0) {
-                    try writer.writeBits(distance_prefix.extra_value, distance_prefix.extra_bits);
-                }
-            },
+    // Build the best multi-group plan (over prefix-block sizes), if any beats
+    // the single-group winner by real encoded size.
+    var chosen_plan: ?MultiGroupPlan = null;
+    defer if (chosen_plan) |*p| p.deinit(gpa);
+    if (try planMultiGroup(gpa, dimensions, pixels, tokens, best_cache_bits, ops_buffer)) |plan_value| {
+        var plan_mut = plan_value;
+        var trial = bit_writer.BitWriter.init(scratch);
+        emitMultiGroup(gpa, &trial, dimensions, pixels, tokens, &plan_mut) catch {
+            plan_mut.deinit(gpa);
+            return emitSingleGroup(writer, pixels, tokens, best_cache_bits, ops_buffer);
+        };
+        if (bitLength(&trial) < best_bits) {
+            chosen_plan = plan_mut;
+        } else {
+            plan_mut.deinit(gpa);
         }
     }
+
+    if (chosen_plan) |*plan_mut| {
+        return emitMultiGroup(gpa, writer, dimensions, pixels, tokens, plan_mut);
+    }
+    try emitSingleGroup(writer, pixels, tokens, best_cache_bits, ops_buffer);
+}
+
+/// Total bits written into `writer` so far (whole bytes plus pending bits).
+fn bitLength(writer: *const bit_writer.BitWriter) usize {
+    return writer.written().len * 8 + writer.pendingBits();
+}
+
+fn emitSingleGroup(
+    writer: *bit_writer.BitWriter,
+    pixels: []const pixel.Pixel,
+    tokens: []const lz77.Token,
+    cache_bits: u4,
+    ops_buffer: []Op,
+) Error!void {
+    const ops = lowerOps(tokens, pixels, cache_bits, ops_buffer);
+    const cache_size = cacheSizeFor(cache_bits);
+
+    var hist: Histogram = .{};
+    for (ops) |op| hist.addOp(op.kind);
+
+    var codes: GroupCodes = .{};
+    codes.build(&hist, cache_size);
+
+    try writeColorCacheHeader(writer, cache_bits);
+    try writer.writeBit(0); // meta-prefix present = 0
+    try codes.writeDescriptors(writer);
+
+    for (ops) |op| try emitOp(writer, &codes, op.kind);
+}
+
+fn writeColorCacheHeader(writer: *bit_writer.BitWriter, cache_bits: u4) Error!void {
+    if (cache_bits == 0) {
+        try writer.writeBit(0); // color cache present = 0
+        return;
+    }
+    try writer.writeBit(1); // color cache present = 1
+    try writer.writeBits(cache_bits, 4);
 }
 
 fn sumCounts(counts: []const u32) u64 {
     var total: u64 = 0;
     for (counts) |c| total += c;
     return total;
+}
+
+// ---------------------------------------------------------------------------
+// Multiple Huffman groups (entropy image / meta-prefix).
+// ---------------------------------------------------------------------------
+
+const MultiGroupPlan = struct {
+    prefix_bits: u4,
+    entropy_dimensions: image.Dimensions,
+    group_count: u32,
+    cache_bits: u4,
+    /// Per-block group assignment, in entropy-image raster order.
+    block_groups: []u16,
+
+    fn deinit(self: *MultiGroupPlan, gpa: std.mem.Allocator) void {
+        gpa.free(self.block_groups);
+    }
+};
+
+/// Builds the best multi-group plan over the candidate prefix-block sizes, or
+/// null when the image is too small to benefit. Blocks are clustered greedily by
+/// green-histogram similarity into at most `group_count_max_local` groups. The
+/// op stream is lowered once (shared cache) so block histograms match emission
+/// exactly. The estimate here only ranks the prefix-block sizes against each
+/// other; the caller measures the returned plan's real encoded size before
+/// keeping it, so an inaccurate estimate can never enlarge the output.
+fn planMultiGroup(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
+    tokens: []const lz77.Token,
+    cache_bits: u4,
+    ops_buffer: []Op,
+) Error!?MultiGroupPlan {
+    const width: u32 = dimensions.width;
+    const height: u32 = dimensions.height;
+    // Multi-group only helps when there are enough blocks to specialize.
+    if (@as(u64, width) * height < 256) return null;
+
+    const ops = lowerOps(tokens, pixels, cache_bits, ops_buffer);
+    const extra_bits = opStreamExtraBits(ops);
+    const cache_size = cacheSizeFor(cache_bits);
+
+    var best: ?MultiGroupPlan = null;
+    var best_bits: u64 = std.math.maxInt(u64);
+    errdefer if (best) |*b| b.deinit(gpa);
+
+    for (meta_prefix_bits_candidates) |prefix_bits| {
+        const block_size: u32 = @as(u32, 1) << prefix_bits;
+        const entropy_width = divRoundUp(width, block_size);
+        const entropy_height = divRoundUp(height, block_size);
+        const block_count: usize = @as(usize, entropy_width) * entropy_height;
+        if (block_count < 2) continue;
+
+        var candidate = try buildGroupingForPrefix(
+            gpa,
+            dimensions,
+            ops,
+            cache_bits,
+            cache_size,
+            prefix_bits,
+            entropy_width,
+            entropy_height,
+            extra_bits,
+        );
+        if (candidate.estimated_bits < best_bits) {
+            if (best) |*b| b.deinit(gpa);
+            best_bits = candidate.estimated_bits;
+            best = candidate.plan;
+        } else {
+            candidate.plan.deinit(gpa);
+        }
+    }
+
+    return best;
+}
+
+const Candidate = struct {
+    plan: MultiGroupPlan,
+    estimated_bits: u64,
+};
+
+/// Clusters blocks for one prefix-block size and estimates the encoded bit
+/// cost. The estimate is exact for the symbol/extra bits (it rebuilds per-group
+/// histograms from the final assignment) and approximate for the descriptor and
+/// entropy-image overhead.
+fn buildGroupingForPrefix(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    ops: []const Op,
+    cache_bits: u4,
+    cache_size: u16,
+    prefix_bits: u4,
+    entropy_width: u32,
+    entropy_height: u32,
+    extra_bits: u64,
+) Error!Candidate {
+    const width: usize = dimensions.width;
+    const block_count: usize = @as(usize, entropy_width) * entropy_height;
+
+    const block_hists = try gpa.alloc(Histogram, block_count);
+    defer gpa.free(block_hists);
+    @memset(block_hists, Histogram{});
+    for (ops) |op| {
+        const block = blockIndex(op.position, width, prefix_bits, entropy_width);
+        block_hists[block].addOp(op.kind);
+    }
+
+    const block_groups = try gpa.alloc(u16, block_count);
+    errdefer gpa.free(block_groups);
+
+    // Greedy clustering: assign each block to the nearest existing group, or
+    // open a new one when capacity remains and the block is distinct enough.
+    const group_hists = try gpa.alloc(Histogram, group_count_max_local);
+    defer gpa.free(group_hists);
+    var group_count: u32 = 0;
+    for (block_hists, 0..) |*bh, i| {
+        const g = assignBlockToGroup(bh, group_hists[0..group_count], &group_count);
+        block_groups[i] = g;
+        group_hists[g].merge(bh);
+    }
+    assert(group_count >= 1);
+
+    var total_bits: u64 = extra_bits;
+    var gi: u32 = 0;
+    while (gi < group_count) : (gi += 1) {
+        total_bits += histogramSymbolBits(&group_hists[gi], cache_size);
+        total_bits += descriptorOverheadEstimate(&group_hists[gi], cache_size);
+    }
+    total_bits += entropyImageBitsEstimate(block_count, group_count);
+    total_bits += 3 + @as(u64, if (cache_size == 0) 2 else 7);
+
+    return .{
+        .plan = .{
+            .prefix_bits = prefix_bits,
+            .entropy_dimensions = try image.Dimensions.init(entropy_width, entropy_height),
+            .group_count = group_count,
+            .cache_bits = cache_bits,
+            .block_groups = block_groups,
+        },
+        .estimated_bits = total_bits,
+    };
+}
+
+fn blockIndex(position: usize, width: usize, prefix_bits: u4, entropy_width: u32) usize {
+    const x = position % width;
+    const y = position / width;
+    const bx = x >> prefix_bits;
+    const by = y >> prefix_bits;
+    return by * entropy_width + bx;
+}
+
+/// Picks the closest existing group for `bh` by green-histogram L1 distance, or
+/// opens a new group when capacity remains and the block is distinct enough.
+fn assignBlockToGroup(
+    bh: *const Histogram,
+    group_hists: []const Histogram,
+    group_count: *u32,
+) u16 {
+    if (group_count.* == 0) {
+        group_count.* = 1;
+        return 0;
+    }
+
+    var best_group: u16 = 0;
+    var best_distance: u64 = std.math.maxInt(u64);
+    for (group_hists, 0..) |*gh, g| {
+        const d = greenHistogramDistance(bh, gh);
+        if (d < best_distance) {
+            best_distance = d;
+            best_group = @intCast(g);
+        }
+    }
+
+    if (group_count.* < group_count_max_local and best_distance > new_group_threshold) {
+        const g: u16 = @intCast(group_count.*);
+        group_count.* += 1;
+        return g;
+    }
+
+    return best_group;
+}
+
+const new_group_threshold: u64 = 32;
+
+/// L1 distance between two groups' green histograms. Cheap and good enough to
+/// cluster visually distinct regions.
+fn greenHistogramDistance(a: *const Histogram, b: *const Histogram) u64 {
+    var distance: u64 = 0;
+    for (a.green, b.green) |ca, cb| {
+        distance += if (ca > cb) ca - cb else cb - ca;
+    }
+    return distance;
+}
+
+/// Rough estimate of the entropy image's own encoded size: a transform-role
+/// image of `block_count` pixels whose green channel holds the group index, at
+/// ~ceil(log2(group_count)) bits/pixel plus a descriptor base.
+fn entropyImageBitsEstimate(block_count: usize, group_count: u32) u64 {
+    const per_pixel: u64 = @max(1, std.math.log2_int_ceil(u32, @max(group_count, 1)));
+    return per_pixel * block_count + 80;
+}
+
+/// Emits the multi-group main image: the color-cache header, the meta-prefix
+/// bit + prefix-bits field, the entropy image, the per-group prefix codes, and
+/// the symbol stream selecting each op's group via the entropy image. The color
+/// cache (when present) is walked over the whole image so its state matches the
+/// decoder (lowering already did this; ops carry their final cache/literal
+/// decision).
+fn emitMultiGroup(
+    gpa: std.mem.Allocator,
+    writer: *bit_writer.BitWriter,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
+    tokens: []const lz77.Token,
+    plan: *MultiGroupPlan,
+) Error!void {
+    const cache_size = cacheSizeFor(plan.cache_bits);
+    const width: usize = dimensions.width;
+
+    // Re-lower the ops so we can both build exact per-group histograms and emit
+    // from the identical op stream (cache decisions already baked in).
+    const ops_buffer = try gpa.alloc(Op, tokens.len);
+    defer gpa.free(ops_buffer);
+    const ops = lowerOps(tokens, pixels, plan.cache_bits, ops_buffer);
+
+    // Build per-group codes from exact per-group histograms.
+    const group_codes = try gpa.alloc(GroupCodes, plan.group_count);
+    defer gpa.free(group_codes);
+    {
+        const group_hists = try gpa.alloc(Histogram, plan.group_count);
+        defer gpa.free(group_hists);
+        @memset(group_hists, Histogram{});
+        for (ops) |op| {
+            const block = blockIndex(op.position, width, plan.prefix_bits, plan.entropy_dimensions.width);
+            group_hists[plan.block_groups[block]].addOp(op.kind);
+        }
+        for (group_codes, 0..) |*gc, g| {
+            gc.* = .{};
+            gc.build(&group_hists[g], cache_size);
+        }
+    }
+
+    try writeColorCacheHeader(writer, plan.cache_bits);
+    try writer.writeBit(1); // meta-prefix present
+    try writer.writeBits(@as(u32, plan.prefix_bits) - meta_prefix.prefix_bits_min, 3);
+
+    // The entropy image is a transform-role single-group image whose green
+    // channel carries the group index; emit it as a literal stream.
+    try writeEntropyImage(writer, plan);
+
+    for (group_codes) |*gc| try gc.writeDescriptors(writer);
+
+    for (ops) |op| {
+        const block = blockIndex(op.position, width, plan.prefix_bits, plan.entropy_dimensions.width);
+        try emitOp(writer, &group_codes[plan.block_groups[block]], op.kind);
+    }
+}
+
+/// Emits the entropy image as a transform-role single prefix-code group. Each
+/// pixel encodes one block's group index (red = high byte, green = low byte),
+/// matching `meta_prefix.code`'s reconstruction.
+fn writeEntropyImage(writer: *bit_writer.BitWriter, plan: *const MultiGroupPlan) Error!void {
+    const block_count = plan.block_groups.len;
+    assert(block_count >= 1);
+
+    // Histogram the entropy image's channels (green = low byte, red = high
+    // byte; blue/alpha are 0; distance unused). The green channel uses the
+    // transform-role (no-cache) alphabet the decoder reads.
+    var green_counts: [green_base_alphabet_size]u32 = .{0} ** green_base_alphabet_size;
+    var red_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
+    var blue_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
+    var alpha_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
+    var distance_counts: [distance_alphabet_size]u32 = .{0} ** distance_alphabet_size;
+    distance_counts[0] = 1;
+
+    for (plan.block_groups) |g| {
+        green_counts[@intCast(g & 0xff)] += 1;
+        red_counts[@intCast(g >> 8)] += 1;
+        blue_counts[0] += 1;
+        alpha_counts[0] += 1;
+    }
+
+    var green_l: [green_base_alphabet_size]u8 = undefined;
+    var green_c: [green_base_alphabet_size]u16 = undefined;
+    var red_l: [literal_alphabet_size]u8 = undefined;
+    var red_c: [literal_alphabet_size]u16 = undefined;
+    var blue_l: [literal_alphabet_size]u8 = undefined;
+    var blue_c: [literal_alphabet_size]u16 = undefined;
+    var alpha_l: [literal_alphabet_size]u8 = undefined;
+    var alpha_c: [literal_alphabet_size]u16 = undefined;
+    var dist_l: [distance_alphabet_size]u8 = undefined;
+    var dist_c: [distance_alphabet_size]u16 = undefined;
+
+    huffman_writer.build(&green_counts, &green_l, &green_c);
+    huffman_writer.build(&red_counts, &red_l, &red_c);
+    huffman_writer.build(&blue_counts, &blue_l, &blue_c);
+    huffman_writer.build(&alpha_counts, &alpha_l, &alpha_c);
+    huffman_writer.build(&distance_counts, &dist_l, &dist_c);
+
+    try writer.writeBit(0); // color cache present = 0 (transform role)
+    try writeNormalPrefixCode(writer, &green_l);
+    try writeNormalPrefixCode(writer, &red_l);
+    try writeNormalPrefixCode(writer, &blue_l);
+    try writeNormalPrefixCode(writer, &alpha_l);
+    try writeNormalPrefixCode(writer, &dist_l);
+
+    const g_code = codeOf(&green_l, &green_c);
+    const r_code = codeOf(&red_l, &red_c);
+    const b_code = codeOf(&blue_l, &blue_c);
+    const a_code = codeOf(&alpha_l, &alpha_c);
+    for (plan.block_groups) |g| {
+        try g_code.writeSymbol(writer, @intCast(g & 0xff));
+        try r_code.writeSymbol(writer, @intCast(g >> 8));
+        try b_code.writeSymbol(writer, 0);
+        try a_code.writeSymbol(writer, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,7 +1476,7 @@ fn writeConstantSubImage(
 ) Error!void {
     assert(count >= 1);
 
-    var green_counts: [green_alphabet_size]u32 = .{0} ** green_alphabet_size;
+    var green_counts: [green_base_alphabet_size]u32 = .{0} ** green_base_alphabet_size;
     var red_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
     var blue_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
     var alpha_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
@@ -862,41 +1488,67 @@ fn writeConstantSubImage(
     alpha_counts[pixel.alpha(value)] = @intCast(count);
     distance_counts[0] = 1;
 
-    var green_code: GreenCode = .{};
-    var red_code: LiteralCode = .{};
-    var blue_code: LiteralCode = .{};
-    var alpha_code: LiteralCode = .{};
-    var distance_codes: DistanceCode = .{};
-
-    huffman_writer.build(&green_counts, &green_code.lengths, &green_code.codes);
-    huffman_writer.build(&red_counts, &red_code.lengths, &red_code.codes);
-    huffman_writer.build(&blue_counts, &blue_code.lengths, &blue_code.codes);
-    huffman_writer.build(&alpha_counts, &alpha_code.lengths, &alpha_code.codes);
-    huffman_writer.build(&distance_counts, &distance_codes.lengths, &distance_codes.codes);
+    var codes: TransformChannelCodes = .{};
+    codes.build(&green_counts, &red_counts, &blue_counts, &alpha_counts, &distance_counts);
 
     // A transform sub-image is read with the `.transform` role: the decoder
     // reads a color-cache-present bit (no meta-prefix bit) before the prefix
     // codes. Emit color-cache = 0.
     try writer.writeBit(0);
+    try codes.writeDescriptors(writer);
 
-    try writeNormalPrefixCode(writer, &green_code.lengths);
-    try writeNormalPrefixCode(writer, &red_code.lengths);
-    try writeNormalPrefixCode(writer, &blue_code.lengths);
-    try writeNormalPrefixCode(writer, &alpha_code.lengths);
-    try writeNormalPrefixCode(writer, &distance_codes.lengths);
-
-    const g = green_code.code();
-    const r = red_code.code();
-    const b = blue_code.code();
-    const a = alpha_code.code();
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        try g.writeSymbol(writer, pixel.green(value));
-        try r.writeSymbol(writer, pixel.red(value));
-        try b.writeSymbol(writer, pixel.blue(value));
-        try a.writeSymbol(writer, pixel.alpha(value));
+        try codes.writePixel(writer, value);
     }
 }
+
+/// Per-channel codes for a transform-role sub-image (literals only). The green
+/// channel still spans `green_base_alphabet_size` symbols (literals + length
+/// codes) because the decoder reads that alphabet for a no-cache group; only the
+/// literal symbols are ever populated here.
+const TransformChannelCodes = struct {
+    green_l: [green_base_alphabet_size]u8 = undefined,
+    green_c: [green_base_alphabet_size]u16 = undefined,
+    red_l: [literal_alphabet_size]u8 = undefined,
+    red_c: [literal_alphabet_size]u16 = undefined,
+    blue_l: [literal_alphabet_size]u8 = undefined,
+    blue_c: [literal_alphabet_size]u16 = undefined,
+    alpha_l: [literal_alphabet_size]u8 = undefined,
+    alpha_c: [literal_alphabet_size]u16 = undefined,
+    dist_l: [distance_alphabet_size]u8 = undefined,
+    dist_c: [distance_alphabet_size]u16 = undefined,
+
+    fn build(
+        self: *TransformChannelCodes,
+        green_counts: []const u32,
+        red_counts: []const u32,
+        blue_counts: []const u32,
+        alpha_counts: []const u32,
+        distance_counts: []const u32,
+    ) void {
+        huffman_writer.build(green_counts, &self.green_l, &self.green_c);
+        huffman_writer.build(red_counts, &self.red_l, &self.red_c);
+        huffman_writer.build(blue_counts, &self.blue_l, &self.blue_c);
+        huffman_writer.build(alpha_counts, &self.alpha_l, &self.alpha_c);
+        huffman_writer.build(distance_counts, &self.dist_l, &self.dist_c);
+    }
+
+    fn writeDescriptors(self: *const TransformChannelCodes, writer: *bit_writer.BitWriter) Error!void {
+        try writeNormalPrefixCode(writer, &self.green_l);
+        try writeNormalPrefixCode(writer, &self.red_l);
+        try writeNormalPrefixCode(writer, &self.blue_l);
+        try writeNormalPrefixCode(writer, &self.alpha_l);
+        try writeNormalPrefixCode(writer, &self.dist_l);
+    }
+
+    fn writePixel(self: *const TransformChannelCodes, writer: *bit_writer.BitWriter, value: pixel.Pixel) Error!void {
+        try codeOf(&self.green_l, &self.green_c).writeSymbol(writer, pixel.green(value));
+        try codeOf(&self.red_l, &self.red_c).writeSymbol(writer, pixel.red(value));
+        try codeOf(&self.blue_l, &self.blue_c).writeSymbol(writer, pixel.blue(value));
+        try codeOf(&self.alpha_l, &self.alpha_c).writeSymbol(writer, pixel.alpha(value));
+    }
+};
 
 /// Emits a small sub-image as a literal stream under per-channel constant
 /// prefix codes (every pixel identical). Used for the palette (color-indexing)
@@ -908,7 +1560,7 @@ fn writeLiteralSubImage(
     assert(pixels.len > 0);
 
     // Build per-channel Huffman codes over just these pixels and emit them.
-    var green_counts: [green_alphabet_size]u32 = .{0} ** green_alphabet_size;
+    var green_counts: [green_base_alphabet_size]u32 = .{0} ** green_base_alphabet_size;
     var red_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
     var blue_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
     var alpha_counts: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size;
@@ -922,36 +1574,16 @@ fn writeLiteralSubImage(
         alpha_counts[pixel.alpha(value)] += 1;
     }
 
-    var green_code: GreenCode = .{};
-    var red_code: LiteralCode = .{};
-    var blue_code: LiteralCode = .{};
-    var alpha_code: LiteralCode = .{};
-    var distance_codes: DistanceCode = .{};
-
-    huffman_writer.build(&green_counts, &green_code.lengths, &green_code.codes);
-    huffman_writer.build(&red_counts, &red_code.lengths, &red_code.codes);
-    huffman_writer.build(&blue_counts, &blue_code.lengths, &blue_code.codes);
-    huffman_writer.build(&alpha_counts, &alpha_code.lengths, &alpha_code.codes);
-    huffman_writer.build(&distance_counts, &distance_codes.lengths, &distance_codes.codes);
+    var codes: TransformChannelCodes = .{};
+    codes.build(&green_counts, &red_counts, &blue_counts, &alpha_counts, &distance_counts);
 
     // A transform sub-image is read with the `.transform` role: a color-cache
     // bit (no meta-prefix bit), then the five prefix codes, then the literals.
     try writer.writeBit(0); // color cache present = 0
-    try writeNormalPrefixCode(writer, &green_code.lengths);
-    try writeNormalPrefixCode(writer, &red_code.lengths);
-    try writeNormalPrefixCode(writer, &blue_code.lengths);
-    try writeNormalPrefixCode(writer, &alpha_code.lengths);
-    try writeNormalPrefixCode(writer, &distance_codes.lengths);
+    try codes.writeDescriptors(writer);
 
-    const g = green_code.code();
-    const r = red_code.code();
-    const b = blue_code.code();
-    const a = alpha_code.code();
     for (pixels) |value| {
-        try g.writeSymbol(writer, pixel.green(value));
-        try r.writeSymbol(writer, pixel.red(value));
-        try b.writeSymbol(writer, pixel.blue(value));
-        try a.writeSymbol(writer, pixel.alpha(value));
+        try codes.writePixel(writer, value);
     }
 }
 
@@ -1167,6 +1799,16 @@ test "encodes and round-trips a 1x1 image" {
     try decodeRoundTrip(testing.allocator, dims, &pixels);
 }
 
+test "encodes and round-trips a solid all-zero image (cache-hit-on-empty-cache)" {
+    // A fully transparent black image: the first pixel value is 0, which hits
+    // the zero-initialized color cache, so no literal channels are ever emitted.
+    // The encoder must still build valid red/blue/alpha codes.
+    const dims = try image.Dimensions.init(40, 40);
+    var pixels: [40 * 40]pixel.Pixel = undefined;
+    @memset(&pixels, 0);
+    try decodeRoundTrip(testing.allocator, dims, &pixels);
+}
+
 test "encodes and round-trips a solid-color image" {
     const dims = try image.Dimensions.init(8, 8);
     var pixels: [64]pixel.Pixel = undefined;
@@ -1341,4 +1983,102 @@ test "encoder rejects a pixel count that disagrees with dimensions" {
     const dims = try image.Dimensions.init(4, 4);
     const pixels = [_]pixel.Pixel{pixel.fromChannels(0, 0, 0, 0)} ** 4;
     try testing.expectError(error.OutputTooLarge, encodeAlloc(testing.allocator, dims, &pixels));
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3: color cache and multiple Huffman groups (entropy image).
+// ---------------------------------------------------------------------------
+
+test "encodes and round-trips a cache-friendly repeated-palette image" {
+    // Many pixels drawn from a small recurring set of colors arranged so the
+    // palette transform is skipped (more than 256 distinct values overall) but
+    // a color cache still finds frequent hits.
+    const width = 96;
+    const height = 96;
+    const dims = try image.Dimensions.init(width, height);
+    const pixels = try testing.allocator.alloc(pixel.Pixel, width * height);
+    defer testing.allocator.free(pixels);
+    var rng: u32 = 0xc0ffee;
+    for (pixels) |*p| {
+        rng = rng *% 1664525 +% 1013904223;
+        // 512 distinct colors (so palette is out) but heavily repeated.
+        const key: u16 = @intCast((rng >> 12) & 0x1ff);
+        p.* = pixel.fromChannels(255, @intCast(key & 0xff), @intCast((key >> 1) & 0xff), @intCast(key >> 2));
+    }
+    try decodeRoundTrip(testing.allocator, dims, pixels);
+}
+
+test "lowerOps replaces repeated literals with color-cache references" {
+    // Two pixels of the same color: with a cache, the second is a cache hit.
+    const a = pixel.fromChannels(255, 0x11, 0x22, 0x33);
+    const tokens = [_]lz77.Token{ .{ .literal = a }, .{ .literal = a } };
+    const pixels = [_]pixel.Pixel{ a, a };
+    var ops_buf: [2]Op = undefined;
+
+    const without = lowerOps(&tokens, &pixels, 0, &ops_buf);
+    try testing.expect(without[0].kind == .literal);
+    try testing.expect(without[1].kind == .literal);
+
+    const with = lowerOps(&tokens, &pixels, 10, &ops_buf);
+    try testing.expect(with[0].kind == .literal);
+    try testing.expect(with[1].kind == .cache);
+}
+
+test "lowerOps feeds copied pixels into the cache like the decoder" {
+    // A literal then a copy reproducing it; a following literal equal to the
+    // copied value must be detected as a cache hit, proving copies update the
+    // cache. distance 1 copies the prior pixel.
+    const a = pixel.fromChannels(255, 9, 8, 7);
+    const tokens = [_]lz77.Token{
+        .{ .literal = a },
+        .{ .copy = .{ .length = 2, .distance = 1 } },
+        .{ .literal = a },
+    };
+    const pixels = [_]pixel.Pixel{ a, a, a, a };
+    var ops_buf: [3]Op = undefined;
+    const ops = lowerOps(&tokens, &pixels, 10, &ops_buf);
+    try testing.expectEqual(@as(usize, 3), ops.len);
+    try testing.expect(ops[2].kind == .cache);
+}
+
+test "encoder selects a multi-group plan for a two-region image" {
+    // A large image split top/bottom into two regions with disjoint color
+    // distributions, so clustering should open at least two Huffman groups.
+    const width = 128;
+    const height = 128;
+    const dims = try image.Dimensions.init(width, height);
+    const pixels = try testing.allocator.alloc(pixel.Pixel, width * height);
+    defer testing.allocator.free(pixels);
+    var rng: u32 = 0x5eed;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            rng = rng *% 1664525 +% 1013904223;
+            const noise: u8 = @intCast((rng >> 16) & 0x3f);
+            const high: u8 = 190 +% noise;
+            const p = if (y < height / 2)
+                // Top region: reddish, many distinct values.
+                pixel.fromChannels(255, high, noise, noise)
+            else
+                // Bottom region: blueish, different distribution.
+                pixel.fromChannels(255, noise, noise, high);
+            pixels[y * width + x] = p;
+        }
+    }
+
+    const tokens = try testing.allocator.alloc(lz77.Token, pixels.len);
+    defer testing.allocator.free(tokens);
+    const token_stream = try tokenize(testing.allocator, dims, pixels, tokens);
+
+    const ops_buffer = try testing.allocator.alloc(Op, token_stream.len);
+    defer testing.allocator.free(ops_buffer);
+
+    const maybe_plan = try planMultiGroup(testing.allocator, dims, pixels, token_stream, 0, ops_buffer);
+    try testing.expect(maybe_plan != null);
+    var plan = maybe_plan.?;
+    defer plan.deinit(testing.allocator);
+    try testing.expect(plan.group_count >= 2);
+
+    // And the whole image round-trips bit-exactly (exercising the multi-group
+    // emission path through the public encoder).
+    try decodeRoundTrip(testing.allocator, dims, pixels);
 }

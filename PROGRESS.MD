@@ -22,7 +22,12 @@ round-trips bit-exactly (see "Step 7 — VP8L Lossless Encoder (slice 1)" and th
 2026-06-16 oracle row). Its second slice — LZ77 back-references plus the
 subtract-green, color, predictor, and palette/color-indexing transforms (each
 decision-gated) — is also delivered and round-trips bit-exactly (see "Step 7 —
-VP8L Lossless Encoder (slice 2)" and the second 2026-06-16 oracle row).
+VP8L Lossless Encoder (slice 2)" and the second 2026-06-16 oracle row). Its third
+slice — an optional color cache and an optional entropy image / multiple Huffman
+groups (meta-prefix), each chosen by measuring the real encoded size — is now
+delivered, still round-trips bit-exactly, and lowers the median size-vs-`cwebp`
+ratio to 1.04x (see "Step 7 — VP8L Lossless Encoder (slice 3)" and the third
+2026-06-16 oracle row).
 
 ## Cross-Cutting Practices
 
@@ -55,6 +60,42 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 7 — VP8L Lossless Encoder (slice 3)
+
+The third encoder slice adds entropy-coding depth on top of slice 2's
+transforms, all in `src/vp8l/encoder.zig` (mirroring the decode side's
+`color_cache.zig`, `meta_prefix.zig`, `prefix_groups.zig`, and the group-store
+entropy path in `entropy.zig`):
+
+- An optional color cache. The LZ77 token stream is lowered to an "op stream"
+  while simulating the decoder's cache exactly: lowering reads the materialized
+  main-image pixels so every copied pixel is inserted into the cache just as the
+  decoder inserts it, and a literal whose pixel already sits at its hashed slot
+  is emitted as a cache-index green symbol (`green_base + index`), the exact
+  inverse of `color_cache.zig` + the cache path in `entropy.zig`. A guard gives
+  any empty channel histogram a single symbol so the prefix code stays a valid
+  single-leaf tree — this matters for a solid all-zero image whose first pixel
+  hits the zero-initialized cache and emits no literals at all.
+- An optional entropy image / multiple Huffman groups (meta-prefix). The image
+  is tiled into prefix blocks (block-size log2 in [3,5]); per-block green
+  histograms are clustered greedily (L1 distance, bounded at 16 groups); the
+  entropy image (group index per block, red high byte / green low byte) is
+  emitted as a transform-role single-group literal stream, followed by the
+  per-group prefix codes and a symbol stream that selects each op's group by its
+  starting block. This inverts `meta_prefix.zig` + `prefix_groups.zig`.
+- Both choices are gated by *measuring the real encoded size*: each candidate
+  (single group with each candidate cache size, and the multi-group plan) is
+  fully encoded into a scratch buffer and the smallest is re-emitted into the
+  output. Because the comparison is exact, a candidate is never kept when it
+  would enlarge the output, so slice 3 is never larger than slice 2 on any file.
+
+Validity and round-trip stay gated by `zig build test`: the slice-1 corpus
+round-trip test still passes with the richer encoder, and new tests cover a
+cache-friendly repeated-palette image, the cache-hit/copy-insert lowering rules
+(white-box on `lowerOps`), the empty-cache solid-image edge case, and a
+two-region image whose `planMultiGroup` is asserted to open at least two groups
+and which round-trips through the multi-group emission path.
 
 ### Step 7 — VP8L Lossless Encoder (slice 2)
 
@@ -333,6 +374,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-14 | Composited animation frames vs `anim_dump -pam` (libwebp 1.5.0) | Matched 14 locally generated animations byte-for-byte across all composited frames (`img2webp` lossless/lossy/mixed plus `webpmux`-assembled frames): every dispose×blend combination, full-canvas and sub-rect frames, binary and gradient alpha, background-dispose with overlapping and disjoint rectangles, and canvases from 2x1 to 100x80. The 8 most representative (29 frames) are committed under `testdata/animation` with SHA-256 frame hashes in `testdata/animation/hashes.tsv`. |
 | 2026-06-16 | VP8L literal encoder round-trip (own decoder + `dwebp`) | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode (ARGB literals only) and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test). Locally, `dwebp -pam` also decodes the encoder's output bit-exactly to the source on `lossless_vec_2_0.webp` (128x128); `dwebp` is not on CI, so CI relies on the own-decoder round-trip. Encoded size is ~1.28x the original corpus bytes (literals only; size is not gated this slice). |
 | 2026-06-16 | VP8L transform encoder (slice 2) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with LZ77 + the decision-gated subtract-green/color/predictor/palette transforms and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) also decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0986x (37/43 files at or below 1.10x; range 0.92x–1.63x), aggregate-bytes ratio 1.044x. Size is reported, not yet hard-gated; the worst cases are small/synthetic vector images where cwebp's entropy-image and color-cache machinery (slice 3) wins. |
+| 2026-06-16 | VP8L entropy encoder (slice 3) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with the slice-2 transforms plus the optional color cache and optional entropy-image/multiple-Huffman-groups, each chosen by measuring the real encoded size, and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus round-trip test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0368x (37/43 files at or below 1.10x; range 0.92x–1.59x), and no file is larger than the slice-2 encoding (the measure-by-encoding selection only keeps genuine wins). The remaining files above 1.10x are the photographic `lossless1`–`lossless4` / `lossless_color_transform` / `near_lossless_75`, which need per-block predictor selection (a later refinement) to close the gap. The 1.10x median size gate for step 7 holds against `cwebp` on this corpus; the PNG comparison is not yet recorded. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
