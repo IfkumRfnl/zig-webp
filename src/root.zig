@@ -54,6 +54,8 @@ pub const vp8l_entropy = @import("vp8l/entropy.zig");
 pub const vp8l_huffman = @import("vp8l/huffman.zig");
 pub const vp8l_image_data = @import("vp8l/image_data.zig");
 pub const vp8l_inverse_transform = @import("vp8l/inverse_transform.zig");
+pub const vp8l_forward_transform = @import("vp8l/forward_transform.zig");
+pub const vp8l_lz77 = @import("vp8l/lz77.zig");
 pub const vp8l_meta_prefix = @import("vp8l/meta_prefix.zig");
 pub const vp8l_pixel = @import("vp8l/pixel.zig");
 pub const vp8l_prefix_groups = @import("vp8l/prefix_groups.zig");
@@ -209,9 +211,11 @@ pub fn encodeStatic(
 /// Encodes a caller-supplied pixel buffer into a complete lossless (VP8L)
 /// WebP file. The buffer may be `rgba`/`bgra`/`argb` (4-channel) or `rgb`
 /// (treated as opaque), read row-major honoring its stride. The current VP8L
-/// encoder emits ARGB literals (no LZ77, transforms, or color cache yet; see
-/// PLAN.MD step 7), so the output is valid and round-trips bit-exactly but is
-/// not yet size-optimized. `encode_options.format` must be `.lossless`.
+/// encoder applies LZ77 back-references plus decision-gated subtract-green,
+/// color, predictor, and palette/color-indexing transforms (single global
+/// prefix-code group, no color cache yet; see PLAN.MD step 7), so the output is
+/// valid and round-trips bit-exactly. `encode_options.format` must be
+/// `.lossless`.
 /// Returns caller-owned bytes (free with the same allocator).
 pub fn encodeLossless(
     gpa: std.mem.Allocator,
