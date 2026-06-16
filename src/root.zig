@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
+const encode = @import("encode.zig");
 
 pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
@@ -25,6 +26,7 @@ pub const color = @import("color.zig");
 pub const container = @import("container.zig");
 pub const decode = @import("decode.zig");
 pub const demux = @import("demux.zig");
+pub const encode_module = @import("encode.zig");
 pub const errors = @import("errors.zig");
 pub const features = @import("features.zig");
 pub const image = @import("image.zig");
@@ -46,6 +48,8 @@ pub const vp8_transform = @import("vp8/transform.zig");
 pub const vp8l_header = @import("vp8l/header.zig");
 pub const vp8l_color_cache = @import("vp8l/color_cache.zig");
 pub const vp8l_decoder = @import("vp8l/decoder.zig");
+pub const vp8l_encoder = @import("vp8l/encoder.zig");
+pub const vp8l_huffman_writer = @import("vp8l/huffman_writer.zig");
 pub const vp8l_entropy = @import("vp8l/entropy.zig");
 pub const vp8l_huffman = @import("vp8l/huffman.zig");
 pub const vp8l_image_data = @import("vp8l/image_data.zig");
@@ -141,6 +145,7 @@ pub const VP8LPrefixCodeGroupStore = vp8l_prefix_groups.Store;
 pub const VP8LPrefixCodeGroupWorkBuffers = vp8l_prefix_groups.WorkBuffers;
 pub const VP8LTransform = vp8l_transform.Transform;
 pub const VP8LTransformListReader = vp8l_transform.ListReader;
+pub const VP8LHuffmanWriterCode = vp8l_huffman_writer.Code;
 
 pub const chunk_header_size = container.chunk_header_size;
 pub const riff_header_size = container.riff_header_size;
@@ -199,6 +204,33 @@ pub fn encodeStatic(
     encode_options: MuxOptions,
 ) Error![]u8 {
     return mux.encodeStatic(gpa, static_image, encode_options);
+}
+
+/// Encodes a caller-supplied pixel buffer into a complete lossless (VP8L)
+/// WebP file. The buffer may be `rgba`/`bgra`/`argb` (4-channel) or `rgb`
+/// (treated as opaque), read row-major honoring its stride. The current VP8L
+/// encoder emits ARGB literals (no LZ77, transforms, or color cache yet; see
+/// PLAN.MD step 7), so the output is valid and round-trips bit-exactly but is
+/// not yet size-optimized. `encode_options.format` must be `.lossless`.
+/// Returns caller-owned bytes (free with the same allocator).
+pub fn encodeLossless(
+    gpa: std.mem.Allocator,
+    buffer: ImageBuffer,
+    encode_options: EncoderOptions,
+) Error![]u8 {
+    return encode.encodeStaticLossless(gpa, buffer, encode_options);
+}
+
+/// Encodes a `width`x`height` ARGB pixel array (packed `0xAARRGGBB`,
+/// row-major) into a raw VP8L bitstream — the payload of a `VP8L` chunk,
+/// without the RIFF container. Most callers want `encodeLossless`; this is for
+/// tooling that muxes the bitstream itself. Returns caller-owned bytes.
+pub fn encodeVP8LBitstream(
+    gpa: std.mem.Allocator,
+    dimensions: Dimensions,
+    pixels: []const VP8LARGBPixel,
+) Error![]u8 {
+    return vp8l_encoder.encodeAlloc(gpa, dimensions, pixels);
 }
 
 /// Decodes a complete WebP file into an owned pixel buffer. Currently

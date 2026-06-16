@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-14
+Last updated: 2026-06-16
 
 ## Current Position
 
@@ -16,7 +16,10 @@ decoded ALPH plane over lossy color — all byte-exact against `dwebp -pam` for
 every lossy file in the corpus, including lossy+alpha (see Oracle Results).
 Animated WebP now decodes through `decodeAnimation` (all composited frames) and
 the streaming `AnimationDecoder`, byte-exact against libwebp's `anim_dump` on a
-generated animation corpus. Next is step 7 (VP8L lossless encoder).
+generated animation corpus. Step 7 (VP8L lossless encoder) is now in progress:
+its first slice — valid VP8L still output from ARGB literals — is delivered and
+round-trips bit-exactly (see "Step 7 — VP8L Lossless Encoder (slice 1)" and the
+2026-06-16 oracle row).
 
 ## Cross-Cutting Practices
 
@@ -49,6 +52,32 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 7 — VP8L Lossless Encoder (slice 1)
+
+The first encoder slice emits valid still VP8L bitstreams from ARGB literals
+only — no LZ77 backward references, no transforms, and no color cache yet. A
+canonical Huffman writer (`src/vp8l/huffman_writer.zig`) is the exact inverse
+of the decoder's reader (`src/vp8l/huffman.zig`): it assigns length-limited
+canonical code lengths from a histogram, then emits codes in the reader's
+canonical (length, symbol) order with the same bit-reversal, including the
+single-leaf zero-bit exception and a length-limited build for the 7-bit
+code-length-code. The encoder (`src/vp8l/encoder.zig`) writes the VP8L image
+header, a "no transform" terminator, the no-color-cache / single-prefix-group
+flags, the five prefix-code descriptors (green/red/blue/alpha/distance) in
+normal form, and the per-pixel literal symbol stream, all through the existing
+LSB-first `BitWriter`. The public API gains `encodeLossless` (typed pixel
+buffer → muxed simple `VP8L` WebP file, any RGBA/BGRA/ARGB/RGB input honoring
+stride) and `encodeVP8LBitstream` (ARGB → raw VP8L payload), wired in
+`src/encode.zig` and `src/root.zig` and muxed via the existing
+`mux.encodeStatic`.
+
+Validity and round-trip are gated by committed tests under `zig build test`:
+synthetic edge cases (1x1, solid color, two-axis gradient, full-range alpha,
+single-row, single-column) plus a corpus test that decodes every still VP8L
+file in `testdata/libwebp-test-data` to RGBA, re-encodes it, decodes the
+re-encoded bytes, and asserts the pixels are bit-identical to the source.
+Size is not gated for this slice (LZ77/transforms come next).
 
 ### Step 6 — Extended Decode and Animation
 
@@ -259,6 +288,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-14 | VP8 YUV-to-RGB + fancy upsampling vs `dwebp -pam` | Matched all 70 lossy-without-alpha still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), plus 84 locally generated `cwebp` files (two-axis gradients at odd dimensions 1x1 through 64x48, qualities 5-95, simple and normal filters, segments + sharpness 7); 61 non-lossy / lossy+alpha corpus files skipped. The `-nofilter` oracle matches all 154 too. |
 | 2026-06-14 | Composited lossy RGBA (with ALPH alpha) vs `dwebp -pam` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), now including all 18 lossy+alpha files via ALPH composition, plus 18 locally generated `cwebp` lossy+alpha files (RGBA gradients at odd dimensions 1x1 through 64x48, qualities 30-95, alpha quality 60-100, full-range alpha); 43 non-lossy corpus files skipped. Both the filtered and `-nofilter` oracle modes match. |
 | 2026-06-14 | Composited animation frames vs `anim_dump -pam` (libwebp 1.5.0) | Matched 14 locally generated animations byte-for-byte across all composited frames (`img2webp` lossless/lossy/mixed plus `webpmux`-assembled frames): every dispose×blend combination, full-canvas and sub-rect frames, binary and gradient alpha, background-dispose with overlapping and disjoint rectangles, and canvases from 2x1 to 100x80. The 8 most representative (29 frames) are committed under `testdata/animation` with SHA-256 frame hashes in `testdata/animation/hashes.tsv`. |
+| 2026-06-16 | VP8L literal encoder round-trip (own decoder + `dwebp`) | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode (ARGB literals only) and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test). Locally, `dwebp -pam` also decodes the encoder's output bit-exactly to the source on `lossless_vec_2_0.webp` (128x128); `dwebp` is not on CI, so CI relies on the own-decoder round-trip. Encoded size is ~1.28x the original corpus bytes (literals only; size is not gated this slice). |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

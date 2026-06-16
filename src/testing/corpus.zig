@@ -6,6 +6,7 @@ const alpha_decode = @import("../alpha.zig");
 const animation_decode = @import("../animation_decode.zig");
 const decode = @import("../decode.zig");
 const demux = @import("../demux.zig");
+const encode = @import("../encode.zig");
 const errors = @import("../errors.zig");
 const limits = @import("../limits.zig");
 
@@ -729,6 +730,82 @@ test "composited animation frames match committed SHA-256 hashes" {
     }
 
     try std.testing.expectEqual(@as(u32, default_animation_file_count), verified_count);
+}
+
+test "VP8L encoder round-trips every lossless corpus image bit-exactly" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, default_root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        error.NotDir => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.close(io);
+
+    const corpus_limits = limits.ResourceLimits{
+        .output_pixels_max = std.math.maxInt(u32),
+        .animation_canvas_pixels_max = std.math.maxInt(u32),
+    };
+
+    var encoded_count: u32 = 0;
+    var iterator = root.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
+
+        const bytes = try readFileAlloc(std.testing.allocator, entry.name, .{
+            .limits = corpus_limits,
+        });
+        defer std.testing.allocator.free(bytes);
+
+        // Classify: only still lossless (VP8L) files are in scope for slice 1.
+        var result = try demux.parse(std.testing.allocator, bytes, .{ .limits = corpus_limits });
+        const is_lossless_still = !result.features.is_animation and
+            result.features.format == .lossless;
+        result.deinit();
+        if (!is_lossless_still) continue;
+
+        // Source pixels: decode the original file to RGBA via the decoder.
+        var source = decode.decodeStatic(std.testing.allocator, bytes, .{
+            .output_format = .rgba,
+            .limits = corpus_limits,
+        }) catch |err| {
+            std.debug.print("source decode failed for {s}: {s}\n", .{ entry.name, @errorName(err) });
+            return err;
+        };
+        defer source.deinit();
+
+        // Re-encode the decoded pixels with the new encoder.
+        const reencoded = encode.encodeStaticLossless(std.testing.allocator, source.buffer, .{
+            .limits = corpus_limits,
+        }) catch |err| {
+            std.debug.print("re-encode failed for {s}: {s}\n", .{ entry.name, @errorName(err) });
+            return err;
+        };
+        defer std.testing.allocator.free(reencoded);
+
+        // Decode the re-encoded bytes and assert bit-exact equality with the
+        // source pixels. This is a genuine source-vs-redecoded comparison.
+        var roundtrip = decode.decodeStatic(std.testing.allocator, reencoded, .{
+            .output_format = .rgba,
+            .limits = corpus_limits,
+        }) catch |err| {
+            std.debug.print("round-trip decode failed for {s}: {s}\n", .{ entry.name, @errorName(err) });
+            return err;
+        };
+        defer roundtrip.deinit();
+
+        if (!std.mem.eql(u8, source.buffer.pixels, roundtrip.buffer.pixels)) {
+            std.debug.print("round-trip pixel mismatch for {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+
+        encoded_count += 1;
+    }
+
+    // The committed corpus carries 43 still VP8L files (see PROGRESS.MD oracle
+    // rows). Require at least that many round-tripped so a corpus regression
+    // cannot silently shrink the coverage.
+    try std.testing.expect(encoded_count >= 43);
 }
 
 test "rejects corpus paths that escape the configured root" {
