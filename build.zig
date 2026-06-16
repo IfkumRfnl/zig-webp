@@ -18,153 +18,116 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(webp_library);
 
-    const decode_tool = b.addExecutable(.{
-        .name = "zig-webp-decode",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-decode.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
+    // Boilerplate shared by every `zig-webp-*` CLI tool, imported as `cli_common`.
+    const cli_common_module = b.createModule(.{
+        .root_source_file = b.path("tools/cli_common.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "webp", .module = webp_module },
+        },
     });
-    const run_decode_tool = b.addRunArtifact(decode_tool);
-    if (b.args) |args| {
-        run_decode_tool.addArgs(args);
-    }
-    const decode_step = b.step("decode", "Decode a static lossless WebP to PAM");
-    decode_step.dependOn(&run_decode_tool.step);
 
-    const alpha_tool = b.addExecutable(.{
-        .name = "zig-webp-alpha",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-alpha.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    b.installArtifact(alpha_tool);
-    const run_alpha_tool = b.addRunArtifact(alpha_tool);
-    if (b.args) |args| {
-        run_alpha_tool.addArgs(args);
-    }
-    const alpha_step = b.step("alpha", "Decode a WebP ALPH chunk to a raw alpha plane");
-    alpha_step.dependOn(&run_alpha_tool.step);
-
-    const yuv_tool = b.addExecutable(.{
-        .name = "zig-webp-yuv",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-yuv.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    b.installArtifact(yuv_tool);
-    const run_yuv_tool = b.addRunArtifact(yuv_tool);
-    if (b.args) |args| {
-        run_yuv_tool.addArgs(args);
-    }
-    const yuv_step = b.step("yuv", "Decode a lossy WebP to raw YUV planes");
-    yuv_step.dependOn(&run_yuv_tool.step);
-
-    const rgb_tool = b.addExecutable(.{
-        .name = "zig-webp-rgb",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-rgb.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    b.installArtifact(rgb_tool);
-    const run_rgb_tool = b.addRunArtifact(rgb_tool);
-    if (b.args) |args| {
-        run_rgb_tool.addArgs(args);
-    }
-    const rgb_step = b.step("rgb", "Decode a lossy WebP to RGBA (fancy upsampling) as PAM");
-    rgb_step.dependOn(&run_rgb_tool.step);
-
-    const anim_tool = b.addExecutable(.{
-        .name = "zig-webp-anim",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-anim.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    b.installArtifact(anim_tool);
-    const run_anim_tool = b.addRunArtifact(anim_tool);
-    if (b.args) |args| {
-        run_anim_tool.addArgs(args);
-    }
-    const anim_step = b.step("anim", "Decode an animated WebP to per-frame PAM files");
-    anim_step.dependOn(&run_anim_tool.step);
-
-    const corpus_hashes_tool = b.addExecutable(.{
-        .name = "zig-webp-corpus-hashes",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-corpus-hashes.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    const run_corpus_hashes_tool = b.addRunArtifact(corpus_hashes_tool);
-    run_corpus_hashes_tool.setCwd(b.path("."));
-    if (b.args) |args| {
-        run_corpus_hashes_tool.addArgs(args);
-    }
-    const corpus_hashes_step = b.step(
-        "corpus-hashes",
-        "Regenerate testdata/corpus-hashes.tsv from decoded corpus planes",
-    );
-    corpus_hashes_step.dependOn(&run_corpus_hashes_tool.step);
-
-    const anim_hashes_tool = b.addExecutable(.{
-        .name = "zig-webp-anim-hashes",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/zig-webp-anim-hashes.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "webp", .module = webp_module },
-            },
-        }),
-    });
-    const run_anim_hashes_tool = b.addRunArtifact(anim_hashes_tool);
-    run_anim_hashes_tool.setCwd(b.path("."));
-    if (b.args) |args| {
-        run_anim_hashes_tool.addArgs(args);
-    }
-    const anim_hashes_step = b.step(
-        "anim-hashes",
-        "Regenerate testdata/animation/hashes.tsv from composited frames",
-    );
-    anim_hashes_step.dependOn(&run_anim_hashes_tool.step);
+    // Each CLI tool is wired identically: a one-source executable that imports
+    // the `webp` library and the shared `cli_common` module, plus a named run
+    // step (forwarding `-- ARGS`). The `check` step depends on all of them so
+    // CI keeps compiling every tool. `install` requests whether `zig build`
+    // (no step) installs the binary, matching prior per-tool behavior.
+    const Tool = struct {
+        name: []const u8,
+        source: []const u8,
+        step: []const u8,
+        description: []const u8,
+        install: bool,
+        // Tools that read fixture directories run from the repo root.
+        cwd_repo_root: bool = false,
+    };
+    const tools = [_]Tool{
+        .{
+            .name = "zig-webp-decode",
+            .source = "tools/zig-webp-decode.zig",
+            .step = "decode",
+            .description = "Decode a static lossless WebP to PAM",
+            .install = false,
+        },
+        .{
+            .name = "zig-webp-alpha",
+            .source = "tools/zig-webp-alpha.zig",
+            .step = "alpha",
+            .description = "Decode a WebP ALPH chunk to a raw alpha plane",
+            .install = true,
+        },
+        .{
+            .name = "zig-webp-yuv",
+            .source = "tools/zig-webp-yuv.zig",
+            .step = "yuv",
+            .description = "Decode a lossy WebP to raw YUV planes",
+            .install = true,
+        },
+        .{
+            .name = "zig-webp-rgb",
+            .source = "tools/zig-webp-rgb.zig",
+            .step = "rgb",
+            .description = "Decode a lossy WebP to RGBA (fancy upsampling) as PAM",
+            .install = true,
+        },
+        .{
+            .name = "zig-webp-anim",
+            .source = "tools/zig-webp-anim.zig",
+            .step = "anim",
+            .description = "Decode an animated WebP to per-frame PAM files",
+            .install = true,
+        },
+        .{
+            .name = "zig-webp-corpus-hashes",
+            .source = "tools/zig-webp-corpus-hashes.zig",
+            .step = "corpus-hashes",
+            .description = "Regenerate testdata/corpus-hashes.tsv from decoded corpus planes",
+            .install = false,
+            .cwd_repo_root = true,
+        },
+        .{
+            .name = "zig-webp-anim-hashes",
+            .source = "tools/zig-webp-anim-hashes.zig",
+            .step = "anim-hashes",
+            .description = "Regenerate testdata/animation/hashes.tsv from composited frames",
+            .install = false,
+            .cwd_repo_root = true,
+        },
+    };
 
     const check_step = b.step("check", "Compile the library and tools");
     check_step.dependOn(&webp_library.step);
-    check_step.dependOn(&decode_tool.step);
-    check_step.dependOn(&alpha_tool.step);
-    check_step.dependOn(&yuv_tool.step);
-    check_step.dependOn(&rgb_tool.step);
-    check_step.dependOn(&anim_tool.step);
-    check_step.dependOn(&corpus_hashes_tool.step);
-    check_step.dependOn(&anim_hashes_tool.step);
+
+    for (tools) |tool| {
+        const exe = b.addExecutable(.{
+            .name = tool.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(tool.source),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "webp", .module = webp_module },
+                    .{ .name = "cli_common", .module = cli_common_module },
+                },
+            }),
+        });
+        if (tool.install) {
+            b.installArtifact(exe);
+        }
+
+        const run = b.addRunArtifact(exe);
+        if (tool.cwd_repo_root) {
+            run.setCwd(b.path("."));
+        }
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
+        const step = b.step(tool.step, tool.description);
+        step.dependOn(&run.step);
+
+        check_step.dependOn(&exe.step);
+    }
 
     const unit_tests = b.addTest(.{
         .root_module = webp_module,

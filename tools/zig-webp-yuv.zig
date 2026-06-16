@@ -1,51 +1,27 @@
 const std = @import("std");
 const webp = @import("webp");
+const cli = @import("cli_common");
 
 const not_lossy_exit_code = 3;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-
-    var nofilter = false;
-    var positional: [2][]const u8 = undefined;
-    var positional_count: usize = 0;
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--nofilter")) {
-            nofilter = true;
-        } else if (positional_count < 2) {
-            positional[positional_count] = arg;
-            positional_count += 1;
-        } else {
-            positional_count = 3;
-            break;
-        }
-    }
-    if (positional_count != 2) {
-        try std.Io.File.stderr().writeStreamingAll(
-            io,
-            "usage: zig-webp-yuv [--nofilter] INPUT.webp OUTPUT.raw\n" ++
-                "Writes decoded Y, U, V planes (cropped, tightly packed) like\n" ++
-                "`dwebp -yuv` without the appended alpha plane. Pass --nofilter\n" ++
-                "to skip the in-loop deblocking filter (matches `dwebp -nofilter`).\n" ++
-                "Exits 3 when the file is not a static lossy image.\n",
-        );
-        std.process.exit(2);
-    }
-
-    const input_path = positional[0];
-    const output_path = positional[1];
-
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        input_path,
-        gpa,
-        .limited64((webp.ResourceLimits{}).input_bytes_max),
+    const ctx = try cli.Cli.init(init);
+    const parsed_args = cli.parseNoFilterTwoPaths(
+        ctx,
+        "usage: zig-webp-yuv [--nofilter] INPUT.webp OUTPUT.raw\n" ++
+            "Writes decoded Y, U, V planes (cropped, tightly packed) like\n" ++
+            "`dwebp -yuv` without the appended alpha plane. Pass --nofilter\n" ++
+            "to skip the in-loop deblocking filter (matches `dwebp -nofilter`).\n" ++
+            "Exits 3 when the file is not a static lossy image.\n",
     );
-    defer gpa.free(bytes);
 
-    var parsed = try webp.parseWebP(gpa, bytes, .{
+    const input_path = parsed_args.input_path;
+    const output_path = parsed_args.output_path;
+
+    const bytes = try ctx.readInput(input_path);
+    defer ctx.gpa.free(bytes);
+
+    var parsed = try webp.parseWebP(ctx.gpa, bytes, .{
         .limits = .{
             .output_pixels_max = std.math.maxInt(u32),
             .animation_canvas_pixels_max = std.math.maxInt(u32),
@@ -56,16 +32,14 @@ pub fn main(init: std.process.Init) !void {
     const skip = parsed.features.is_animation or
         (parsed.features.format orelse .lossless) != .lossy;
     if (skip) {
-        try std.Io.File.stderr().writeStreamingAll(io, "not a static lossy image\n");
-        std.process.exit(not_lossy_exit_code);
+        ctx.exitWithMessage("not a static lossy image\n", not_lossy_exit_code);
     }
     const image_chunk = parsed.features.image_data orelse {
-        try std.Io.File.stderr().writeStreamingAll(io, "missing VP8 chunk\n");
-        std.process.exit(not_lossy_exit_code);
+        ctx.exitWithMessage("missing VP8 chunk\n", not_lossy_exit_code);
     };
 
-    var frame = try webp.vp8_decoder.decodeFrame(gpa, image_chunk.payload(bytes), .{
-        .apply_loop_filter = !nofilter,
+    var frame = try webp.vp8_decoder.decodeFrame(ctx.gpa, image_chunk.payload(bytes), .{
+        .apply_loop_filter = !parsed_args.nofilter,
     });
     defer frame.deinit();
 
@@ -73,8 +47,8 @@ pub fn main(init: std.process.Init) !void {
     const chroma_height = frame.chromaHeight();
     const total = @as(usize, frame.width) * frame.height +
         2 * @as(usize, chroma_width) * chroma_height;
-    const output = try gpa.alloc(u8, total);
-    defer gpa.free(output);
+    const output = try ctx.gpa.alloc(u8, total);
+    defer ctx.gpa.free(output);
 
     var offset: usize = 0;
     for (0..frame.height) |row| {
@@ -95,8 +69,5 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.assert(offset == total);
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = output_path,
-        .data = output,
-    });
+    try ctx.writeOutput(output_path, output);
 }

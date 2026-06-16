@@ -1,46 +1,31 @@
 const std = @import("std");
 const webp = @import("webp");
+const cli = @import("cli_common");
 
 const corpus = webp.testing.corpus;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len > 3) {
-        try std.Io.File.stderr().writeStreamingAll(
-            io,
+    const ctx = try cli.Cli.init(init);
+    if (ctx.args.len > 3) {
+        ctx.usageError(
             "usage: zig-webp-corpus-hashes [CORPUS_DIR] [OUTPUT.tsv]\n" ++
                 "Writes SHA-256 hashes of decoded corpus planes as TSV rows.\n",
         );
-        std.process.exit(2);
     }
 
-    const corpus_path = if (args.len > 1) args[1] else corpus.default_root_path;
-    const output_path = if (args.len > 2)
-        args[2]
+    const corpus_path = if (ctx.args.len > 1) ctx.args[1] else corpus.default_root_path;
+    const output_path = if (ctx.args.len > 2)
+        ctx.args[2]
     else
         corpus.hash_manifest_root_path ++ "/" ++ corpus.hash_manifest_file_name;
 
-    var corpus_dir = try std.Io.Dir.cwd().openDir(io, corpus_path, .{ .iterate = true });
-    defer corpus_dir.close(io);
+    var corpus_dir = try std.Io.Dir.cwd().openDir(ctx.io, corpus_path, .{ .iterate = true });
+    defer corpus_dir.close(ctx.io);
 
-    var file_names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (file_names.items) |name| gpa.free(name);
-        file_names.deinit(gpa);
-    }
+    var file_names = try cli.collectWebpFileNames(ctx.gpa, ctx.io, corpus_dir);
+    defer cli.freeFileNames(ctx.gpa, &file_names);
 
-    var iterator = corpus_dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".webp")) continue;
-
-        try file_names.append(gpa, try gpa.dupe(u8, entry.name));
-    }
-    std.mem.sort([]u8, file_names.items, {}, fileNameLessThan);
-
-    var manifest: std.Io.Writer.Allocating = .init(gpa);
+    var manifest: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer manifest.deinit();
     try manifest.writer.writeAll(
         "# SHA-256 hashes of zig-webp decoded planes, one tab-separated row\n" ++
@@ -51,14 +36,14 @@ pub fn main(init: std.process.Init) !void {
     var row_count: u32 = 0;
     for (file_names.items) |file_name| {
         const file_bytes = try corpus_dir.readFileAlloc(
-            io,
+            ctx.io,
             file_name,
-            gpa,
+            ctx.gpa,
             .limited64((webp.ResourceLimits{}).input_bytes_max),
         );
-        defer gpa.free(file_bytes);
+        defer ctx.gpa.free(file_bytes);
 
-        var parsed = try webp.parseWebP(gpa, file_bytes, .{
+        var parsed = try webp.parseWebP(ctx.gpa, file_bytes, .{
             .limits = corpus.plane_hash_demux_limits,
         });
         defer parsed.deinit();
@@ -67,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
 
         _ = parsed.features.format orelse continue;
         if (parsed.features.image_data != null) {
-            const digest = try corpus.hashStillRGBA(gpa, file_bytes);
+            const digest = try corpus.hashStillRGBA(ctx.gpa, file_bytes);
             try manifest.writer.print("{s}\trgba\t{s}\n", .{
                 file_name,
                 &std.fmt.bytesToHex(digest, .lower),
@@ -75,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
             row_count += 1;
         }
         if (parsed.features.alpha != null) {
-            const digest = try corpus.hashAlphaPlane(gpa, file_bytes);
+            const digest = try corpus.hashAlphaPlane(ctx.gpa, file_bytes);
             try manifest.writer.print("{s}\talpha\t{s}\n", .{
                 file_name,
                 &std.fmt.bytesToHex(digest, .lower),
@@ -84,10 +69,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = output_path,
-        .data = manifest.written(),
-    });
+    try ctx.writeOutput(output_path, manifest.written());
 
     var message_buffer: [256]u8 = undefined;
     const message = try std.fmt.bufPrint(
@@ -95,9 +77,5 @@ pub fn main(init: std.process.Init) !void {
         "wrote {d} rows to {s}\n",
         .{ row_count, output_path },
     );
-    try std.Io.File.stderr().writeStreamingAll(io, message);
-}
-
-fn fileNameLessThan(_: void, a: []u8, b: []u8) bool {
-    return std.mem.order(u8, a, b) == .lt;
+    try ctx.writeStderr(message);
 }
