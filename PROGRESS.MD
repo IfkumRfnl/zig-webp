@@ -19,7 +19,10 @@ the streaming `AnimationDecoder`, byte-exact against libwebp's `anim_dump` on a
 generated animation corpus. Step 7 (VP8L lossless encoder) is now in progress:
 its first slice — valid VP8L still output from ARGB literals — is delivered and
 round-trips bit-exactly (see "Step 7 — VP8L Lossless Encoder (slice 1)" and the
-2026-06-16 oracle row).
+2026-06-16 oracle row). Its second slice — LZ77 back-references plus the
+subtract-green, color, predictor, and palette/color-indexing transforms (each
+decision-gated) — is also delivered and round-trips bit-exactly (see "Step 7 —
+VP8L Lossless Encoder (slice 2)" and the second 2026-06-16 oracle row).
 
 ## Cross-Cutting Practices
 
@@ -52,6 +55,46 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 7 — VP8L Lossless Encoder (slice 2)
+
+The second encoder slice adds compression transforms on top of slice 1's
+literal output, each the exact inverse of the corresponding decode routine so
+every combination still round-trips bit-exactly through this library's decoder:
+
+- LZ77 back-reference matching (`src/vp8l/lz77.zig`): a hash-chain greedy
+  matcher over packed ARGB pixels emits literal/copy tokens. `prefixForValue`
+  inverts the decoder's `image_data.readPrefixValue` (length and distance
+  prefix symbols + extra bits), and `distanceCodeForPixels` inverts
+  `distanceFromCode` by emitting the direct `distance + 120` code form
+  (matches are capped at `(1 << 20) - 120` pixels so the code is always
+  representable). Copies extend the green channel's alphabet with length
+  symbols and use the distance prefix code, exactly as the decoder reads them.
+- Forward transforms (`src/vp8l/forward_transform.zig`): subtract-green, the
+  per-block color transform (signed 3.5 fixed-point green→red / green→blue /
+  red→blue multipliers), the per-block predictor transform (all 14 modes), and
+  the color-table delta coding for palettes. Each is the bit-exact inverse of
+  `inverse_transform.zig` (proven by per-mode round-trip unit tests).
+- The encoder (`src/vp8l/encoder.zig`) now plans a transform stack: a
+  palette / color-indexing transform for images with at most 256 distinct
+  colors (with the decoder's index bit-packing for 2/4/16/256-color tables and
+  a delta-coded color table), or, for higher-color images, a single global
+  predictor mode (chosen by minimizing a residual-magnitude proxy) followed by
+  the cheaper of a color transform or subtract-green (mutually exclusive so
+  red/blue are not adjusted twice). Each transform is applied only when its
+  estimated gain is positive. The main image is then LZ77-tokenized and
+  entropy-coded. Prefix-code descriptors now pick the cheapest of the simple
+  form (1–2 length-1 symbols) and the normal form with run-length packing
+  (code-length repeat codes 16/17/18), which slashed the per-file overhead on
+  small images (e.g. the 1x1 `lossless_vec_1_*` files dropped from 382 to 48
+  bytes).
+
+Validity and round-trip stay gated by `zig build test`: the slice-1 corpus
+round-trip test (decode every still VP8L corpus file to RGBA, re-encode, decode,
+assert bit-identical) still passes with the richer encoder, and new synthetic
+cases cover low-color palettes (including odd-width 1-bit-packed indices),
+LZ77-friendly repetition, and a chroma-correlated image whose transform plan is
+asserted to include the color transform.
 
 ### Step 7 — VP8L Lossless Encoder (slice 1)
 
@@ -289,6 +332,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-14 | Composited lossy RGBA (with ALPH alpha) vs `dwebp -pam` | Matched all 88 lossy still files in `libwebp-test-data` byte-for-byte (full RGBA PAM), now including all 18 lossy+alpha files via ALPH composition, plus 18 locally generated `cwebp` lossy+alpha files (RGBA gradients at odd dimensions 1x1 through 64x48, qualities 30-95, alpha quality 60-100, full-range alpha); 43 non-lossy corpus files skipped. Both the filtered and `-nofilter` oracle modes match. |
 | 2026-06-14 | Composited animation frames vs `anim_dump -pam` (libwebp 1.5.0) | Matched 14 locally generated animations byte-for-byte across all composited frames (`img2webp` lossless/lossy/mixed plus `webpmux`-assembled frames): every dispose×blend combination, full-canvas and sub-rect frames, binary and gradient alpha, background-dispose with overlapping and disjoint rectangles, and canvases from 2x1 to 100x80. The 8 most representative (29 frames) are committed under `testdata/animation` with SHA-256 frame hashes in `testdata/animation/hashes.tsv`. |
 | 2026-06-16 | VP8L literal encoder round-trip (own decoder + `dwebp`) | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode (ARGB literals only) and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test). Locally, `dwebp -pam` also decodes the encoder's output bit-exactly to the source on `lossless_vec_2_0.webp` (128x128); `dwebp` is not on CI, so CI relies on the own-decoder round-trip. Encoded size is ~1.28x the original corpus bytes (literals only; size is not gated this slice). |
+| 2026-06-16 | VP8L transform encoder (slice 2) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with LZ77 + the decision-gated subtract-green/color/predictor/palette transforms and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) also decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0986x (37/43 files at or below 1.10x; range 0.92x–1.63x), aggregate-bytes ratio 1.044x. Size is reported, not yet hard-gated; the worst cases are small/synthetic vector images where cwebp's entropy-image and color-cache machinery (slice 3) wins. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
