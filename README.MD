@@ -21,6 +21,13 @@ library also exposes bounded option and limit types, image buffers, metadata,
 animation-frame and feature probing, RIFF/WebP demux, static mux, and the
 VP8/VP8L bitstream infrastructure.
 
+Lossless encode has begun: `encodeLossless` turns a typed pixel buffer
+(RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L` WebP file.
+This first slice emits ARGB literals only (no LZ77, transforms, or color cache
+yet — see PLAN.MD step 7), so output is not size-optimized but round-trips
+bit-exactly through this library's decoder for every still VP8L corpus image,
+and `dwebp` decodes it back to the same pixels.
+
 ## Goals
 
 - Decode and encode WebP lossy, lossless, alpha, metadata, and animation data.
