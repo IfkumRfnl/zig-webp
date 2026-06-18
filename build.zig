@@ -94,6 +94,14 @@ pub fn build(b: *std.Build) void {
             .install = false,
             .cwd_repo_root = true,
         },
+        .{
+            .name = "zig-webp-encode-report",
+            .source = "tools/zig-webp-encode-report.zig",
+            .step = "encode-report",
+            .description = "Report lossless encoder size + round-trip over the encode corpus",
+            .install = false,
+            .cwd_repo_root = true,
+        },
     };
 
     const check_step = b.step("check", "Compile the library and tools");

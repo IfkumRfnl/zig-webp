@@ -1,0 +1,37 @@
+# zig-webp lossless encode report: encoded size and round-trip per source.
+# Regenerate with `zig build encode-report -- testdata/encode-corpus-sizes.tsv`.
+family	name	width	height	format	raw_bytes	encoded_bytes	bpp	psnr_db	roundtrip
+synthetic	flat_1x1_rgb	1	1	rgb	3	38	304.0000	inf	ok
+synthetic	gradient_1x1_rgba	1	1	rgba	4	30	240.0000	inf	ok
+synthetic	gradient_1x17_rgb	1	17	rgb	51	74	34.8235	inf	ok
+synthetic	bars_17x1_rgb	17	1	rgb	51	88	41.4118	inf	ok
+synthetic	checker_7x7_rgb	7	7	rgb	147	50	8.1633	inf	ok
+synthetic	alpha_transparent_5x5_rgba	5	5	rgba	100	84	26.8800	inf	ok
+synthetic	gradient_16x16_rgb	16	16	rgb	768	474	14.8125	inf	ok
+synthetic	checker_16x16_rgb	16	16	rgb	768	50	1.5625	inf	ok
+synthetic	gradient_17x17_rgb	17	17	rgb	867	68	1.8824	inf	ok
+synthetic	checker_17x17_rgba	17	17	rgba	1156	52	1.4394	inf	ok
+synthetic	bars_15x15_rgb	15	15	rgb	675	84	2.9867	inf	ok
+synthetic	gradient_16x17_rgb	16	17	rgb	816	66	1.9412	inf	ok
+synthetic	noise_17x16_rgb	17	16	rgb	816	994	29.2353	inf	ok
+synthetic	grayscale_ramp_16x16_rgb	16	16	rgb	768	66	2.0625	inf	ok
+synthetic	noise_23x31_rgb	23	31	rgb	2139	2344	26.3001	inf	ok
+synthetic	radial_32x32_rgb	32	32	rgb	3072	650	5.0781	inf	ok
+synthetic	two_tone_31x17_rgb	31	17	rgb	1581	50	0.7590	inf	ok
+synthetic	alpha_gradient_32x32_rgba	32	32	rgba	4096	92	0.7188	inf	ok
+synthetic	alpha_checker_33x33_rgba	33	33	rgba	4356	54	0.3967	inf	ok
+synthetic	gradient_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok
+synthetic	bars_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok
+synthetic	flat_40x40_rgba	40	40	rgba	6400	50	0.2500	inf	ok
+synthetic	gradient_100x1_rgb	100	1	rgb	300	212	16.9600	inf	ok
+synthetic	bars_1x100_rgb	1	100	rgb	300	50	4.0000	inf	ok
+synthetic	noise_129x97_rgb	129	97	rgb	37539	37650	24.0710	inf	ok
+synthetic	radial_128x128_rgb	128	128	rgb	49152	4316	2.1074	inf	ok
+synthetic	gradient_256x256_rgb	256	256	rgb	196608	112	0.0137	inf	ok
+synthetic	alpha_transparent_64x64_rgba	64	64	rgba	16384	74	0.1445	inf	ok
+synthetic	checker_128x128_rgba	128	128	rgba	65536	56	0.0273	inf	ok
+synthetic	grayscale_ramp_200x60_rgb	200	60	rgb	36000	412	0.2747	inf	ok
+photo	photo_foliage.webp	512	342	rgba	700416	145622	6.6531	inf	ok
+photo	photo_portrait.webp	342	512	rgba	700416	156262	7.1392	inf	ok
+photo	photo_signage.webp	512	342	rgba	700416	183568	8.3867	inf	ok
+photo	photo_sky.webp	512	384	rgba	786432	174432	7.0977	inf	ok

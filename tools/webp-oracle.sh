@@ -22,6 +22,7 @@ Usage:
   tools/webp-oracle.sh compare-anim-corpus OUT_DIR [CORPUS_DIR]
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
+  tools/webp-oracle.sh compare-encode-corpus REPORT.tsv
 
 Runs optional local libwebp tools when they are installed. Missing tools are
 reported as skips so this script can live outside the package dependency graph.
@@ -40,6 +41,56 @@ check() {
             printf '%s\t%s\n' "$tool" "SKIP: not installed"
         fi
     done
+}
+
+# Compare this library's lossless encoder against `cwebp -lossless` on the
+# real-image encode corpus. Reads an encode-report TSV (our sizes; produced by
+# `zig build encode-report -- --with-corpus REPORT.tsv`) and, for every photo
+# and in-tree-corpus row, re-encodes the same source with cwebp and pairs the
+# sizes. Both encoders are lossless so the decoded pixels are bit-identical;
+# size is the only metric here (PSNR is reserved for the step-8 lossy oracle).
+compare_encode_corpus() {
+    report=$1
+    if [ ! -f "$report" ]; then
+        printf 'error: report TSV not found: %s\n' "$report" >&2
+        printf 'generate it with: zig build encode-report -- --with-corpus %s\n' "$report" >&2
+        exit 2
+    fi
+    if ! has_tool cwebp; then
+        printf 'cwebp\tSKIP: not installed\n' >&2
+        exit 0
+    fi
+
+    tmp=$(mktemp -d)
+    data="$tmp/data.tsv"
+    : >"$data"
+
+    grep -vE '^#|^family' "$report" | while IFS="$(printf '\t')" read -r family name _w _h _fmt _raw our _bpp _psnr _rt; do
+        case "$family" in
+            photo) dir=testdata/photos ;;
+            corpus) dir=testdata/libwebp-test-data ;;
+            *) continue ;;
+        esac
+        src="$dir/$name"
+        [ -f "$src" ] || continue
+        if cwebp -quiet -lossless "$src" -o "$tmp/cwebp.webp" 2>/dev/null; then
+            cwebp_bytes=$(wc -c <"$tmp/cwebp.webp" | tr -d ' ')
+            printf '%s\t%s\t%s\t%s\n' "$family" "$name" "$our" "$cwebp_bytes" >>"$data"
+        fi
+    done
+
+    printf 'family\tname\tour_bytes\tcwebp_bytes\tratio\n'
+    awk -F'\t' '
+        { printf "%s\t%s\t%s\t%s\t%.4f\n", $1, $2, $3, $4, $3 / $4; r[NR] = $3 / $4; our_total += $3; cwebp_total += $4 }
+        END {
+            n = NR
+            if (n == 0) { print "# no paired files (sources missing or cwebp failed)"; exit }
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
+            median = (n % 2) ? r[(n + 1) / 2] : (r[n / 2] + r[n / 2 + 1]) / 2
+            printf "# files=%d  median_ratio=%.4f  aggregate_ratio=%.4f  (our/cwebp, <1 = smaller than cwebp)\n", n, median, our_total / cwebp_total
+        }' "$data"
+
+    rm -rf "$tmp"
 }
 
 decode_one() {
@@ -630,6 +681,14 @@ case "$mode" in
             exit 0
         fi
         decode_one "$out_dir" "$encoded"
+        ;;
+
+    compare-encode-corpus)
+        if [ "$#" -ne 2 ]; then
+            usage >&2
+            exit 2
+        fi
+        compare_encode_corpus "$2"
         ;;
 
     -h|--help|help)

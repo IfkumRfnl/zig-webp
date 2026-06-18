@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-16
+Last updated: 2026-06-18
 
 ## Current Position
 
@@ -29,6 +29,15 @@ delivered, still round-trips bit-exactly, and lowers the median size-vs-`cwebp`
 ratio to 1.04x (see "Step 7 — VP8L Lossless Encoder (slice 3)" and the third
 2026-06-16 oracle row).
 
+Ahead of the VP8 lossy encoder (step 8), an encode **test corpus** now backs the
+encoder side, since step 8's gates are measured on source images: a generated
+synthetic source matrix (macroblock-edge dimensions × content × alpha), four
+committed CC0 photographs under `testdata/photos/`, and the in-tree lossless
+WebP files. Every synthetic source and photo round-trips bit-exactly through
+`encodeStaticLossless` and back under `zig build test`, and a committed oracle
+mode measures lossless size against `cwebp -lossless` (median 1.04x; see
+"Encode Test Corpus (pre-step-8 harness)" and the 2026-06-18 oracle row).
+
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
@@ -43,6 +52,19 @@ SHA-256 hashes in `testdata/corpus-hashes.tsv`, so CI needs no `dwebp`. The hash
 manifest `testdata/animation/hashes.tsv` locks the composited frames of the 8
 committed animations (29 frames total) against `anim_dump`; regenerate with
 `zig build anim-hashes` after a fresh `compare-anim` run.
+
+The encoder has a parallel corpus harness. `src/testing/encode_corpus.zig`
+round-trips a defined set of *source* images through the lossless encoder and
+back through the decoder, asserting bit-exact recovery under `zig build test`:
+the synthetic matrix from `src/testing/synth.zig` (edge dimensions, content,
+and alpha cases, generated at test time) and the committed CC0 photographs in
+`testdata/photos/` (decoded to pristine pixels). No hashes are needed — for
+lossless the source pixels are the oracle. `src/testing/metrics.zig` adds
+MSE/PSNR (overall and BT.601 luma) for the lossy PSNR gate to come. The
+`zig build encode-report` tool prints encoded size, bits-per-pixel, and the
+round-trip verdict per source (committed baseline
+`testdata/encode-corpus-sizes.tsv`), and `tools/webp-oracle.sh
+compare-encode-corpus REPORT.tsv` pairs those sizes against `cwebp -lossless`.
 
 Fuzz smoke targets are in place for every public decode entry point: strict
 demux (`src/demux.zig`), VP8L still-image decode (`src/vp8l/decoder.zig`),
@@ -60,6 +82,44 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Encode Test Corpus (pre-step-8 harness)
+
+Before the VP8 lossy encoder (step 8), the encode side gained a defined source
+corpus and measurement harness, because step 8's gates are measured on source
+images rather than on decoded WebP files:
+
+- `src/testing/synth.zig` generates a deterministic matrix of 30 synthetic
+  sources crossing VP8 macroblock geometry (1x1; 15/16/17 luma-block edges;
+  asymmetric partials; primes; 1xN/Nx1 strips; larger canvases), content (flat,
+  gradient, high-frequency checker, saturated bars, noise, radial,
+  neutral-chroma ramp, two-tone), and alpha (opaque, ramp, binary, and
+  fully-transparent pixels carrying non-zero RGB — the case step 8a must handle
+  exactly). Nothing is committed; the images are rebuilt at test time.
+- `testdata/photos/` holds four committed CC0 photographs (a face, a foliage
+  macro, signage with text, and a sunset gradient) downscaled to a 512 px
+  longest side and stored as `cwebp -lossless` WebP, so they decode to pristine
+  pixels. Licenses and provenance are in `testdata/photos/PROVENANCE.md`.
+- `src/testing/encode_corpus.zig` round-trips every synthetic source and every
+  committed photo through `encodeStaticLossless` and back through the decoder,
+  asserting bit-exact recovery under `zig build test` (the in-tree lossless
+  corpus is already round-tripped by `corpus.zig`). All 30 synthetic sources and
+  4 photos round-trip with zero mismatches.
+- `src/testing/metrics.zig` provides MSE and PSNR (overall plus BT.601 luma,
+  using libwebp's `VP8RGBToY` weights so step-8 figures line up with `cwebp`).
+- Tooling: `zig build encode-report [-- --with-corpus] [OUT.tsv]` reports
+  encoded size, bits-per-pixel, and round-trip per source (committed baseline
+  `testdata/encode-corpus-sizes.tsv`); `tools/webp-oracle.sh
+  compare-encode-corpus REPORT.tsv` pairs our sizes against `cwebp -lossless`.
+
+This concretely realizes step 7's "encode corpus", which previously named the
+unversioned "libwebp gallery images": a committed CC0 photo set plus the
+synthetic matrix and the in-tree lossless files. Re-measured against
+`cwebp -lossless` (libwebp 1.5.0) over the 43 in-tree lossless files plus the 4
+photos, the per-file median size ratio is 1.0368x (aggregate 1.046x), so the
+step-7 1.10x median gate still holds; the photographic files (1.05x–1.18x on the
+photos, up to 1.59x on `lossless2`/`lossless3`) remain the known gap that
+per-block predictor selection will close.
 
 ### Step 7 — VP8L Lossless Encoder (slice 3)
 
@@ -375,6 +435,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-16 | VP8L literal encoder round-trip (own decoder + `dwebp`) | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode (ARGB literals only) and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test). Locally, `dwebp -pam` also decodes the encoder's output bit-exactly to the source on `lossless_vec_2_0.webp` (128x128); `dwebp` is not on CI, so CI relies on the own-decoder round-trip. Encoded size is ~1.28x the original corpus bytes (literals only; size is not gated this slice). |
 | 2026-06-16 | VP8L transform encoder (slice 2) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with LZ77 + the decision-gated subtract-green/color/predictor/palette transforms and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) also decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0986x (37/43 files at or below 1.10x; range 0.92x–1.63x), aggregate-bytes ratio 1.044x. Size is reported, not yet hard-gated; the worst cases are small/synthetic vector images where cwebp's entropy-image and color-cache machinery (slice 3) wins. |
 | 2026-06-16 | VP8L entropy encoder (slice 3) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with the slice-2 transforms plus the optional color cache and optional entropy-image/multiple-Huffman-groups, each chosen by measuring the real encoded size, and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus round-trip test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0368x (37/43 files at or below 1.10x; range 0.92x–1.59x), and no file is larger than the slice-2 encoding (the measure-by-encoding selection only keeps genuine wins). The remaining files above 1.10x are the photographic `lossless1`–`lossless4` / `lossless_color_transform` / `near_lossless_75`, which need per-block predictor selection (a later refinement) to close the gap. The 1.10x median size gate for step 7 holds against `cwebp` on this corpus; the PNG comparison is not yet recorded. |
+| 2026-06-18 | Encode test corpus round-trip + lossless size vs `cwebp -lossless` | New pre-step-8 harness. Round-trip (CI gate, runs under `zig build test`): all 30 synthetic sources (macroblock-edge dimensions × content × alpha) and the 4 committed CC0 photos (512px) re-encode through `encodeStaticLossless` and decode back bit-exactly, 0 mismatches; the 43 in-tree lossless files stay covered by the existing corpus round-trip test. Size (reported, via `tools/webp-oracle.sh compare-encode-corpus`) over 47 real-image files (43 in-tree lossless + 4 photos), `cwebp -lossless` (libwebp 1.5.0), identical decoded source pixels: per-file median ratio 1.0368x, aggregate 1.046x (range 0.92x–1.59x; the 4 photos 1.05x–1.18x). Confirms the step-7 1.10x median gate on the now-defined encode corpus. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
