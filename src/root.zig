@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");
+const encode_corpus_tests = @import("testing/encode_corpus.zig");
+const metrics_tests = @import("testing/metrics.zig");
+const synth_tests = @import("testing/synth.zig");
 const encode = @import("encode.zig");
 
 pub const alpha = @import("alpha.zig");
@@ -279,6 +282,9 @@ test "root exposes WebP container helpers" {
 
 test "root public declarations compile" {
     _ = corpus_tests;
+    _ = encode_corpus_tests;
+    _ = metrics_tests;
+    _ = synth_tests;
     std.testing.refAllDecls(@This());
 }
 
