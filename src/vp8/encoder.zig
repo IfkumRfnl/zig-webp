@@ -1,11 +1,13 @@
-//! VP8 lossy encoder — step 8a valid-bitstream baseline.
+//! VP8 lossy encoder — step 8b-1 intra mode decision.
 //!
-//! Produces a valid `VP8 ` key-frame bitstream from source YUV 4:2:0 planes
-//! with a deliberately fixed mode decision: every macroblock uses 16x16 DC luma
-//! prediction and 8x8 DC chroma prediction, segmentation and the loop filter
-//! are off, coefficient probabilities stay at the RFC defaults, and there is a
-//! single token partition. Real mode decision, rate-distortion, and the loop
-//! filter are step 8b; alpha and presets are step 8c.
+//! Produces a valid `VP8 ` key-frame bitstream from source YUV 4:2:0 planes.
+//! Each macroblock now picks its 16x16 luma mode (DC/V/H/TM) and its shared 8x8
+//! chroma mode (DC/V/H/TM) by a rate-distortion score — reconstruction SSE plus
+//! a quantizer-scaled penalty on coded coefficients — instead of the step 8a
+//! all-DC default. B_PRED (per-subblock 4x4 luma intra) stays out until step
+//! 8b-2; segmentation, skip decisions, and the loop filter are off; coefficient
+//! probabilities stay at the RFC defaults; and there is a single token
+//! partition.
 //!
 //! Correctness rests on one invariant (see PLAN.MD step 8a): the encoder
 //! reconstructs each macroblock by feeding its own quantized levels back through
@@ -13,8 +15,10 @@
 //! `transform.inverseWalshHadamard`, `transform.addInverseDct`) over neighbors
 //! it has already reconstructed, then emits exactly those levels. A conforming
 //! decoder therefore reproduces the stored reconstruction bit-for-bit, because
-//! both sides run identical math on identical inputs. The forward transform and
-//! quantizer only affect quality, never this self-consistency.
+//! both sides run identical math on identical inputs. The forward transform,
+//! quantizer, and mode decision only affect quality, never this
+//! self-consistency — which is why the encoder gathers prediction neighbors the
+//! way the decoder does, including the synthetic above-left corner.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -37,6 +41,8 @@ pub const Error = errors.Error;
 const luma_block = color.luma_block; // 16
 const chroma_block = color.chroma_block; // 8
 const coeff_count = transform.coefficient_count; // 16
+const luma_pixels = luma_block * luma_block; // 256
+const chroma_pixels = chroma_block * chroma_block; // 64
 
 /// Largest width or height a VP8 frame can encode (14-bit dimension field).
 pub const dimension_max = frame_header.dimension_limit;
@@ -58,6 +64,12 @@ pub const Result = struct {
 
 /// Maximum bytes this encoder can have live at once while producing a frame for
 /// `dimensions`, excluding the caller-owned source planes.
+///
+/// Real mode decision (step 8b) decides each macroblock's modes during the
+/// reconstruction pass and writes partition 0 afterward, so the per-macroblock
+/// mode records, the reconstruction planes, the token scratch, the above-edge
+/// flags, partition 0, and the final bitstream are all reachable at once (each
+/// is held by a `defer` until the function returns). The peak is their sum.
 pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
     const grid = modes.MacroblockGrid.init(dimensions);
     const mb_count = grid.macroblockCount();
@@ -72,16 +84,13 @@ pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
     );
     const above_flags_bytes = try elementByteCount(tokens.NonzeroFlags, grid.columns);
 
-    const partition0_peak = try addByteCounts(macroblock_bytes, partition0_bytes);
-
-    var encode_peak = partition0_bytes;
-    encode_peak = try addByteCounts(encode_peak, reconstruction_bytes);
-    encode_peak = try addByteCounts(encode_peak, token_bytes);
-    encode_peak = try addByteCounts(encode_peak, above_flags_bytes);
-    encode_peak = try addByteCounts(encode_peak, bitstream_bytes);
-
-    if (encode_peak > partition0_peak) return encode_peak;
-    return partition0_peak;
+    var peak = macroblock_bytes;
+    peak = try addByteCounts(peak, reconstruction_bytes);
+    peak = try addByteCounts(peak, token_bytes);
+    peak = try addByteCounts(peak, above_flags_bytes);
+    peak = try addByteCounts(peak, partition0_bytes);
+    peak = try addByteCounts(peak, bitstream_bytes);
+    return peak;
 }
 
 /// Encodes macroblock-padded source YUV planes into a raw VP8 key-frame
@@ -102,12 +111,10 @@ pub fn encodeAlloc(
     // Segmentation is disabled, so every segment shares the frame-level factors.
     const factors = quant.segmentFactors(&header)[0];
 
-    // --- Partition 0: compressed header followed by the per-macroblock modes.
-    const partition0 = try encodePartition0(gpa, &header, mb_count, base_quant_index);
-    defer gpa.free(partition0.buffer);
-    if (partition0.bytes.len > frame_header.first_partition_size_max) {
-        return error.FileTooLarge;
-    }
+    // --- Per-macroblock mode records, filled by the reconstruction pass below
+    //     and written into partition 0 once every mode is decided.
+    const macroblocks = try gpa.alloc(modes.Macroblock, mb_count);
+    defer gpa.free(macroblocks);
 
     // --- Reconstruction planes (the encoder's running prediction context and
     //     the artifact the self-consistency gate checks).
@@ -116,7 +123,8 @@ pub fn encodeAlloc(
     assert(source.luma_stride == reconstruction.luma_stride);
     assert(source.chroma_stride == reconstruction.chroma_stride);
 
-    // --- Token partition: reconstruct and emit residual tokens per macroblock.
+    // --- Token partition: choose modes, reconstruct, and emit residual tokens
+    //     per macroblock in raster order.
     const token_buffer = try gpa.alloc(u8, tokenCapacity(mb_count));
     defer gpa.free(token_buffer);
     var token_writer = bool_writer.BoolWriter.init(token_buffer);
@@ -128,7 +136,7 @@ pub fn encodeAlloc(
     const token_options = tokens.MacroblockOptions{
         .probabilities = &header.coefficient_probabilities,
         .factors = &factors, // unused by writeMacroblock; levels are already quantized
-        .has_y2 = true, // 16x16 luma routes its DC through the Y2 block
+        .has_y2 = true, // every 16x16 luma mode routes its DC through the Y2 block
         .skip = false,
     };
 
@@ -138,7 +146,8 @@ pub fn encodeAlloc(
         var column: u32 = 0;
         while (column < grid.columns) : (column += 1) {
             var levels = tokens.MacroblockLevels{};
-            encodeMacroblock(source, &reconstruction, &factors, column, row, &levels);
+            const macroblock = &macroblocks[row * grid.columns + column];
+            encodeMacroblock(source, &reconstruction, &factors, column, row, &levels, macroblock);
             _ = try tokens.writeMacroblock(
                 &token_writer,
                 token_options,
@@ -149,6 +158,14 @@ pub fn encodeAlloc(
         }
     }
     const token_bytes = try token_writer.finish();
+
+    // --- Partition 0: compressed header followed by the per-macroblock modes
+    //     decided above.
+    const partition0 = try encodePartition0(gpa, &header, macroblocks, base_quant_index);
+    defer gpa.free(partition0.buffer);
+    if (partition0.bytes.len > frame_header.first_partition_size_max) {
+        return error.FileTooLarge;
+    }
 
     // --- Assemble: uncompressed 10-byte header, partition 0, token partition.
     const total = frame_header.header_byte_count + partition0.bytes.len + token_bytes.len;
@@ -180,20 +197,10 @@ const Partition0 = struct {
 fn encodePartition0(
     gpa: std.mem.Allocator,
     header: *const frame_header.Header,
-    mb_count: u32,
+    macroblocks: []const modes.Macroblock,
     base_quant_index: u8,
 ) Error!Partition0 {
-    const macroblocks = try gpa.alloc(modes.Macroblock, mb_count);
-    defer gpa.free(macroblocks);
-    for (macroblocks) |*macroblock| macroblock.* = .{
-        .segment_id = 0,
-        .skip = false,
-        .luma_mode = .dc,
-        .chroma_mode = .dc,
-        .subblock_modes = @splat(.dc),
-    };
-
-    const buffer = try gpa.alloc(u8, partition0Capacity(mb_count));
+    const buffer = try gpa.alloc(u8, partition0Capacity(@intCast(macroblocks.len)));
     errdefer gpa.free(buffer);
     var writer = bool_writer.BoolWriter.init(buffer);
     try frame_header.writeCompressedHeader(&writer, .{ .y_ac_quant_index = base_quant_index });
@@ -235,8 +242,39 @@ fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_head
     };
 }
 
-/// Predicts, transforms, quantizes, reconstructs (into `recon`), and records the
-/// quantized levels for one macroblock at grid position (`mb_column`, `mb_row`).
+// The intra modes the mode decision ranks. B_PRED (per-subblock 4x4 luma) is
+// excluded until step 8b-2; the four 16x16/8x8 modes share the same RFC
+// enumeration values for luma and chroma.
+const luma_mode_candidates = [_]modes.LumaMode{ .dc, .vertical, .horizontal, .true_motion };
+const chroma_mode_candidates = [_]modes.ChromaMode{ .dc, .vertical, .horizontal, .true_motion };
+
+// Lagrange weight tying the coded-coefficient penalty to the quantizer: a
+// coarser step (larger AC factor) makes each saved coefficient worth more
+// distortion, so the decision drops marginal coefficients at low quality and
+// keeps them at high quality. The multiplier was chosen by measuring size and
+// luma PSNR over the encode corpus (see the step 8b-1 PROGRESS row).
+const rd_rate_weight = 1;
+
+fn lambdaFor(ac_factor: u16) u32 {
+    return @as(u32, ac_factor) * rd_rate_weight;
+}
+
+/// Rate-distortion terms for one candidate reconstruction. `distortion` is the
+/// sum of squared reconstruction errors over the block; `rate` is the count of
+/// nonzero quantized coefficients, a cheap monotone proxy for coded token bits
+/// (precise token costing is a later refinement).
+const Rd = struct {
+    distortion: u64,
+    rate: u32,
+
+    fn cost(self: Rd, lambda: u32) u64 {
+        return self.distortion + @as(u64, lambda) * self.rate;
+    }
+};
+
+/// Chooses each plane's intra mode, reconstructs the macroblock (into `recon`),
+/// records the quantized levels, and writes the decided modes into `macroblock`.
+/// Luma is committed before chroma, but the planes are independent.
 fn encodeMacroblock(
     source: *const color.YuvPlanes,
     recon: *color.YuvPlanes,
@@ -244,67 +282,146 @@ fn encodeMacroblock(
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
+    macroblock: *modes.Macroblock,
 ) void {
-    encodeLuma(source, recon, factors, mb_column, mb_row, levels);
-    encodeChromaPlane(
-        source.chroma_u,
-        recon.chroma_u,
-        recon.chroma_stride,
-        factors.uv_dc,
-        factors.uv_ac,
-        mb_column,
-        mb_row,
-        &levels.chroma_u,
-    );
-    encodeChromaPlane(
-        source.chroma_v,
-        recon.chroma_v,
-        recon.chroma_stride,
-        factors.uv_dc,
-        factors.uv_ac,
-        mb_column,
-        mb_row,
-        &levels.chroma_v,
-    );
+    const luma_mode = selectLuma(source, recon, factors, mb_column, mb_row, levels);
+    const chroma_mode = selectChroma(source, recon, factors, mb_column, mb_row, levels);
+    macroblock.* = .{
+        .segment_id = 0,
+        .skip = false,
+        .luma_mode = luma_mode,
+        .chroma_mode = chroma_mode,
+        // Non-B_PRED macroblocks contribute a single derived context mode to
+        // their neighbors; `encodeKeyFrameModes` reads this for the B_PRED
+        // probability contexts of later macroblocks.
+        .subblock_modes = @splat(modes.derivedSubblockMode(luma_mode)),
+    };
 }
 
-fn encodeLuma(
+/// Gathers the above row, left column, and above-left corner for full-block
+/// prediction, mirroring the decoder's bordered scratch (`decoder.Scratch`):
+/// the synthetic 127 above the frame, 129 left of it, and — crucially — a
+/// corner of 127 on the top macroblock row but 129 down the left edge below it.
+/// Only TrueMotion reads the corner, which is why step 8a (DC-only) never
+/// needed this distinction.
+fn gatherFullBlockNeighbors(
+    comptime size: u32,
+    plane: []const u8,
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    has_above: bool,
+    has_left: bool,
+    above: *[size]u8,
+    left: *[size]u8,
+    above_left: *u8,
+) void {
+    above.* = @splat(prediction.border_above);
+    left.* = @splat(prediction.border_left);
+    if (has_above) above.* = plane[(mb_y - 1) * stride + mb_x ..][0..size].*;
+    if (has_left) {
+        for (0..size) |r| left[r] = plane[(mb_y + r) * stride + mb_x - 1];
+    }
+    above_left.* = if (has_above and has_left)
+        plane[(mb_y - 1) * stride + mb_x - 1]
+    else if (!has_above)
+        prediction.border_above
+    else
+        prediction.border_left;
+}
+
+fn lumaToChromaMode(mode: modes.LumaMode) modes.ChromaMode {
+    assert(mode != .subblocks);
+    return @enumFromInt(@intFromEnum(mode));
+}
+
+fn selectLuma(
     source: *const color.YuvPlanes,
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
-) void {
+) modes.LumaMode {
     const stride = recon.luma_stride;
     const mb_x: usize = @as(usize, mb_column) * luma_block;
     const mb_y: usize = @as(usize, mb_row) * luma_block;
-    const origin = mb_y * stride + mb_x;
     const has_above = mb_row > 0;
     const has_left = mb_column > 0;
+    const edges = prediction.EdgePresence{ .has_above = has_above, .has_left = has_left };
 
-    // 1. DC-predict the whole 16x16 block from already-reconstructed neighbors.
-    //    DC ignores absent edges via EdgePresence, so the dummy fill is unread.
-    var above: [luma_block]u8 = @splat(127);
-    var left: [luma_block]u8 = @splat(129);
-    var above_left: u8 = 127;
-    if (has_above) above = recon.luma[(mb_y - 1) * stride + mb_x ..][0..luma_block].*;
-    if (has_left) {
-        for (0..luma_block) |r| left[r] = recon.luma[(mb_y + r) * stride + mb_x - 1];
+    var above: [luma_block]u8 = undefined;
+    var left: [luma_block]u8 = undefined;
+    var above_left: u8 = undefined;
+    gatherFullBlockNeighbors(luma_block, recon.luma, stride, mb_x, mb_y, has_above, has_left, &above, &left, &above_left);
+
+    // Tight copy of the source macroblock for residual and SSE; the planes are
+    // macroblock-padded, so a full 16x16 always exists.
+    var src: [luma_pixels]u8 = undefined;
+    for (0..luma_block) |r| {
+        src[r * luma_block ..][0..luma_block].* = source.luma[(mb_y + r) * stride + mb_x ..][0..luma_block].*;
     }
-    if (has_above and has_left) above_left = recon.luma[(mb_y - 1) * stride + mb_x - 1];
-    prediction.predictFullBlock(
-        luma_block,
-        .dc,
-        &above,
-        &left,
-        above_left,
-        .{ .has_above = has_above, .has_left = has_left },
-        recon.luma[origin..],
-        @intCast(stride),
-    );
 
-    // 2. Forward-DCT each subblock residual; collect the 16 DC coefficients.
+    const lambda = lambdaFor(factors.y1_ac);
+    var best_cost: u64 = std.math.maxInt(u64);
+    var best_mode: modes.LumaMode = .dc;
+    var best_block: [luma_pixels]u8 = undefined;
+    var best_luma: [luma_block][coeff_count]i16 = undefined;
+    var best_y2: [coeff_count]i16 = undefined;
+
+    for (luma_mode_candidates) |mode| {
+        var block: [luma_pixels]u8 = undefined;
+        var luma_levels: [luma_block][coeff_count]i16 = undefined;
+        var y2_levels: [coeff_count]i16 = undefined;
+        const rd = reconstructLuma16(
+            lumaToChromaMode(mode),
+            &src,
+            &above,
+            &left,
+            above_left,
+            edges,
+            factors,
+            &block,
+            &luma_levels,
+            &y2_levels,
+        );
+        const cost = rd.cost(lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_mode = mode;
+            best_block = block;
+            best_luma = luma_levels;
+            best_y2 = y2_levels;
+        }
+    }
+
+    for (0..luma_block) |r| {
+        recon.luma[(mb_y + r) * stride + mb_x ..][0..luma_block].* = best_block[r * luma_block ..][0..luma_block].*;
+    }
+    levels.luma = best_luma;
+    levels.y2 = best_y2;
+    return best_mode;
+}
+
+/// Reconstructs one 16x16 luma macroblock for the given mode into the tight
+/// `out_block` (stride `luma_block`) and returns its rate-distortion terms.
+/// Mirrors the decoder: predict, forward-DCT each subblock, route the DCs
+/// through the Y2 WHT, then dequantize and inverse-transform exactly the levels
+/// it records, so a conforming decoder reproduces `out_block` bit-for-bit.
+fn reconstructLuma16(
+    mode: modes.ChromaMode,
+    src: *const [luma_pixels]u8,
+    above: *const [luma_block]u8,
+    left: *const [luma_block]u8,
+    above_left: u8,
+    edges: prediction.EdgePresence,
+    factors: *const quant.Factors,
+    out_block: *[luma_pixels]u8,
+    out_luma: *[luma_block][coeff_count]i16,
+    out_y2: *[coeff_count]i16,
+) Rd {
+    prediction.predictFullBlock(luma_block, mode, above, left, above_left, edges, out_block, luma_block);
+
     var subblock_coeffs: [luma_block][coeff_count]i16 = undefined;
     var dcs: [coeff_count]i16 = undefined;
     for (0..luma_block) |sub| {
@@ -313,29 +430,32 @@ fn encodeLuma(
         var residual: [coeff_count]i16 = undefined;
         for (0..4) |r| {
             for (0..4) |c| {
-                const idx = (mb_y + sub_y + r) * stride + mb_x + sub_x + c;
-                residual[r * 4 + c] = @as(i16, source.luma[idx]) - @as(i16, recon.luma[idx]);
+                const idx = (sub_y + r) * luma_block + sub_x + c;
+                residual[r * 4 + c] = @as(i16, src[idx]) - @as(i16, out_block[idx]);
             }
         }
         forward_transform.forwardDct(&residual, &subblock_coeffs[sub]);
         dcs[sub] = subblock_coeffs[sub][0];
     }
 
-    // 3. Y2: forward WHT, quantize, then dequant + inverse WHT back to the DCs
-    //    the decoder will scatter into each luma block (NOT level*factor).
+    // Y2: forward WHT, quantize, then dequant + inverse WHT back to the DCs the
+    // decoder scatters into each luma block (NOT level*factor).
     var y2_coeffs: [coeff_count]i16 = undefined;
     forward_transform.forwardWalshHadamard(&dcs, &y2_coeffs);
-    levels.y2[0] = quant.quantizeCoefficient(y2_coeffs[0], factors.y2_dc);
-    for (1..coeff_count) |p| levels.y2[p] = quant.quantizeCoefficient(y2_coeffs[p], factors.y2_ac);
+    out_y2[0] = quant.quantizeCoefficient(y2_coeffs[0], factors.y2_dc);
+    for (1..coeff_count) |p| out_y2[p] = quant.quantizeCoefficient(y2_coeffs[p], factors.y2_ac);
 
     var y2_dequant: [coeff_count]i16 = undefined;
-    y2_dequant[0] = quant.dequantize(levels.y2[0], factors.y2_dc);
-    for (1..coeff_count) |p| y2_dequant[p] = quant.dequantize(levels.y2[p], factors.y2_ac);
+    y2_dequant[0] = quant.dequantize(out_y2[0], factors.y2_dc);
+    for (1..coeff_count) |p| y2_dequant[p] = quant.dequantize(out_y2[p], factors.y2_ac);
     var reconstructed_dcs: [coeff_count]i16 = undefined;
     transform.inverseWalshHadamard(&y2_dequant, &reconstructed_dcs);
 
-    // 4. Quantize each block's AC, rebuild the dequantized block with the
-    //    scattered DC at position 0, and add the inverse DCT to the prediction.
+    var rate: u32 = 0;
+    for (out_y2) |level| {
+        if (level != 0) rate += 1;
+    }
+
     for (0..luma_block) |sub| {
         const sub_x = (sub % 4) * 4;
         const sub_y = (sub / 4) * 4;
@@ -345,64 +465,113 @@ fn encodeLuma(
         for (1..coeff_count) |p| {
             level[p] = quant.quantizeCoefficient(subblock_coeffs[sub][p], factors.y1_ac);
             dequant[p] = quant.dequantize(level[p], factors.y1_ac);
+            if (level[p] != 0) rate += 1;
         }
-        levels.luma[sub] = level;
-        // Skip the inverse DCT of an all-zero block exactly as the decoder does
-        // (its residual is identically zero, leaving the prediction untouched);
-        // dequant[0] already carries the Y2-scattered DC, so the test matches.
+        out_luma[sub] = level;
+        // Skip the inverse DCT of an all-zero block exactly as the decoder does;
+        // dequant[0] already carries the Y2-scattered DC.
         if (blockHasNonzero(&dequant)) {
-            const sub_origin = (mb_y + sub_y) * stride + mb_x + sub_x;
-            transform.addInverseDct(&dequant, recon.luma[sub_origin..], @intCast(stride));
+            transform.addInverseDct(&dequant, out_block[sub_y * luma_block + sub_x ..], luma_block);
         }
     }
+
+    return .{ .distortion = sumSquaredError(src, out_block), .rate = rate };
 }
 
-fn encodeChromaPlane(
-    source: []const u8,
-    recon: []u8,
-    stride: usize,
-    dc_factor: u16,
-    ac_factor: u16,
+/// Chooses the single chroma mode shared by the U and V planes (RFC 11.4) by
+/// scoring their combined rate-distortion, then commits both reconstructions.
+fn selectChroma(
+    source: *const color.YuvPlanes,
+    recon: *color.YuvPlanes,
+    factors: *const quant.Factors,
     mb_column: u32,
     mb_row: u32,
-    plane_levels: *[tokens.chroma_block_count][coeff_count]i16,
-) void {
+    levels: *tokens.MacroblockLevels,
+) modes.ChromaMode {
+    const stride = recon.chroma_stride;
     const mb_x: usize = @as(usize, mb_column) * chroma_block;
     const mb_y: usize = @as(usize, mb_row) * chroma_block;
-    const origin = mb_y * stride + mb_x;
     const has_above = mb_row > 0;
     const has_left = mb_column > 0;
+    const edges = prediction.EdgePresence{ .has_above = has_above, .has_left = has_left };
 
-    // 1. DC-predict the 8x8 block from reconstructed chroma neighbors.
-    var above: [chroma_block]u8 = @splat(127);
-    var left: [chroma_block]u8 = @splat(129);
-    var above_left: u8 = 127;
-    if (has_above) above = recon[(mb_y - 1) * stride + mb_x ..][0..chroma_block].*;
-    if (has_left) {
-        for (0..chroma_block) |r| left[r] = recon[(mb_y + r) * stride + mb_x - 1];
+    var u_above: [chroma_block]u8 = undefined;
+    var u_left: [chroma_block]u8 = undefined;
+    var u_corner: u8 = undefined;
+    gatherFullBlockNeighbors(chroma_block, recon.chroma_u, stride, mb_x, mb_y, has_above, has_left, &u_above, &u_left, &u_corner);
+    var v_above: [chroma_block]u8 = undefined;
+    var v_left: [chroma_block]u8 = undefined;
+    var v_corner: u8 = undefined;
+    gatherFullBlockNeighbors(chroma_block, recon.chroma_v, stride, mb_x, mb_y, has_above, has_left, &v_above, &v_left, &v_corner);
+
+    var u_src: [chroma_pixels]u8 = undefined;
+    var v_src: [chroma_pixels]u8 = undefined;
+    for (0..chroma_block) |r| {
+        u_src[r * chroma_block ..][0..chroma_block].* = source.chroma_u[(mb_y + r) * stride + mb_x ..][0..chroma_block].*;
+        v_src[r * chroma_block ..][0..chroma_block].* = source.chroma_v[(mb_y + r) * stride + mb_x ..][0..chroma_block].*;
     }
-    if (has_above and has_left) above_left = recon[(mb_y - 1) * stride + mb_x - 1];
-    prediction.predictFullBlock(
-        chroma_block,
-        .dc,
-        &above,
-        &left,
-        above_left,
-        .{ .has_above = has_above, .has_left = has_left },
-        recon[origin..],
-        @intCast(stride),
-    );
 
-    // 2. Per 4x4 subblock: residual, forward DCT, quantize (DC + AC), then
-    //    dequant + inverse DCT back onto the prediction.
+    const lambda = lambdaFor(factors.uv_ac);
+    var best_cost: u64 = std.math.maxInt(u64);
+    var best_mode: modes.ChromaMode = .dc;
+    var best_u_block: [chroma_pixels]u8 = undefined;
+    var best_v_block: [chroma_pixels]u8 = undefined;
+    var best_u_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
+    var best_v_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
+
+    for (chroma_mode_candidates) |mode| {
+        var u_block: [chroma_pixels]u8 = undefined;
+        var v_block: [chroma_pixels]u8 = undefined;
+        var u_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
+        var v_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
+        const rd_u = reconstructChroma8(mode, &u_src, &u_above, &u_left, u_corner, edges, factors.uv_dc, factors.uv_ac, &u_block, &u_levels);
+        const rd_v = reconstructChroma8(mode, &v_src, &v_above, &v_left, v_corner, edges, factors.uv_dc, factors.uv_ac, &v_block, &v_levels);
+        const combined = Rd{ .distortion = rd_u.distortion + rd_v.distortion, .rate = rd_u.rate + rd_v.rate };
+        const cost = combined.cost(lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_mode = mode;
+            best_u_block = u_block;
+            best_v_block = v_block;
+            best_u_levels = u_levels;
+            best_v_levels = v_levels;
+        }
+    }
+
+    for (0..chroma_block) |r| {
+        recon.chroma_u[(mb_y + r) * stride + mb_x ..][0..chroma_block].* = best_u_block[r * chroma_block ..][0..chroma_block].*;
+        recon.chroma_v[(mb_y + r) * stride + mb_x ..][0..chroma_block].* = best_v_block[r * chroma_block ..][0..chroma_block].*;
+    }
+    levels.chroma_u = best_u_levels;
+    levels.chroma_v = best_v_levels;
+    return best_mode;
+}
+
+/// Reconstructs one 8x8 chroma plane for the given mode into the tight
+/// `out_block` (stride `chroma_block`) and returns its rate-distortion terms.
+fn reconstructChroma8(
+    mode: modes.ChromaMode,
+    src: *const [chroma_pixels]u8,
+    above: *const [chroma_block]u8,
+    left: *const [chroma_block]u8,
+    above_left: u8,
+    edges: prediction.EdgePresence,
+    dc_factor: u16,
+    ac_factor: u16,
+    out_block: *[chroma_pixels]u8,
+    out_levels: *[tokens.chroma_block_count][coeff_count]i16,
+) Rd {
+    prediction.predictFullBlock(chroma_block, mode, above, left, above_left, edges, out_block, chroma_block);
+
+    var rate: u32 = 0;
     for (0..tokens.chroma_block_count) |sub| {
         const sub_x = (sub % 2) * 4;
         const sub_y = (sub / 2) * 4;
         var residual: [coeff_count]i16 = undefined;
         for (0..4) |r| {
             for (0..4) |c| {
-                const idx = (mb_y + sub_y + r) * stride + mb_x + sub_x + c;
-                residual[r * 4 + c] = @as(i16, source[idx]) - @as(i16, recon[idx]);
+                const idx = (sub_y + r) * chroma_block + sub_x + c;
+                residual[r * 4 + c] = @as(i16, src[idx]) - @as(i16, out_block[idx]);
             }
         }
         var coeffs: [coeff_count]i16 = undefined;
@@ -416,13 +585,28 @@ fn encodeChromaPlane(
             level[p] = quant.quantizeCoefficient(coeffs[p], ac_factor);
             dequant[p] = quant.dequantize(level[p], ac_factor);
         }
-        plane_levels[sub] = level;
+        out_levels[sub] = level;
+        for (level) |coded| {
+            if (coded != 0) rate += 1;
+        }
         // Same all-zero-block skip as the luma path and the decoder.
         if (blockHasNonzero(&dequant)) {
-            const sub_origin = (mb_y + sub_y) * stride + mb_x + sub_x;
-            transform.addInverseDct(&dequant, recon[sub_origin..], @intCast(stride));
+            transform.addInverseDct(&dequant, out_block[sub_y * chroma_block + sub_x ..], chroma_block);
         }
     }
+
+    return .{ .distortion = sumSquaredError(src, out_block), .rate = rate };
+}
+
+/// Sum of squared per-pixel differences between two equal-length blocks.
+fn sumSquaredError(source: []const u8, reconstruction: []const u8) u64 {
+    assert(source.len == reconstruction.len);
+    var sse: u64 = 0;
+    for (source, reconstruction) |s, r| {
+        const diff = @as(i32, s) - @as(i32, r);
+        sse += @intCast(diff * diff);
+    }
+    return sse;
 }
 
 /// Whether any dequantized coefficient is nonzero. Mirrors the decoder's
@@ -509,6 +693,37 @@ test "encoder reconstruction matches the decoder byte-for-byte" {
     try expectSelfConsistent(1, 1); // single pixel, all edges synthetic
     try expectSelfConsistent(33, 18); // wide, asymmetric partials
     try expectSelfConsistent(64, 48); // multi-macroblock interior
+    // One macroblock column: every macroblock below the top row is a
+    // column-0/row>0 case, the only place the above-left corner is the
+    // synthetic 129. A TrueMotion choice there would diverge if the encoder
+    // gathered the wrong corner, so this pins the decoder-mirroring fix.
+    try expectSelfConsistent(16, 64);
+}
+
+test "full-block neighbor gather mirrors the decoder's synthetic corner" {
+    const stride = 48;
+    var plane: [stride * 48]u8 = undefined;
+    for (0..48) |y| {
+        for (0..48) |x| plane[y * stride + x] = @intCast((x * 3 + y) & 0xff);
+    }
+
+    var above: [luma_block]u8 = undefined;
+    var left: [luma_block]u8 = undefined;
+    var corner: u8 = undefined;
+
+    // Top-left macroblock: no real neighbors, so the corner is the synthetic
+    // above border (127).
+    gatherFullBlockNeighbors(luma_block, &plane, stride, 0, 0, false, false, &above, &left, &corner);
+    try std.testing.expectEqual(@as(u8, prediction.border_above), corner);
+
+    // Left edge below the top row: the corner is the synthetic left border
+    // (129), not the above border the step 8a code used here.
+    gatherFullBlockNeighbors(luma_block, &plane, stride, 0, luma_block, true, false, &above, &left, &corner);
+    try std.testing.expectEqual(@as(u8, prediction.border_left), corner);
+
+    // Interior: the corner is the real reconstructed pixel above and to the left.
+    gatherFullBlockNeighbors(luma_block, &plane, stride, luma_block, luma_block, true, true, &above, &left, &corner);
+    try std.testing.expectEqual(plane[(luma_block - 1) * stride + (luma_block - 1)], corner);
 }
 
 test "encoded baseline frame is a valid muxable VP8 bitstream" {
