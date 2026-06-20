@@ -1,0 +1,57 @@
+name: "Setup Zig"
+description: "Install a pinned Zig toolchain directly from ziglang.org, verified by SHA-256."
+
+# Why this exists instead of `uses: mlugg/setup-zig@v2`:
+#
+# That action declares `using: node20` in its action.yml. GitHub is removing
+# the Node 20 runtime from runners, so it force-runs the action on Node 24 and
+# prints a deprecation warning on every single run:
+#   https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+# As of this writing every published mlugg/setup-zig release (through v2.2.1)
+# and `main` still declare node20, and the node24 migration (mlugg/setup-zig#56)
+# is still an open, unmerged PR. So the warning cannot be cleared by bumping the
+# action version -- there is no fixed version to bump to.
+#
+# A composite action runs only shell steps and carries no Node runtime of its
+# own, so it produces no such warning. The trade-off is that we give up the
+# action's mirror fallback and minisign verification; we replace them with a
+# SHA-256 check against ziglang.org's download index plus a download retry loop.
+
+inputs:
+  version:
+    description: 'Zig version to install (e.g. "0.16.0" or "master").'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Zig ${{ inputs.version }}
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # ziglang.org index keys are "<arch>-<os>", e.g. "x86_64-linux".
+        platform="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+        index="$(curl -fsSL --retry 3 --retry-all-errors https://ziglang.org/download/index.json)"
+        tarball="$(printf '%s' "$index" | jq -r --arg v "$ZIG_VERSION" --arg p "$platform" '.[$v][$p].tarball // empty')"
+        shasum="$(printf '%s' "$index" | jq -r --arg v "$ZIG_VERSION" --arg p "$platform" '.[$v][$p].shasum // empty')"
+
+        if [ -z "$tarball" ] || [ -z "$shasum" ]; then
+          echo "::error::ziglang.org index.json has no Zig '$ZIG_VERSION' build for '$platform'"
+          exit 1
+        fi
+
+        echo "Installing Zig $ZIG_VERSION for $platform"
+        echo "  tarball: $tarball"
+        curl -fsSL --retry 3 --retry-all-errors "$tarball" -o "$RUNNER_TEMP/zig.tar.xz"
+        echo "${shasum}  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+
+        dest="$RUNNER_TEMP/zig"
+        mkdir -p "$dest"
+        tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$dest" --strip-components=1
+        echo "$dest" >> "$GITHUB_PATH"
+
+        "$dest/zig" version

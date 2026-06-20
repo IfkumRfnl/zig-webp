@@ -12,7 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: mlugg/setup-zig@v2
+      # Local composite action (shell-only) instead of mlugg/setup-zig@v2,
+      # which still declares the deprecated Node 20 runtime. See
+      # .github/actions/setup-zig/action.yml for the rationale.
+      - uses: ./.github/actions/setup-zig
         with:
           version: 0.16.0
 
