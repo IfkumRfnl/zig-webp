@@ -387,14 +387,23 @@ conversion, forward DCT/WHT, forward quantization, and coefficient token coding.
 Every encode-corpus image decodes without error through both this library's
 decoder and `dwebp`, and the decoder reproduces the encoder's own reconstruction
 bit-for-bit at the YUV layer (the step 8a gate; see `PROGRESS.MD` and the
-2026-06-19 oracle row). Next is step 8b (quality):
+2026-06-19 oracle row).
 
-1. Replace the fixed mode decision with real per-macroblock intra mode selection
-   (16x16 vs B_PRED, plus the chroma mode) scored by rate-distortion, with token
-   cost estimation.
-2. Add segmentation, skip decisions, and loop-filter level selection, gating on
-   the matched-size luma-PSNR target in step 8b above.
-3. Then step 8c: method/quality presets, target-size and target-PSNR modes,
+Step 8b (quality) is broken into reviewable slices so the encoder stays
+auditable:
+
+1. **8b-1 (delivered).** Real per-macroblock intra mode selection for the 16x16
+   luma modes and the shared 8x8 chroma mode (DC/V/H/TM), scored by a
+   rate-distortion metric (reconstruction SSE plus a quantizer-scaled
+   coded-coefficient penalty). The self-consistency and `dwebp` validity gates
+   still hold and every photo improves in both PSNR and size over 8a; see the
+   2026-06-20 oracle row.
+2. **8b-2 (next).** Add B_PRED (per-subblock 4x4 luma intra) to the mode
+   decision, with proper VP8 token-cost estimation so the 16x16-vs-B_PRED choice
+   is rate-accurate.
+3. **8b-3.** Add segmentation, skip decisions, and loop-filter level selection,
+   gating on the matched-size luma-PSNR target in step 8b above.
+4. Then step 8c: method/quality presets, target-size and target-PSNR modes,
    sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
 
 This order keeps early work testable and prevents the project from becoming
