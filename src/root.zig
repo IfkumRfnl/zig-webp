@@ -241,6 +241,34 @@ pub fn encodeVP8LBitstream(
     return vp8l_encoder.encodeAlloc(gpa, dimensions, pixels);
 }
 
+/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
+/// using the step 8a baseline encoder: a fixed all-DC mode decision, no loop
+/// filter, and default coefficient probabilities (see PLAN.MD step 8a). The
+/// buffer may be `rgba`/`bgra`/`argb` or `rgb`, read row-major honoring stride;
+/// the alpha channel is dropped (lossy alpha via `ALPH` is step 8c).
+/// `encode_options.quality` (0..100) selects the quantizer and
+/// `encode_options.format` must be `.lossy`. Returns caller-owned bytes.
+pub fn encodeLossy(
+    gpa: std.mem.Allocator,
+    buffer: ImageBuffer,
+    encode_options: EncoderOptions,
+) Error![]u8 {
+    return encode.encodeStaticLossy(gpa, buffer, encode_options);
+}
+
+/// Encodes a `width`x`height` ARGB pixel array (packed `0xAARRGGBB`, row-major)
+/// into a raw VP8 bitstream — the payload of a `VP8 ` chunk, without the RIFF
+/// container. `quality` is 0..100. Most callers want `encodeLossy`; this is for
+/// tooling that muxes the bitstream itself. Returns caller-owned bytes.
+pub fn encodeVP8Bitstream(
+    gpa: std.mem.Allocator,
+    dimensions: Dimensions,
+    pixels: []const VP8LARGBPixel,
+    quality: u8,
+) Error![]u8 {
+    return encode.encodeVP8Bitstream(gpa, dimensions, pixels, quality);
+}
+
 /// Decodes a complete WebP file into an owned pixel buffer. Currently
 /// still-lossless (VP8L) only: lossy inputs fail with
 /// `error.UnsupportedImageFormat` and animations with

@@ -23,6 +23,7 @@ Usage:
   tools/webp-oracle.sh encode INPUT_IMAGE OUTPUT.webp
   tools/webp-oracle.sh roundtrip INPUT_IMAGE OUT_DIR
   tools/webp-oracle.sh compare-encode-corpus REPORT.tsv
+  tools/webp-oracle.sh compare-encode-lossy [CORPUS_DIR]
 
 Runs optional local libwebp tools when they are installed. Missing tools are
 reported as skips so this script can live outside the package dependency graph.
@@ -91,6 +92,125 @@ compare_encode_corpus() {
         }' "$data"
 
     rm -rf "$tmp"
+}
+
+# The external half of the step 8a validity gate: every image our lossy encoder
+# produces must decode without error under libwebp's `dwebp`. For each still
+# source (photos + an in-tree corpus) it encodes with `zig-webp-encode`, decodes
+# the result with `dwebp` (the validity check), and pairs the encoded size
+# against `cwebp -q -noalpha` on the same color pixels (step 8a drops alpha).
+# Requires `zig build` to have produced the encoder binary. Exits non-zero if
+# any still source fails to encode, if any output fails to decode, or if no
+# outputs were validated.
+compare_encode_lossy() {
+    corpus_dir=${1:-testdata/libwebp-test-data}
+    quality=75
+    encoder=zig-out/bin/zig-webp-encode
+
+    if [ ! -x "$encoder" ]; then
+        printf 'error: %s not found; build it with `zig build` first\n' "$encoder" >&2
+        exit 2
+    fi
+    if ! has_tool dwebp || ! has_tool cwebp || ! has_tool webpinfo; then
+        printf 'dwebp/cwebp/webpinfo\tSKIP: not installed\n' >&2
+        exit 0
+    fi
+
+    tmp=$(mktemp -d)
+    data="$tmp/data.tsv"
+    : >"$data"
+    invalid=0
+    encode_failed=0
+    reference_failed=0
+    paired=0
+    skipped=0
+
+    for entry in "testdata/photos:photo" "$corpus_dir:corpus"; do
+        dir=${entry%:*}
+        family=${entry#*:}
+        [ -d "$dir" ] || continue
+        for src in "$dir"/*.webp; do
+            [ -f "$src" ] || continue
+            name=$(basename "$src")
+            rm -f "$tmp/our.webp" "$tmp/our.png" "$tmp/src.png" "$tmp/cwebp.webp"
+
+            if ! webpinfo "$src" >"$tmp/source.webpinfo" 2>/dev/null; then
+                printf 'FAIL\twebpinfo\t%s\n' "$src" >&2
+                reference_failed=$((reference_failed + 1))
+                continue
+            fi
+            if grep -q '^Chunk ANIM ' "$tmp/source.webpinfo"; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+
+            if ! "$encoder" "$src" "$tmp/our.webp" "$quality" 2>/dev/null; then
+                printf 'FAIL\tencode\t%s\n' "$src" >&2
+                encode_failed=$((encode_failed + 1))
+                continue
+            fi
+
+            if dwebp -quiet "$tmp/our.webp" -o "$tmp/our.png" 2>/dev/null; then
+                valid=ok
+            else
+                valid=DWEBP-FAIL
+                invalid=$((invalid + 1))
+            fi
+
+            # Re-encode the same decoded colors with cwebp for a size reference.
+            # Step 8a drops alpha, so the reference encode must do the same.
+            if ! dwebp -quiet "$src" -o "$tmp/src.png" 2>/dev/null; then
+                printf 'FAIL\tdwebp-source\t%s\n' "$src" >&2
+                reference_failed=$((reference_failed + 1))
+                continue
+            fi
+            if ! cwebp -quiet -q "$quality" -noalpha "$tmp/src.png" -o "$tmp/cwebp.webp" 2>/dev/null; then
+                printf 'FAIL\tcwebp\t%s\n' "$src" >&2
+                reference_failed=$((reference_failed + 1))
+                continue
+            fi
+            our_bytes=$(wc -c <"$tmp/our.webp" | tr -d ' ')
+            cwebp_bytes=$(wc -c <"$tmp/cwebp.webp" | tr -d ' ')
+            printf '%s\t%s\t%s\t%s\t%s\n' "$family" "$name" "$our_bytes" "$cwebp_bytes" "$valid" >>"$data"
+            paired=$((paired + 1))
+        done
+    done
+
+    printf 'family\tname\tour_bytes\tcwebp_bytes\tvalid\tratio\n'
+    awk -F'\t' '
+        { printf "%s\t%s\t%s\t%s\t%s\t%.4f\n", $1, $2, $3, $4, $5, $3 / $4
+          r[NR] = $3 / $4; our_total += $3; cwebp_total += $4; if ($5 != "ok") bad++ }
+        END {
+            n = NR
+            if (n == 0) { print "# no paired files (sources missing or tools failed)"; exit }
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
+            median = (n % 2) ? r[(n + 1) / 2] : (r[n / 2] + r[n / 2 + 1]) / 2
+            printf "# files=%d  dwebp_invalid=%d  median_ratio=%.4f  aggregate_ratio=%.4f  (our/cwebp -q -noalpha at matched quality)\n", n, bad + 0, median, our_total / cwebp_total
+        }' "$data"
+
+    status=0
+    if [ "$paired" -eq 0 ]; then
+        printf 'compare-encode-lossy: no files were encoded and validated\n' >&2
+        status=1
+    fi
+    if [ "$encode_failed" -ne 0 ]; then
+        printf 'compare-encode-lossy: %d still file(s) failed to encode\n' "$encode_failed" >&2
+        status=1
+    fi
+    if [ "$reference_failed" -ne 0 ]; then
+        printf 'compare-encode-lossy: %d reference tool failure(s)\n' "$reference_failed" >&2
+        status=1
+    fi
+    if [ "$skipped" -ne 0 ]; then
+        printf 'compare-encode-lossy: skipped %d animated file(s)\n' "$skipped" >&2
+    fi
+    if [ "$invalid" -ne 0 ]; then
+        printf 'compare-encode-lossy: %d file(s) failed dwebp validation\n' "$invalid" >&2
+        status=1
+    fi
+
+    rm -rf "$tmp"
+    exit "$status"
 }
 
 decode_one() {
@@ -689,6 +809,14 @@ case "$mode" in
             exit 2
         fi
         compare_encode_corpus "$2"
+        ;;
+
+    compare-encode-lossy)
+        if [ "$#" -gt 2 ]; then
+            usage >&2
+            exit 2
+        fi
+        compare_encode_lossy "${2:-}"
         ;;
 
     -h|--help|help)

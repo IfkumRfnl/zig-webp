@@ -19,6 +19,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const errors = @import("errors.zig");
 const image = @import("image.zig");
 
 // Fixed-point precision for the YUV->RGB conversion (`YUV_FIX2` in libwebp).
@@ -316,6 +317,213 @@ inline fn clip8(value: i32) u8 {
     return 255;
 }
 
+//------------------------------------------------------------------------------
+// RGB -> YUV 4:2:0 conversion (encode side, PLAN.MD step 8a).
+//
+// The BT.601 forward coefficients are libwebp's `VP8RGBToY/U/V`
+// (`src/dsp/yuv.h`); chroma is a 2x2 box average. Unlike the decode direction
+// this is not pinned bit-for-bit to libwebp — the step 8a gate compares the
+// encoder's *reconstruction* against the decoder, which is identical by
+// construction regardless of how the source chroma was downsampled, so an exact
+// libwebp match here only affects PSNR. Color is computed from raw RGB with the
+// alpha channel ignored, so a fully transparent pixel still contributes its
+// hidden RGB (the transparent-RGB case step 8a must handle exactly).
+
+/// Luma macroblock edge in pixels (16x16) and chroma macroblock edge (8x8).
+pub const luma_block = 16;
+pub const chroma_block = 8;
+
+/// Owned macroblock-padded source planes: `luma` is `mb_width*16` by
+/// `mb_height*16`, each chroma plane `mb_width*8` by `mb_height*8`, with partial
+/// macroblocks filled by edge replication. The visible image is the top-left
+/// `width` x `height` region. `view()` borrows these as decode-side `Planes`.
+pub const YuvPlanes = struct {
+    luma: []u8,
+    chroma_u: []u8,
+    chroma_v: []u8,
+    luma_stride: usize,
+    chroma_stride: usize,
+    mb_width: u32,
+    mb_height: u32,
+    width: u32,
+    height: u32,
+
+    /// Allocates zero-initialized planes sized for `width` x `height` rounded up
+    /// to whole macroblocks. Luma defaults to 0 and chroma to the neutral 128.
+    pub fn initAlloc(gpa: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!YuvPlanes {
+        assert(width >= 1 and height >= 1);
+        const mb_width = (width + luma_block - 1) / luma_block;
+        const mb_height = (height + luma_block - 1) / luma_block;
+        const luma_stride: usize = @as(usize, mb_width) * luma_block;
+        const chroma_stride: usize = @as(usize, mb_width) * chroma_block;
+        const luma_rows: usize = @as(usize, mb_height) * luma_block;
+        const chroma_rows: usize = @as(usize, mb_height) * chroma_block;
+
+        const luma = try gpa.alloc(u8, luma_stride * luma_rows);
+        errdefer gpa.free(luma);
+        const chroma_u = try gpa.alloc(u8, chroma_stride * chroma_rows);
+        errdefer gpa.free(chroma_u);
+        const chroma_v = try gpa.alloc(u8, chroma_stride * chroma_rows);
+
+        @memset(luma, 0);
+        @memset(chroma_u, 128);
+        @memset(chroma_v, 128);
+
+        return .{
+            .luma = luma,
+            .chroma_u = chroma_u,
+            .chroma_v = chroma_v,
+            .luma_stride = luma_stride,
+            .chroma_stride = chroma_stride,
+            .mb_width = mb_width,
+            .mb_height = mb_height,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    pub fn deinit(self: *YuvPlanes, gpa: std.mem.Allocator) void {
+        gpa.free(self.luma);
+        gpa.free(self.chroma_u);
+        gpa.free(self.chroma_v);
+        self.* = undefined;
+    }
+
+    /// Borrows the planes as decode-side `Planes` (e.g. to upsample back to RGB).
+    pub fn view(self: *const YuvPlanes) Planes {
+        return .{
+            .luma = self.luma,
+            .chroma_u = self.chroma_u,
+            .chroma_v = self.chroma_v,
+            .luma_stride = self.luma_stride,
+            .chroma_stride = self.chroma_stride,
+            .width = self.width,
+            .height = self.height,
+        };
+    }
+};
+
+pub fn yuv420AllocationBytes(width: u32, height: u32) errors.Error!u64 {
+    if (width == 0) return error.InvalidCanvasSize;
+    if (height == 0) return error.InvalidCanvasSize;
+
+    const mb_width = (@as(u64, width) + luma_block - 1) / luma_block;
+    const mb_height = (@as(u64, height) + luma_block - 1) / luma_block;
+    const luma_stride = mb_width * luma_block;
+    const chroma_stride = mb_width * chroma_block;
+    const luma_rows = mb_height * luma_block;
+    const chroma_rows = mb_height * chroma_block;
+
+    var bytes = try mulByteCounts(luma_stride, luma_rows);
+    bytes = try addByteCounts(bytes, try mulByteCounts(chroma_stride, chroma_rows));
+    bytes = try addByteCounts(bytes, try mulByteCounts(chroma_stride, chroma_rows));
+    return bytes;
+}
+
+fn addByteCounts(a: u64, b: u64) errors.Error!u64 {
+    return std.math.add(u64, a, b) catch error.AllocationLimitExceeded;
+}
+
+fn mulByteCounts(a: u64, b: u64) errors.Error!u64 {
+    return std.math.mul(u64, a, b) catch error.AllocationLimitExceeded;
+}
+
+/// Converts packed-ARGB source pixels (`0xAARRGGBB`, row-major, length
+/// `width*height`; alpha ignored) into macroblock-padded YUV 4:2:0 source
+/// planes. Partial macroblocks are filled by replicating the visible edge.
+pub fn rgbaToYuv420Alloc(
+    gpa: std.mem.Allocator,
+    argb: []const u32,
+    width: u32,
+    height: u32,
+) std.mem.Allocator.Error!YuvPlanes {
+    const w: usize = width;
+    const h: usize = height;
+    assert(argb.len == w * h);
+
+    var planes = try YuvPlanes.initAlloc(gpa, width, height);
+    errdefer planes.deinit(gpa);
+
+    const luma_stride = planes.luma_stride;
+    // Luma over the visible region, then replicate the right edge across the
+    // macroblock padding of each row.
+    for (0..h) |y| {
+        const dst = planes.luma[y * luma_stride ..];
+        for (0..w) |x| {
+            const p = argb[y * w + x];
+            dst[x] = rgbToY(redOf(p), greenOf(p), blueOf(p));
+        }
+        const edge = dst[w - 1];
+        for (w..luma_stride) |x| dst[x] = edge;
+    }
+    // Replicate the bottom edge row across the macroblock padding below.
+    const luma_rows: usize = @as(usize, planes.mb_height) * luma_block;
+    for (h..luma_rows) |y| {
+        @memcpy(
+            planes.luma[y * luma_stride ..][0..luma_stride],
+            planes.luma[(h - 1) * luma_stride ..][0..luma_stride],
+        );
+    }
+
+    // Chroma over the full padded grid; each cell box-averages its 2x2 source
+    // window with coordinates clamped into the visible region (edge replicate).
+    const chroma_stride = planes.chroma_stride;
+    const chroma_rows: usize = @as(usize, planes.mb_height) * chroma_block;
+    for (0..chroma_rows) |cy| {
+        for (0..chroma_stride) |cx| {
+            var r4: i32 = 0;
+            var g4: i32 = 0;
+            var b4: i32 = 0;
+            for (0..2) |dy| {
+                for (0..2) |dx| {
+                    const sx = @min(2 * cx + dx, w - 1);
+                    const sy = @min(2 * cy + dy, h - 1);
+                    const p = argb[sy * w + sx];
+                    r4 += redOf(p);
+                    g4 += greenOf(p);
+                    b4 += blueOf(p);
+                }
+            }
+            planes.chroma_u[cy * chroma_stride + cx] = rgbSumToU(r4, g4, b4);
+            planes.chroma_v[cy * chroma_stride + cx] = rgbSumToV(r4, g4, b4);
+        }
+    }
+
+    return planes;
+}
+
+inline fn redOf(p: u32) i32 {
+    return @intCast((p >> 16) & 0xff);
+}
+inline fn greenOf(p: u32) i32 {
+    return @intCast((p >> 8) & 0xff);
+}
+inline fn blueOf(p: u32) i32 {
+    return @intCast(p & 0xff);
+}
+
+// Per-pixel luma: libwebp `VP8RGBToY` with round-to-nearest and the 16-level
+// black offset folded in, descaled by YUV_FIX (16). Result lands in [16, 235].
+inline fn rgbToY(r: i32, g: i32, b: i32) u8 {
+    const luma = 16839 * r + 33059 * g + 6420 * b;
+    const y = (luma + (1 << 15) + (16 << 16)) >> 16;
+    return @intCast(std.math.clamp(y, 0, 255));
+}
+
+// Chroma from a 2x2 sum: libwebp `VP8RGBToU/V` coefficients applied to the sum,
+// descaled by YUV_FIX+2 (18 = 16 fixed-point + 2 for the /4 average), centered
+// at 128 with round-to-nearest.
+inline fn rgbSumToU(r4: i32, g4: i32, b4: i32) u8 {
+    return clipUV(-9719 * r4 - 19081 * g4 + 28800 * b4);
+}
+inline fn rgbSumToV(r4: i32, g4: i32, b4: i32) u8 {
+    return clipUV(28800 * r4 - 24116 * g4 - 4684 * b4);
+}
+inline fn clipUV(value: i32) u8 {
+    const x = (value + (1 << 17) + (128 << 18)) >> 18;
+    return @intCast(std.math.clamp(x, 0, 255));
+}
+
 // A 1x1 frame collapses the upsampler to a single conversion of (y, u, v):
 // the boundary mirror makes every neighbour equal, and the diamond filter is
 // constant-preserving, so this isolates the BT.601 arithmetic. Anchors are
@@ -441,4 +649,86 @@ test "horizontal fancy upsampling interpolates the diamond weights" {
         6, 224, 0, 255, // chroma (50, 50)
         38, 200, 13, 255, // chroma (70, 70)
     }, &out);
+}
+
+// Forward RGB->YUV anchors, hand-computed from the libwebp coefficients above.
+test "RGB to YUV converts hand-computed BT.601 anchors" {
+    const Case = struct { argb: u32, y: u8, u: u8, v: u8 };
+    const cases = [_]Case{
+        .{ .argb = 0xff80_8080, .y = 126, .u = 128, .v = 128 }, // neutral grey
+        .{ .argb = 0xffff_0000, .y = 82, .u = 90, .v = 240 }, // pure red
+        .{ .argb = 0xff00_ff00, .y = 145, .u = 54, .v = 34 }, // pure green
+        .{ .argb = 0xff00_00ff, .y = 41, .u = 240, .v = 110 }, // pure blue
+    };
+    for (cases) |case| {
+        const argb = [_]u32{case.argb};
+        var planes = try rgbaToYuv420Alloc(std.testing.allocator, &argb, 1, 1);
+        defer planes.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.y, planes.luma[0]);
+        try std.testing.expectEqual(case.u, planes.chroma_u[0]);
+        try std.testing.expectEqual(case.v, planes.chroma_v[0]);
+    }
+}
+
+// Color is computed from raw RGB regardless of alpha: a fully transparent red
+// yields the same YUV as an opaque red (the transparent-RGB case).
+test "RGB to YUV ignores alpha (transparent RGB is preserved)" {
+    const opaque_red = [_]u32{0xffff_0000};
+    const transparent_red = [_]u32{0x00ff_0000};
+    var a = try rgbaToYuv420Alloc(std.testing.allocator, &opaque_red, 1, 1);
+    defer a.deinit(std.testing.allocator);
+    var b = try rgbaToYuv420Alloc(std.testing.allocator, &transparent_red, 1, 1);
+    defer b.deinit(std.testing.allocator);
+    try std.testing.expectEqual(a.luma[0], b.luma[0]);
+    try std.testing.expectEqual(a.chroma_u[0], b.chroma_u[0]);
+    try std.testing.expectEqual(a.chroma_v[0], b.chroma_v[0]);
+}
+
+// Odd dimensions pad to whole macroblocks by edge replication: a constant field
+// stays constant through every plane sample, including the padding, and the
+// padded geometry matches ceil(dim/16).
+test "RGB to YUV pads partial macroblocks by replicating the edge" {
+    const width = 17;
+    const height = 17;
+    var argb: [width * height]u32 = @splat(0xff3c_7818); // arbitrary constant color
+    var planes = try rgbaToYuv420Alloc(std.testing.allocator, &argb, width, height);
+    defer planes.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), planes.mb_width);
+    try std.testing.expectEqual(@as(u32, 2), planes.mb_height);
+    try std.testing.expectEqual(@as(usize, 32), planes.luma_stride);
+    try std.testing.expectEqual(@as(usize, 16), planes.chroma_stride);
+
+    const luma_first = planes.luma[0];
+    for (planes.luma) |sample| try std.testing.expectEqual(luma_first, sample);
+    const u_first = planes.chroma_u[0];
+    for (planes.chroma_u) |sample| try std.testing.expectEqual(u_first, sample);
+    const v_first = planes.chroma_v[0];
+    for (planes.chroma_v) |sample| try std.testing.expectEqual(v_first, sample);
+
+    _ = &argb;
+}
+
+// Forward then back (via the decoder-side fancy upsampler) recovers a constant
+// field essentially exactly, exercising the full conversion pair.
+test "RGB to YUV round-trips a constant field through the upsampler" {
+    const width = 6;
+    const height = 5;
+    var argb: [width * height]u32 = @splat(0xff20_60a0);
+    var planes = try rgbaToYuv420Alloc(std.testing.allocator, &argb, width, height);
+    defer planes.deinit(std.testing.allocator);
+
+    var rgba: [width * height * 4]u8 = undefined;
+    upsampleFancy(.rgba, planes.view(), &rgba, width * 4);
+
+    // The decode side does not recover the source bit-for-bit (YUV 4:2:0 is
+    // lossy), but a constant field should land within a couple of levels.
+    for (0..width * height) |pixel| {
+        const got = rgba[pixel * 4 ..][0..4];
+        try std.testing.expect(@abs(@as(i32, got[0]) - 0x20) <= 3);
+        try std.testing.expect(@abs(@as(i32, got[1]) - 0x60) <= 3);
+        try std.testing.expect(@abs(@as(i32, got[2]) - 0xa0) <= 3);
+        try std.testing.expectEqual(@as(u8, 255), got[3]);
+    }
+    _ = &argb;
 }

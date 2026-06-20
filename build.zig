@@ -102,6 +102,21 @@ pub fn build(b: *std.Build) void {
             .install = false,
             .cwd_repo_root = true,
         },
+        .{
+            .name = "zig-webp-encode-lossy-report",
+            .source = "tools/zig-webp-encode-lossy-report.zig",
+            .step = "encode-lossy-report",
+            .description = "Report lossy (VP8) encoder size + luma PSNR over the encode corpus",
+            .install = false,
+            .cwd_repo_root = true,
+        },
+        .{
+            .name = "zig-webp-encode",
+            .source = "tools/zig-webp-encode.zig",
+            .step = "encode-lossy",
+            .description = "Re-encode a still WebP as a lossy (VP8) WebP",
+            .install = true,
+        },
     };
 
     const check_step = b.step("check", "Compile the library and tools");

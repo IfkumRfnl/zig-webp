@@ -8,11 +8,16 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const color = @import("color.zig");
+const container = @import("container.zig");
 const errors = @import("errors.zig");
 const features = @import("features.zig");
 const image = @import("image.zig");
+const limits = @import("limits.zig");
 const mux = @import("mux.zig");
 const options = @import("options.zig");
+const vp8_encoder = @import("vp8/encoder.zig");
+const vp8_quant = @import("vp8/quant.zig");
 const vp8l_encoder = @import("vp8l/encoder.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
 
@@ -34,7 +39,6 @@ pub fn encodeStaticLossless(
     const pixel_count: usize = @intCast(try dimensions.pixelCount());
 
     try encode_options.limits.validateCanvas(dimensions.width, dimensions.height, false);
-
     const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
     defer gpa.free(argb);
     gatherArgb(buffer, argb);
@@ -47,6 +51,162 @@ pub fn encodeStaticLossless(
         .format = .lossless,
         .bitstream = bitstream,
     }, .{ .limits = encode_options.limits });
+}
+
+/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
+/// with the step 8a baseline encoder: a fixed all-DC mode decision, no loop
+/// filter, and default coefficient probabilities. The buffer's `format` may be
+/// any supported layout; the alpha channel is dropped (lossy alpha via `ALPH`
+/// is step 8c), so RGBA input encodes color only. `encode_options.quality`
+/// (0..100) selects the quantizer. `encode_options.format` must be `.lossy`.
+/// The returned bytes are caller-owned (free with `gpa`).
+pub fn encodeStaticLossy(
+    gpa: std.mem.Allocator,
+    buffer: image.Buffer,
+    encode_options: options.EncoderOptions,
+) errors.Error![]u8 {
+    if (encode_options.format != .lossy) return error.UnsupportedImageFormat;
+    try buffer.validate();
+
+    const dimensions = buffer.dimensions;
+    if (dimensions.width > vp8_encoder.dimension_max or
+        dimensions.height > vp8_encoder.dimension_max)
+    {
+        return error.InvalidCanvasSize;
+    }
+    try encode_options.limits.validateCanvas(dimensions.width, dimensions.height, false);
+    const pixel_count_u64 = try dimensions.pixelCount();
+    try validateLossyInitialAllocationBudget(
+        dimensions,
+        pixel_count_u64,
+        encode_options.limits,
+    );
+    const pixel_count: usize = @intCast(pixel_count_u64);
+
+    const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    defer gpa.free(argb);
+    gatherArgb(buffer, argb);
+
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, dimensions.width, dimensions.height);
+    defer source.deinit(gpa);
+
+    const base_quant_index = vp8_quant.baseQuantIndexForQuality(encode_options.quality);
+    var result = try vp8_encoder.encodeAlloc(gpa, &source, base_quant_index);
+    defer result.deinit(gpa);
+
+    try validateLossyMuxAllocationBudget(
+        dimensions,
+        pixel_count_u64,
+        result.bitstream.len,
+        encode_options.limits,
+    );
+
+    return mux.encodeStatic(gpa, .{
+        .canvas = dimensions,
+        .format = .lossy,
+        .bitstream = result.bitstream,
+    }, .{ .limits = encode_options.limits });
+}
+
+/// Encodes a packed-ARGB pixel array (`0xAARRGGBB`, row-major, length
+/// `width*height`) into a raw VP8 bitstream — the payload of a `VP8 ` chunk,
+/// without the RIFF container. `quality` is 0..100. Most callers want
+/// `encodeStaticLossy`; this is for tooling that muxes the bitstream itself.
+/// Returns caller-owned bytes (free with `gpa`).
+pub fn encodeVP8Bitstream(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    pixels: []const vp8l_pixel.Pixel,
+    quality: u8,
+) errors.Error![]u8 {
+    if (dimensions.width > vp8_encoder.dimension_max or
+        dimensions.height > vp8_encoder.dimension_max)
+    {
+        return error.InvalidCanvasSize;
+    }
+    if (pixels.len != @as(usize, @intCast(try dimensions.pixelCount()))) {
+        return error.InvalidCanvasSize;
+    }
+
+    var source = try color.rgbaToYuv420Alloc(gpa, pixels, dimensions.width, dimensions.height);
+    defer source.deinit(gpa);
+
+    var result = try vp8_encoder.encodeAlloc(
+        gpa,
+        &source,
+        vp8_quant.baseQuantIndexForQuality(quality),
+    );
+    result.reconstruction.deinit(gpa);
+    return result.bitstream;
+}
+
+const AllocationBudget = struct {
+    resource_limits: limits.ResourceLimits,
+    bytes: u64 = 0,
+
+    fn init(resource_limits: limits.ResourceLimits) AllocationBudget {
+        return .{ .resource_limits = resource_limits };
+    }
+
+    fn reserveElements(
+        self: *AllocationBudget,
+        comptime T: type,
+        count: u64,
+    ) errors.Error!void {
+        try self.reserveBytes(try elementByteCount(T, count));
+    }
+
+    fn reserveBytes(self: *AllocationBudget, bytes: u64) errors.Error!void {
+        if (bytes > std.math.maxInt(u64) - self.bytes) return error.AllocationLimitExceeded;
+        self.bytes += bytes;
+        try self.resource_limits.validateAllocationBytes(self.bytes);
+    }
+};
+
+fn validateLossyInitialAllocationBudget(
+    dimensions: image.Dimensions,
+    pixel_count: u64,
+    resource_limits: limits.ResourceLimits,
+) errors.Error!void {
+    var budget = AllocationBudget.init(resource_limits);
+    try budget.reserveElements(vp8l_pixel.Pixel, pixel_count);
+    try budget.reserveBytes(try color.yuv420AllocationBytes(dimensions.width, dimensions.height));
+    try budget.reserveBytes(try vp8_encoder.allocationBytesMax(dimensions));
+}
+
+fn validateLossyMuxAllocationBudget(
+    dimensions: image.Dimensions,
+    pixel_count: u64,
+    bitstream_len: usize,
+    resource_limits: limits.ResourceLimits,
+) errors.Error!void {
+    var budget = AllocationBudget.init(resource_limits);
+    try budget.reserveElements(vp8l_pixel.Pixel, pixel_count);
+
+    const yuv_bytes = try color.yuv420AllocationBytes(dimensions.width, dimensions.height);
+    try budget.reserveBytes(yuv_bytes);
+    try budget.reserveBytes(yuv_bytes);
+    try budget.reserveBytes(@intCast(bitstream_len));
+    try budget.reserveBytes(try simpleLossyWebPFileBytes(bitstream_len));
+}
+
+fn simpleLossyWebPFileBytes(bitstream_len: usize) errors.Error!u64 {
+    const payload_size: u64 = @intCast(bitstream_len);
+    if (payload_size > std.math.maxInt(u32)) return error.ChunkTooLarge;
+
+    var bytes = @as(u64, container.riff_header_size + container.chunk_header_size);
+    bytes = try addByteCounts(bytes, payload_size);
+    bytes = try addByteCounts(bytes, payload_size & 1);
+    return bytes;
+}
+
+fn elementByteCount(comptime T: type, count: u64) errors.Error!u64 {
+    if (count > std.math.maxInt(u64) / @sizeOf(T)) return error.AllocationLimitExceeded;
+    return count * @sizeOf(T);
+}
+
+fn addByteCounts(a: u64, b: u64) errors.Error!u64 {
+    return std.math.add(u64, a, b) catch error.AllocationLimitExceeded;
 }
 
 /// Reads the caller buffer's pixels (any supported format, honoring stride)
@@ -76,6 +236,20 @@ fn pixelFromSample(format: image.PixelFormat, sample: []const u8) vp8l_pixel.Pix
         .bgra => vp8l_pixel.fromChannels(sample[3], sample[2], sample[1], sample[0]),
         .argb => vp8l_pixel.fromChannels(sample[0], sample[1], sample[2], sample[3]),
     };
+}
+
+/// Allocates a row-major packed-ARGB copy of `buffer` (any supported format,
+/// honoring stride) — the input the YUV converter and the VP8/VP8L encoders
+/// take. Caller owns the result (free with `gpa`).
+pub fn gatherArgbAlloc(
+    gpa: std.mem.Allocator,
+    buffer: image.Buffer,
+) std.mem.Allocator.Error![]vp8l_pixel.Pixel {
+    const pixel_count: usize = @as(usize, buffer.dimensions.width) * buffer.dimensions.height;
+    const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    errdefer gpa.free(argb);
+    gatherArgb(buffer, argb);
+    return argb;
 }
 
 const testing = std.testing;
@@ -192,4 +366,106 @@ test "lossless static encode survives allocation failure at every site" {
     };
 
     try testing.checkAllAllocationFailures(testing.allocator, encodeAllocationProbe, .{buffer});
+}
+
+test "encodeStaticLossy produces a decodable VP8 WebP at the source size" {
+    const decode = @import("decode.zig");
+
+    const width = 18;
+    const height = 10;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const base = (y * width + x) * 4;
+            pixels[base + 0] = @intCast((x * 14) % 256);
+            pixels[base + 1] = @intCast((y * 25) % 256);
+            pixels[base + 2] = @intCast(((x + y) * 8) % 256);
+            pixels[base + 3] = 255;
+        }
+    }
+
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    const encoded = try encodeStaticLossy(testing.allocator, buffer, .{ .format = .lossy });
+    defer testing.allocator.free(encoded);
+
+    // It must decode without error at the right size (lossy, so not bit-exact;
+    // fidelity is covered by the encoder self-consistency and corpus PSNR tests).
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .rgba });
+    defer decoded.deinit();
+    try testing.expectEqual(dims.width, decoded.buffer.dimensions.width);
+    try testing.expectEqual(dims.height, decoded.buffer.dimensions.height);
+}
+
+test "encodeStaticLossy rejects non-lossy format requests" {
+    const dims = try image.Dimensions.init(1, 1);
+    var pixels = [_]u8{ 1, 2, 3, 4 };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = 4,
+        .format = .rgba,
+    };
+    try testing.expectError(
+        error.UnsupportedImageFormat,
+        encodeStaticLossy(testing.allocator, buffer, .{ .format = .lossless }),
+    );
+}
+
+test "encodeStaticLossy counts VP8 scratch against allocation limits" {
+    const width = 32;
+    const height = 32;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @intCast(i % 256);
+
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    var pre_vp8_budget = AllocationBudget.init(.{
+        .allocation_bytes_max = std.math.maxInt(u64),
+    });
+    const pixel_count = try dims.pixelCount();
+    try pre_vp8_budget.reserveElements(vp8l_pixel.Pixel, pixel_count);
+    try pre_vp8_budget.reserveBytes(try color.yuv420AllocationBytes(width, height));
+
+    try testing.expectError(
+        error.AllocationLimitExceeded,
+        encodeStaticLossy(testing.allocator, buffer, .{
+            .format = .lossy,
+            .limits = .{ .allocation_bytes_max = pre_vp8_budget.bytes + 1 },
+        }),
+    );
+}
+
+fn encodeLossyAllocationProbe(gpa: std.mem.Allocator, buffer: image.Buffer) !void {
+    const encoded = try encodeStaticLossy(gpa, buffer, .{ .format = .lossy });
+    gpa.free(encoded);
+}
+
+test "lossy static encode survives allocation failure at every site" {
+    const width = 17; // partial macroblock exercises the padding path too
+    const height = 9;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @intCast(i % 256);
+
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    try testing.checkAllAllocationFailures(testing.allocator, encodeLossyAllocationProbe, .{buffer});
 }

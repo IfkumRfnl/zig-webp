@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-18
+Last updated: 2026-06-19
 
 ## Current Position
 
@@ -37,6 +37,21 @@ WebP files. Every synthetic source and photo round-trips bit-exactly through
 `encodeStaticLossless` and back under `zig build test`, and a committed oracle
 mode measures lossless size against `cwebp -lossless` (median 1.04x; see
 "Encode Test Corpus (pre-step-8 harness)" and the 2026-06-18 oracle row).
+
+The VP8 lossy encoder (step 8) is now underway, with its first slice — step 8a,
+a valid-bitstream baseline — delivered. `src/vp8/encoder.zig` emits a `VP8 ` key
+frame with a deliberately fixed all-DC mode decision (16x16 DC luma, 8x8 DC
+chroma, loop filter off, default coefficient probabilities, one token
+partition), built on a forward RGB→YUV420 converter (`color.zig`), forward
+DCT/WHT (`vp8/forward_transform.zig`), forward quantization (`vp8/quant.zig`),
+and coefficient token coding (`vp8/tokens.zig`). The encoder reconstructs each
+macroblock through the same inverse routines the decoder uses, so a conforming
+decoder reproduces its reconstruction bit-for-bit at the YUV layer — the step 8a
+gate, enforced under `zig build test` across the synthetic matrix (including the
+transparent-RGB case) and the photos. Locally `dwebp` decodes all 135 encoded
+still files without error (see "Step 8 — VP8 Lossy Encoder (slice 8a)" and the
+2026-06-19 oracle row). Quality (real mode decision and the PSNR gate) is step
+8b; alpha and presets are step 8c.
 
 ## Cross-Cutting Practices
 
@@ -82,6 +97,62 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 8 — VP8 Lossy Encoder (slice 8a)
+
+The first VP8 lossy encoder slice emits a valid `VP8 ` key-frame bitstream with
+a deliberately fixed mode decision; real mode decision and quality are step 8b.
+The correctness rule is self-consistency: the encoder reconstructs every
+macroblock through the same inverse routines the decoder uses, so a conforming
+decoder reproduces the stored reconstruction bit-for-bit. New and changed code:
+
+- `src/color.zig` gains the forward RGB→YUV420 conversion (BT.601 with libwebp's
+  `VP8RGBToY/U/V` coefficients, a 2x2 chroma box-average, and edge-replicated
+  macroblock padding). Color comes from raw RGB regardless of alpha, so a fully
+  transparent pixel keeps its hidden color — the transparent-RGB case 8a must
+  handle exactly.
+- `src/vp8/forward_transform.zig` is the encode pair of `transform.zig`: a
+  forward 4x4 DCT and forward WHT, locked by round-trip unit tests against the
+  inverse routines before anything depends on them.
+- `src/vp8/quant.zig` gains forward quantization (a bias-toward-zero quantizer
+  reusing the existing dequant tables, with a matching dequantize helper) and a
+  monotone quality→quantizer-index map.
+- `src/vp8/tokens.zig`, `src/vp8/modes.zig`, and `src/vp8/frame_header.zig`
+  promote their previously test-only encode mirrors to production: coefficient
+  token emission (`writeBlock` / `writeMacroblock`), key-frame mode writing
+  (`encodeKeyFrameModes`), and the compressed first-partition header writer —
+  each the exact inverse of the corresponding parser, sharing its tables so the
+  halves cannot drift.
+- `src/vp8/encoder.zig` orchestrates the per-macroblock raster loop: DC-predict
+  from reconstructed neighbors, forward-transform the residual, quantize,
+  reconstruct through the shared inverse routines, and emit the quantized levels
+  as tokens. It writes partition 0 (compressed header + all-DC mode records) and
+  the single token partition, then assembles the frame with the back-patched
+  first-partition size.
+- The public API gains `encodeLossy` / `encodeStaticLossy` (typed pixel buffer →
+  muxed `VP8 ` WebP file; alpha is dropped until 8c) and `encodeVP8Bitstream`
+  (raw VP8 payload), wired through `src/encode.zig` and `src/root.zig`.
+- `encodeStaticLossy` now accounts for its ARGB copy, YUV source/reconstruction
+  planes, VP8 partition/token scratch, raw VP8 bitstream, and final mux output
+  against `EncoderOptions.limits.allocation_bytes_max` before large scratch
+  buffers are allocated.
+
+Validity and the self-consistency gate run under `zig build test`:
+`src/testing/encode_corpus.zig` encodes every synthetic source and committed
+photo through the low-level encoder, decodes the result, and asserts the
+decoder's YUV planes equal the encoder's reconstruction byte-for-byte; the
+smooth photos and a flat fully-transparent field additionally clear an RGB PSNR
+floor, and the public `encodeStaticLossy`+`decodeStatic` path round-trips at the
+source dimensions. New tooling: `zig build encode-lossy-report` reports size,
+bits-per-pixel, and luma PSNR per source, `zig build encode-lossy` re-encodes a
+WebP as lossy, and `tools/webp-oracle.sh compare-encode-lossy` feeds every
+encoded file to `dwebp` for the external validity check and pairs sizes against
+`cwebp -q -noalpha` (matching step 8a's alpha-dropping behavior). Deep encoder
+fuzzing and allocation-failure depth stay deferred to step 11, though the public
+path already passes `checkAllAllocationFailures`.
+The lossy oracle fails on still-image encode errors, reference-tool failures,
+and empty validation sets; only animated files are skipped after `webpinfo`
+classification.
 
 ### Encode Test Corpus (pre-step-8 harness)
 
@@ -436,6 +507,8 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-16 | VP8L transform encoder (slice 2) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with LZ77 + the decision-gated subtract-green/color/predictor/palette transforms and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) also decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0986x (37/43 files at or below 1.10x; range 0.92x–1.63x), aggregate-bytes ratio 1.044x. Size is reported, not yet hard-gated; the worst cases are small/synthetic vector images where cwebp's entropy-image and color-cache machinery (slice 3) wins. |
 | 2026-06-16 | VP8L entropy encoder (slice 3) round-trip + size vs `cwebp -lossless` | All 43 still VP8L files in `testdata/libwebp-test-data` re-encode with the slice-2 transforms plus the optional color cache and optional entropy-image/multiple-Huffman-groups, each chosen by measuring the real encoded size, and decode back bit-exactly to the source RGBA via this library's decoder (committed corpus round-trip test, runs under `zig build test`). Locally `dwebp` (libwebp 1.5.0) decodes all 43 re-encoded files to pixels byte-identical to the originals (full corpus cross-check, 0 mismatches). Size vs `cwebp -lossless` (cwebp 1.5.0, default settings, same decoded source pixels): per-file median ratio 1.0368x (37/43 files at or below 1.10x; range 0.92x–1.59x), and no file is larger than the slice-2 encoding (the measure-by-encoding selection only keeps genuine wins). The remaining files above 1.10x are the photographic `lossless1`–`lossless4` / `lossless_color_transform` / `near_lossless_75`, which need per-block predictor selection (a later refinement) to close the gap. The 1.10x median size gate for step 7 holds against `cwebp` on this corpus; the PNG comparison is not yet recorded. |
 | 2026-06-18 | Encode test corpus round-trip + lossless size vs `cwebp -lossless` | New pre-step-8 harness. Round-trip (CI gate, runs under `zig build test`): all 30 synthetic sources (macroblock-edge dimensions × content × alpha) and the 4 committed CC0 photos (512px) re-encode through `encodeStaticLossless` and decode back bit-exactly, 0 mismatches; the 43 in-tree lossless files stay covered by the existing corpus round-trip test. Size (reported, via `tools/webp-oracle.sh compare-encode-corpus`) over 47 real-image files (43 in-tree lossless + 4 photos), `cwebp -lossless` (libwebp 1.5.0), identical decoded source pixels: per-file median ratio 1.0368x, aggregate 1.046x (range 0.92x–1.59x; the 4 photos 1.05x–1.18x). Confirms the step-7 1.10x median gate on the now-defined encode corpus. |
+
+| 2026-06-19 | VP8 lossy encoder (slice 8a) round-trip + validity vs `dwebp`/`cwebp` | New baseline encoder. Self-consistency (CI gate, runs under `zig build test`): the decoder reproduces the encoder's reconstruction byte-for-byte at the YUV layer for all 30 synthetic sources (every macroblock geometry × content × alpha, including the transparent-RGB case) and the 4 committed photos; the public `encodeStaticLossy`+`decodeStatic` path round-trips at the source dimensions. Validity (`tools/webp-oracle.sh compare-encode-lossy`, libwebp 1.5.0): `dwebp` decodes all 135 encoded still files (4 photos + 131 in-tree corpus stills, lossless and lossy sources re-encoded) without error — 0 failures. Quality (reported, not gated): mean BT.601 luma PSNR 37.1 dB over the 34-source report at q75 (photos 34.7–40.8 dB); encoded size median 1.17x and aggregate 1.464x vs `cwebp -q 75 -noalpha` — a DC-only baseline with no rate-distortion, to be closed by step 8b. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

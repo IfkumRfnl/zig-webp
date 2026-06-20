@@ -10,6 +10,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const bool_reader = @import("bool_reader.zig");
+const bool_writer = @import("bool_writer.zig");
 const errors = @import("../errors.zig");
 const image = @import("../image.zig");
 const token_probs = @import("token_probs.zig");
@@ -322,11 +323,11 @@ fn readFlaggedSignedValue(reader: *bool_reader.BoolReader, bit_count: u6) Error!
     return 0;
 }
 
-// --- Test helpers -----------------------------------------------------------
+// --- Key-frame header encoding (the inverse of the parsing above) -----------
 
-const bool_writer = @import("bool_writer.zig");
-
-fn writeFrameTag(out: *[frame_tag_byte_count]u8, first_partition_size: u32) void {
+/// Writes the 3-byte uncompressed frame tag for a shown key frame (version 0).
+/// `first_partition_size` is the byte length of the compressed first partition.
+pub fn writeFrameTag(out: *[frame_tag_byte_count]u8, first_partition_size: u32) void {
     assert(first_partition_size <= first_partition_size_max);
 
     // Key frame (bit 0 clear), version 0, show_frame set.
@@ -336,7 +337,9 @@ fn writeFrameTag(out: *[frame_tag_byte_count]u8, first_partition_size: u32) void
     out[2] = @truncate(bits >> 16);
 }
 
-fn writePictureHeader(out: *[picture_header_byte_count]u8, width: u16, height: u16) void {
+/// Writes the 7-byte uncompressed picture header (start code + 14-bit
+/// dimensions, no upscaling). Inverse of `parsePictureHeader`.
+pub fn writePictureHeader(out: *[picture_header_byte_count]u8, width: u16, height: u16) void {
     assert(width <= dimension_limit);
     assert(height <= dimension_limit);
 
@@ -347,7 +350,10 @@ fn writePictureHeader(out: *[picture_header_byte_count]u8, width: u16, height: u
     out[6] = @truncate(height >> 8);
 }
 
-fn writeDefaultCoefficientProbabilities(writer: *bool_writer.BoolWriter) Error!void {
+/// Emits the "no update" bit for every coefficient-probability cell, leaving
+/// the decoder on the RFC default table. Inverse of
+/// `parseCoefficientProbabilities` when no updates are coded.
+pub fn writeDefaultCoefficientProbabilities(writer: *bool_writer.BoolWriter) Error!void {
     for (token_probs.update_probabilities) |plane| {
         for (plane) |band| {
             for (band) |context| {
@@ -359,24 +365,56 @@ fn writeDefaultCoefficientProbabilities(writer: *bool_writer.BoolWriter) Error!v
     }
 }
 
-fn writeMinimalCompressedHeader(writer: *bool_writer.BoolWriter) Error!void {
+/// Knobs for the compressed first-partition header. The step 8a baseline keeps
+/// segmentation off, one token partition, default coefficient probabilities,
+/// and skip coding disabled; only the loop filter and quantizer vary.
+pub const CompressedHeaderOptions = struct {
+    simple_filter: bool = false,
+    filter_level: u6 = 0,
+    sharpness: u3 = 0,
+    y_ac_quant_index: u8 = 0,
+    refresh_entropy_probs: bool = false,
+};
+
+/// Writes the compressed first-partition header (color space through
+/// mb_no_skip_coeff) in the exact order `parse` reads it back. Segmentation,
+/// loop-filter deltas, and the five per-plane quantizer deltas are all
+/// disabled; the coefficient probabilities stay at the RFC defaults.
+pub fn writeCompressedHeader(
+    writer: *bool_writer.BoolWriter,
+    options: CompressedHeaderOptions,
+) Error!void {
+    assert(options.y_ac_quant_index <= 127);
+
     try writer.writeBit(0); // Color space: YUV as specified.
     try writer.writeBit(0); // Clamping: spec-required pixel clamping.
     try writer.writeBit(0); // Segmentation disabled.
-    try writer.writeBit(1); // Simple loop filter.
-    try writer.writeLiteral(26, 6); // Loop filter level.
-    try writer.writeLiteral(3, 3); // Sharpness.
+    try writer.writeBit(@intFromBool(options.simple_filter));
+    try writer.writeLiteral(options.filter_level, 6);
+    try writer.writeLiteral(options.sharpness, 3);
     try writer.writeBit(0); // Loop filter deltas disabled.
     try writer.writeLiteral(0, 2); // One token partition.
-    try writer.writeLiteral(64, 7); // y_ac quantizer index.
+    try writer.writeLiteral(options.y_ac_quant_index, 7);
     try writer.writeBit(0); // No y_dc delta.
     try writer.writeBit(0); // No y2_dc delta.
     try writer.writeBit(0); // No y2_ac delta.
     try writer.writeBit(0); // No uv_dc delta.
     try writer.writeBit(0); // No uv_ac delta.
-    try writer.writeBit(1); // refresh_entropy_probs.
+    try writer.writeBit(@intFromBool(options.refresh_entropy_probs));
     try writeDefaultCoefficientProbabilities(writer);
-    try writer.writeBit(0); // mb_no_coeff_skip disabled.
+    try writer.writeBit(0); // mb_no_skip_coeff disabled.
+}
+
+// --- Test helpers -----------------------------------------------------------
+
+fn writeMinimalCompressedHeader(writer: *bool_writer.BoolWriter) Error!void {
+    try writeCompressedHeader(writer, .{
+        .simple_filter = true,
+        .filter_level = 26,
+        .sharpness = 3,
+        .y_ac_quant_index = 64,
+        .refresh_entropy_probs = true,
+    });
 }
 
 fn assemblePayload(
