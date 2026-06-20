@@ -398,9 +398,12 @@ auditable:
    coded-coefficient penalty). The self-consistency and `dwebp` validity gates
    still hold and every photo improves in both PSNR and size over 8a; see the
    2026-06-20 oracle row.
-2. **8b-2 (next).** Add B_PRED (per-subblock 4x4 luma intra) to the mode
-   decision, with proper VP8 token-cost estimation so the 16x16-vs-B_PRED choice
-   is rate-accurate.
+2. **8b-2.** Add B_PRED (per-subblock 4x4 luma intra) with proper VP8 token-cost
+   estimation so the 16x16-vs-B_PRED choice is rate-accurate. Split into:
+   **8b-2a (delivered)** — a token bit-cost model (`src/vp8/cost.zig`,
+   `tokens.blockCost`) replacing the nonzero-count rate proxy in the existing
+   16x16/chroma decision (2026-06-20 oracle row); and **8b-2b (next)** — B_PRED
+   itself, scored against the 16x16 modes with that cost model.
 3. **8b-3.** Add segmentation, skip decisions, and loop-filter level selection,
    gating on the matched-size luma-PSNR target in step 8b above.
 4. Then step 8c: method/quality presets, target-size and target-PSNR modes,

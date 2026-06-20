@@ -147,7 +147,7 @@ pub fn encodeAlloc(
         while (column < grid.columns) : (column += 1) {
             var levels = tokens.MacroblockLevels{};
             const macroblock = &macroblocks[row * grid.columns + column];
-            encodeMacroblock(source, &reconstruction, &factors, column, row, &levels, macroblock);
+            encodeMacroblock(source, &reconstruction, &factors, &header.coefficient_probabilities, column, row, &levels, macroblock);
             _ = try tokens.writeMacroblock(
                 &token_writer,
                 token_options,
@@ -248,27 +248,28 @@ fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_head
 const luma_mode_candidates = [_]modes.LumaMode{ .dc, .vertical, .horizontal, .true_motion };
 const chroma_mode_candidates = [_]modes.ChromaMode{ .dc, .vertical, .horizontal, .true_motion };
 
-// Lagrange weight tying the coded-coefficient penalty to the quantizer: a
-// coarser step (larger AC factor) makes each saved coefficient worth more
-// distortion, so the decision drops marginal coefficients at low quality and
-// keeps them at high quality. The multiplier was chosen by measuring size and
-// luma PSNR over the encode corpus (see the step 8b-1 PROGRESS row).
-const rd_rate_weight = 1;
+// Rate-distortion Lagrange multiplier, in units of SSE distortion per coded
+// bit. High-rate RD theory makes the optimal multiplier scale with the square
+// of the quantizer step, which the AC dequant factor stands in for; the scale
+// constant was chosen by measuring size and luma PSNR over the encode corpus
+// (see the step 8b-2a PROGRESS row). `lambdaFor` returns SSE per bit; the cost
+// then divides the 1/256-bit rate back down to bits.
+const rd_lambda_scale = 3;
 
-fn lambdaFor(ac_factor: u16) u32 {
-    return @as(u32, ac_factor) * rd_rate_weight;
+fn lambdaFor(ac_factor: u16) u64 {
+    return (@as(u64, ac_factor) * ac_factor * rd_lambda_scale) / 1024;
 }
 
 /// Rate-distortion terms for one candidate reconstruction. `distortion` is the
-/// sum of squared reconstruction errors over the block; `rate` is the count of
-/// nonzero quantized coefficients, a cheap monotone proxy for coded token bits
-/// (precise token costing is a later refinement).
+/// sum of squared reconstruction errors over the block; `rate` is the estimated
+/// coded-token cost in 1/256-bit units (`tokens.blockCost`), so the cost divides
+/// it by 256 to weigh real bits against distortion.
 const Rd = struct {
     distortion: u64,
     rate: u32,
 
-    fn cost(self: Rd, lambda: u32) u64 {
-        return self.distortion + @as(u64, lambda) * self.rate;
+    fn cost(self: Rd, lambda: u64) u64 {
+        return self.distortion + (lambda * self.rate) / 256;
     }
 };
 
@@ -279,13 +280,14 @@ fn encodeMacroblock(
     source: *const color.YuvPlanes,
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
     macroblock: *modes.Macroblock,
 ) void {
-    const luma_mode = selectLuma(source, recon, factors, mb_column, mb_row, levels);
-    const chroma_mode = selectChroma(source, recon, factors, mb_column, mb_row, levels);
+    const luma_mode = selectLuma(source, recon, factors, probabilities, mb_column, mb_row, levels);
+    const chroma_mode = selectChroma(source, recon, factors, probabilities, mb_column, mb_row, levels);
     macroblock.* = .{
         .segment_id = 0,
         .skip = false,
@@ -339,6 +341,7 @@ fn selectLuma(
     source: *const color.YuvPlanes,
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
@@ -381,6 +384,7 @@ fn selectLuma(
             above_left,
             edges,
             factors,
+            probabilities,
             &block,
             &luma_levels,
             &y2_levels,
@@ -416,6 +420,7 @@ fn reconstructLuma16(
     above_left: u8,
     edges: prediction.EdgePresence,
     factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
     out_block: *[luma_pixels]u8,
     out_luma: *[luma_block][coeff_count]i16,
     out_y2: *[coeff_count]i16,
@@ -451,11 +456,6 @@ fn reconstructLuma16(
     var reconstructed_dcs: [coeff_count]i16 = undefined;
     transform.inverseWalshHadamard(&y2_dequant, &reconstructed_dcs);
 
-    var rate: u32 = 0;
-    for (out_y2) |level| {
-        if (level != 0) rate += 1;
-    }
-
     for (0..luma_block) |sub| {
         const sub_x = (sub % 4) * 4;
         const sub_y = (sub / 4) * 4;
@@ -465,7 +465,6 @@ fn reconstructLuma16(
         for (1..coeff_count) |p| {
             level[p] = quant.quantizeCoefficient(subblock_coeffs[sub][p], factors.y1_ac);
             dequant[p] = quant.dequantize(level[p], factors.y1_ac);
-            if (level[p] != 0) rate += 1;
         }
         out_luma[sub] = level;
         // Skip the inverse DCT of an all-zero block exactly as the decoder does;
@@ -473,6 +472,14 @@ fn reconstructLuma16(
         if (blockHasNonzero(&dequant)) {
             transform.addInverseDct(&dequant, out_block[sub_y * luma_block + sub_x ..], luma_block);
         }
+    }
+
+    // Rate: estimated token bits for the Y2 block plus the sixteen luma blocks
+    // (coded after Y2, so first_position 1). A fixed nonzero context (0) is used
+    // for the per-mode comparison; live left/above context is a later refinement.
+    var rate: u32 = tokens.blockCost(&probabilities[tokens.plane_y2], 0, 0, out_y2);
+    for (out_luma) |*block| {
+        rate += tokens.blockCost(&probabilities[tokens.plane_y_after_y2], 0, 1, block);
     }
 
     return .{ .distortion = sumSquaredError(src, out_block), .rate = rate };
@@ -484,6 +491,7 @@ fn selectChroma(
     source: *const color.YuvPlanes,
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
@@ -524,8 +532,8 @@ fn selectChroma(
         var v_block: [chroma_pixels]u8 = undefined;
         var u_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
         var v_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
-        const rd_u = reconstructChroma8(mode, &u_src, &u_above, &u_left, u_corner, edges, factors.uv_dc, factors.uv_ac, &u_block, &u_levels);
-        const rd_v = reconstructChroma8(mode, &v_src, &v_above, &v_left, v_corner, edges, factors.uv_dc, factors.uv_ac, &v_block, &v_levels);
+        const rd_u = reconstructChroma8(mode, &u_src, &u_above, &u_left, u_corner, edges, factors, probabilities, &u_block, &u_levels);
+        const rd_v = reconstructChroma8(mode, &v_src, &v_above, &v_left, v_corner, edges, factors, probabilities, &v_block, &v_levels);
         const combined = Rd{ .distortion = rd_u.distortion + rd_v.distortion, .rate = rd_u.rate + rd_v.rate };
         const cost = combined.cost(lambda);
         if (cost < best_cost) {
@@ -556,8 +564,8 @@ fn reconstructChroma8(
     left: *const [chroma_block]u8,
     above_left: u8,
     edges: prediction.EdgePresence,
-    dc_factor: u16,
-    ac_factor: u16,
+    factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
     out_block: *[chroma_pixels]u8,
     out_levels: *[tokens.chroma_block_count][coeff_count]i16,
 ) Rd {
@@ -579,16 +587,15 @@ fn reconstructChroma8(
 
         var level: [coeff_count]i16 = @splat(0);
         var dequant: [coeff_count]i16 = @splat(0);
-        level[0] = quant.quantizeCoefficient(coeffs[0], dc_factor);
-        dequant[0] = quant.dequantize(level[0], dc_factor);
+        level[0] = quant.quantizeCoefficient(coeffs[0], factors.uv_dc);
+        dequant[0] = quant.dequantize(level[0], factors.uv_dc);
         for (1..coeff_count) |p| {
-            level[p] = quant.quantizeCoefficient(coeffs[p], ac_factor);
-            dequant[p] = quant.dequantize(level[p], ac_factor);
+            level[p] = quant.quantizeCoefficient(coeffs[p], factors.uv_ac);
+            dequant[p] = quant.dequantize(level[p], factors.uv_ac);
         }
         out_levels[sub] = level;
-        for (level) |coded| {
-            if (coded != 0) rate += 1;
-        }
+        // Estimated token bits for this chroma block (fixed nonzero context 0).
+        rate += tokens.blockCost(&probabilities[tokens.plane_chroma], 0, 0, &level);
         // Same all-zero-block skip as the luma path and the decoder.
         if (blockHasNonzero(&dequant)) {
             transform.addInverseDct(&dequant, out_block[sub_y * chroma_block + sub_x ..], chroma_block);

@@ -15,6 +15,7 @@ const assert = std.debug.assert;
 
 const bool_reader = @import("bool_reader.zig");
 const bool_writer = @import("bool_writer.zig");
+const cost = @import("cost.zig");
 const errors = @import("../errors.zig");
 const quant = @import("quant.zig");
 const token_probs = @import("token_probs.zig");
@@ -460,6 +461,127 @@ pub fn writeBlock(
 
     try writeBlockTokens(writer, plane_probabilities, first_context, first_position, values[0..len]);
     return first_position + @as(u8, @intCast(len));
+}
+
+/// Estimated cost, in 1/256-bit units, of coding one 4x4 block's quantized
+/// `levels` with `writeBlock`. Mirrors `writeBlock`/`writeBlockTokens`/
+/// `writeLargeValue` token-for-token, summing `cost.boolCost` instead of
+/// emitting, so it is the exact ideal bit cost of that coding (the arithmetic
+/// coder's emitted bytes differ only by rounding). The encoder's
+/// rate-distortion mode decision sums these over a macroblock's blocks.
+pub fn blockCost(
+    plane_probabilities: *const [token_probs.band_count][token_probs.context_count][token_probs.probability_count]u8,
+    first_context: u2,
+    first_position: u8,
+    levels: *const [coefficient_count]i16,
+) u32 {
+    assert(first_position <= 1);
+    assert(first_context <= 2);
+
+    var values: [coefficient_count]i32 = undefined;
+    var len: usize = 0;
+    var position: usize = first_position;
+    while (position < coefficient_count) : (position += 1) {
+        const level: i32 = levels[zigzag[position]];
+        values[position - first_position] = level;
+        if (level != 0) len = position - first_position + 1;
+    }
+
+    return blockTokensCost(plane_probabilities, first_context, first_position, values[0..len]);
+}
+
+// Cost mirror of `writeBlockTokens`: same control flow, `cost.boolCost` in
+// place of every `writeBool` and `cost.bit_cost` for the equiprobable sign bit.
+fn blockTokensCost(
+    plane_probabilities: *const [token_probs.band_count][token_probs.context_count][token_probs.probability_count]u8,
+    first_context: u2,
+    first_position: u8,
+    values: []const i32,
+) u32 {
+    var bits: u32 = 0;
+    var position = first_position;
+    var probabilities = &plane_probabilities[coefficient_bands[position]][first_context];
+    var index: usize = 0;
+    var previous_was_zero = false;
+    while (index < values.len) : (index += 1) {
+        const value = values[index];
+        const magnitude: u32 = @abs(value);
+        assert(position < coefficient_count);
+
+        if (!previous_was_zero) bits += cost.boolCost(probabilities[0], 1); // Not EOB.
+        if (magnitude == 0) {
+            bits += cost.boolCost(probabilities[1], 0);
+            position += 1;
+            if (position == coefficient_count) return bits;
+            probabilities = &plane_probabilities[coefficient_bands[position]][0];
+            previous_was_zero = true;
+            continue;
+        }
+        bits += cost.boolCost(probabilities[1], 1);
+
+        var next_context: u2 = undefined;
+        if (magnitude == 1) {
+            bits += cost.boolCost(probabilities[2], 0);
+            next_context = 1;
+        } else {
+            bits += cost.boolCost(probabilities[2], 1);
+            bits += largeValueCost(probabilities, magnitude);
+            next_context = 2;
+        }
+        probabilities = &plane_probabilities[coefficient_bands[position + 1]][next_context];
+        bits += cost.bit_cost; // sign bit, equiprobable
+        position += 1;
+        previous_was_zero = false;
+    }
+    if (position < coefficient_count) {
+        assert(!previous_was_zero);
+        bits += cost.boolCost(probabilities[0], 0); // EOB.
+    }
+    return bits;
+}
+
+// Cost mirror of `writeLargeValue`.
+fn largeValueCost(probabilities: *const [token_probs.probability_count]u8, magnitude: u32) u32 {
+    assert(magnitude >= 2);
+    assert(magnitude <= value_max);
+
+    var bits: u32 = 0;
+    if (magnitude <= 4) {
+        bits += cost.boolCost(probabilities[3], 0);
+        if (magnitude == 2) {
+            bits += cost.boolCost(probabilities[4], 0);
+            return bits;
+        }
+        bits += cost.boolCost(probabilities[4], 1);
+        bits += cost.boolCost(probabilities[5], @intCast(magnitude - 3));
+        return bits;
+    }
+    bits += cost.boolCost(probabilities[3], 1);
+    if (magnitude <= 10) {
+        bits += cost.boolCost(probabilities[6], 0);
+        if (magnitude <= 6) {
+            bits += cost.boolCost(probabilities[7], 0);
+            bits += cost.boolCost(category1_probabilities[0], @intCast(magnitude - 5));
+            return bits;
+        }
+        bits += cost.boolCost(probabilities[7], 1);
+        const residual = magnitude - 7;
+        bits += cost.boolCost(category2_probabilities[0], @intCast(residual >> 1));
+        bits += cost.boolCost(category2_probabilities[1], @intCast(residual & 1));
+        return bits;
+    }
+    bits += cost.boolCost(probabilities[6], 1);
+    const category: u5 = if (magnitude <= 18) 0 else if (magnitude <= 34) 1 else if (magnitude <= 66) 2 else 3;
+    bits += cost.boolCost(probabilities[8], @intCast(category >> 1));
+    bits += cost.boolCost(probabilities[9 + (category >> 1)], @intCast(category & 1));
+    const extra_probabilities = large_category_probabilities[category];
+    const residual = magnitude - 3 - (@as(u32, 8) << category);
+    var bit_index: usize = extra_probabilities.len;
+    for (extra_probabilities) |probability| {
+        bit_index -= 1;
+        bits += cost.boolCost(probability, @intCast((residual >> @intCast(bit_index)) & 1));
+    }
+    return bits;
 }
 
 /// Quantized coefficient levels of one macroblock in raster order, the encode
@@ -1086,4 +1208,36 @@ test "writeMacroblock round-trips raster levels through decodeMacroblock" {
     try std.testing.expectEqual(read_left, write_left);
     try std.testing.expectEqual(read_above, write_above);
     try std.testing.expectEqual(@as(u32, 0x6), try reader.readLiteral(4));
+}
+
+test "blockCost mirrors token structure and grows with coefficient magnitude" {
+    const probs = &token_probs.default_probabilities[plane_y_no_y2];
+
+    var empty: [coefficient_count]i16 = @splat(0);
+    var one: [coefficient_count]i16 = @splat(0);
+    one[0] = 1;
+    var big: [coefficient_count]i16 = @splat(0);
+    big[0] = 100;
+    var many: [coefficient_count]i16 = @splat(3);
+
+    const c_empty = blockCost(probs, 0, 0, &empty);
+    const c_one = blockCost(probs, 0, 0, &one);
+    const c_big = blockCost(probs, 0, 0, &big);
+    const c_many = blockCost(probs, 0, 0, &many);
+
+    // An empty block is exactly one end-of-block boolean at band 0, context 0.
+    try std.testing.expectEqual(cost.boolCost(probs[0][0][0], 0), c_empty);
+    // Any coefficient costs more; a larger one costs more than a unit one; a
+    // full block of coefficients costs most.
+    try std.testing.expect(c_empty < c_one);
+    try std.testing.expect(c_one < c_big);
+    try std.testing.expect(c_big < c_many);
+
+    // first_position 1 (luma after Y2) skips the DC position entirely, so a
+    // block whose only nonzero is at raster position 0 costs just an EOB — and
+    // that EOB is read at band coefficient_bands[1], not band 0.
+    try std.testing.expectEqual(
+        cost.boolCost(probs[coefficient_bands[1]][0][0], 0),
+        blockCost(probs, 0, 1, &one),
+    );
 }
