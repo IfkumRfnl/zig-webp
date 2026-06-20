@@ -398,14 +398,14 @@ auditable:
    coded-coefficient penalty). The self-consistency and `dwebp` validity gates
    still hold and every photo improves in both PSNR and size over 8a; see the
    2026-06-20 oracle row.
-2. **8b-2.** Add B_PRED (per-subblock 4x4 luma intra) with proper VP8 token-cost
-   estimation so the 16x16-vs-B_PRED choice is rate-accurate. Split into:
-   **8b-2a (delivered)** — a token bit-cost model (`src/vp8/cost.zig`,
-   `tokens.blockCost`) replacing the nonzero-count rate proxy in the existing
-   16x16/chroma decision (2026-06-20 oracle row); and **8b-2b (next)** — B_PRED
-   itself, scored against the 16x16 modes with that cost model.
-3. **8b-3.** Add segmentation, skip decisions, and loop-filter level selection,
-   gating on the matched-size luma-PSNR target in step 8b above.
+2. **8b-2 (delivered).** B_PRED (per-subblock 4x4 luma intra) with proper VP8
+   token-cost estimation so the 16x16-vs-B_PRED choice is rate-accurate.
+   Delivered in two slices: **8b-2a** — a token bit-cost model (`src/vp8/cost.zig`,
+   `tokens.blockCost`) replacing the nonzero-count rate proxy; and **8b-2b** —
+   B_PRED itself, scored against the 16x16 modes with that cost model
+   (+1.5 dB at −6.6% bytes on the photo corpus; 2026-06-20 oracle rows).
+3. **8b-3 (next).** Add segmentation, skip decisions, and loop-filter level
+   selection, gating on the matched-size luma-PSNR target in step 8b above.
 4. Then step 8c: method/quality presets, target-size and target-PSNR modes,
    sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
 
