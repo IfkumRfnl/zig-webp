@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const bool_reader = @import("bool_reader.zig");
+const bool_writer = @import("bool_writer.zig");
 const errors = @import("../errors.zig");
 const frame_header = @import("frame_header.zig");
 const image = @import("../image.zig");
@@ -398,9 +399,11 @@ pub fn derivedSubblockMode(mode: LumaMode) SubblockMode {
     };
 }
 
-// --- Test helpers -----------------------------------------------------------
+// --- Mode encoding (the inverse of the key-frame mode parsing above) --------
+//
+// `writeTreeValue` and `encodeKeyFrameModes` are production code used by the VP8
+// encoder; the `testHeader` helper further down is test-only.
 
-const bool_writer = @import("bool_writer.zig");
 const token_probs = @import("token_probs.zig");
 
 const TestHeaderOptions = struct {
@@ -492,13 +495,15 @@ fn writeTreeValue(
     }
 }
 
-// Mirror of parseKeyFrameModes for round-trip tests, tracking the same
-// subblock contexts on the encoding side.
-fn encodeKeyFrameModes(
+/// Writes every macroblock prediction record of a key frame, the exact inverse
+/// of `parseKeyFrameModes`: it tracks the same above/left subblock-mode contexts
+/// so a B_PRED macroblock selects the identical probability tables the decoder
+/// will. `macroblocks` holds one entry per macroblock in raster order.
+pub fn encodeKeyFrameModes(
     writer: *bool_writer.BoolWriter,
     header: *const frame_header.Header,
     macroblocks: []const Macroblock,
-) !void {
+) Error!void {
     const grid = MacroblockGrid.init(header.picture.dimensions);
     assert(macroblocks.len == grid.macroblockCount());
 

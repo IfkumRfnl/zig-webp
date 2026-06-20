@@ -374,22 +374,28 @@ input.
 
 ## Near-Term Work Items
 
-Step 6 is closed: animated WebP decodes through `decodeAnimation` (all
-composited frames) and the streaming `AnimationDecoder`, reusing the static
-VP8/VP8L/alpha decoders per frame and compositing with the spec's
-keyframe/blend/dispose rules — byte-exact against `anim_dump` and locked by
-committed frame hashes. The `VP8X` feature-flag and extended chunk-ordering
-rules were already enforced by strict demux, and metadata extraction works for
-still and animated files via the demux result. Next is step 7 (VP8L lossless
-encoder):
+Steps 0 through 7 are complete and the VP8 lossy encoder (step 8) is underway.
+Step 7 (VP8L lossless encoder) met both gates: every encode-corpus image
+round-trips bit-exactly and the median compressed size is 1.04x
+`cwebp -lossless` (see `PROGRESS.MD`). Its optional near-lossless preprocessing
+was not implemented — it is a quality refinement, not a gate — and remains
+available as future work.
 
-1. Mux still VP8L images, then build the VP8L bit writer and canonical Huffman
-   writer with basic literal output.
-2. Add LZ77 matches, the subtract-green transform, and palette/predictor/color
-   transforms.
-3. Add entropy image / multiple Huffman groups, then optional color cache and
-   near-lossless preprocessing, gating on the validity and size targets in
-   step 7 above.
+Step 8a (the valid-bitstream baseline) is delivered: `src/vp8/encoder.zig` emits
+a `VP8 ` key frame with a fixed all-DC mode decision on top of forward RGB→YUV420
+conversion, forward DCT/WHT, forward quantization, and coefficient token coding.
+Every encode-corpus image decodes without error through both this library's
+decoder and `dwebp`, and the decoder reproduces the encoder's own reconstruction
+bit-for-bit at the YUV layer (the step 8a gate; see `PROGRESS.MD` and the
+2026-06-19 oracle row). Next is step 8b (quality):
+
+1. Replace the fixed mode decision with real per-macroblock intra mode selection
+   (16x16 vs B_PRED, plus the chroma mode) scored by rate-distortion, with token
+   cost estimation.
+2. Add segmentation, skip decisions, and loop-filter level selection, gating on
+   the matched-size luma-PSNR target in step 8b above.
+3. Then step 8c: method/quality presets, target-size and target-PSNR modes,
+   sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
 
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.

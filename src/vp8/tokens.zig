@@ -14,6 +14,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const bool_reader = @import("bool_reader.zig");
+const bool_writer = @import("bool_writer.zig");
 const errors = @import("../errors.zig");
 const quant = @import("quant.zig");
 const token_probs = @import("token_probs.zig");
@@ -327,13 +328,15 @@ fn readLargeValue(
     return value + 3 + (@as(u32, 8) << category);
 }
 
-// --- Test helpers -----------------------------------------------------------
+// --- Token encoding (the bit-exact inverse of the decoding above) -----------
+//
+// The encoder emits coefficient tokens through the boolean writer in the exact
+// structure decodeBlock/decodeMacroblock read them back, sharing the band,
+// zigzag, and category tables so the two halves cannot drift.
 
-const bool_writer = @import("bool_writer.zig");
-
-// Encoding mirror of decodeBlock for round-trip tests. Values are the
-// pre-dequantization token magnitudes with sign, in decode (zigzag) order,
-// terminated by EOB unless position 16 is reached.
+// Emits a block's scan-order signed coefficient values (already trimmed to the
+// last nonzero) as tokens: pre-dequantization magnitudes with sign, in decode
+// (zigzag) order, terminated by EOB unless position 16 is reached.
 fn writeBlockTokens(
     writer: *bool_writer.BoolWriter,
     plane_probabilities: *const [token_probs.band_count][token_probs.context_count][token_probs.probability_count]u8,
@@ -426,6 +429,126 @@ fn writeLargeValue(
         bit_index -= 1;
         try writer.writeBool(probability, @intCast((residual >> @intCast(bit_index)) & 1));
     }
+}
+
+/// Emits one 4x4 block's coefficient tokens from quantized `levels` in raster
+/// order (`levels[p]` is the signed level at raster position p). Position 0 is
+/// skipped when `first_position == 1` (luma blocks that carry their DC in Y2).
+/// Returns the end-of-block position exactly as `decodeBlock` would report it,
+/// so the caller derives the nonzero context the decoder will derive. Inverse
+/// of `decodeBlock`.
+pub fn writeBlock(
+    writer: *bool_writer.BoolWriter,
+    plane_probabilities: *const [token_probs.band_count][token_probs.context_count][token_probs.probability_count]u8,
+    first_context: u2,
+    first_position: u8,
+    levels: *const [coefficient_count]i16,
+) Error!u8 {
+    assert(first_position <= 1);
+    assert(first_context <= 2);
+
+    // Reorder raster levels into scan order, tracking the last nonzero so the
+    // tail of zeros is dropped (an EOB stands in for it).
+    var values: [coefficient_count]i32 = undefined;
+    var len: usize = 0;
+    var position: usize = first_position;
+    while (position < coefficient_count) : (position += 1) {
+        const level: i32 = levels[zigzag[position]];
+        values[position - first_position] = level;
+        if (level != 0) len = position - first_position + 1;
+    }
+
+    try writeBlockTokens(writer, plane_probabilities, first_context, first_position, values[0..len]);
+    return first_position + @as(u8, @intCast(len));
+}
+
+/// Quantized coefficient levels of one macroblock in raster order, the encode
+/// counterpart of `MacroblockCoefficients` (which holds dequantized values).
+pub const MacroblockLevels = struct {
+    y2: [coefficient_count]i16 = @splat(0),
+    luma: [luma_block_count][coefficient_count]i16 = @splat(@splat(0)),
+    chroma_u: [chroma_block_count][coefficient_count]i16 = @splat(@splat(0)),
+    chroma_v: [chroma_block_count][coefficient_count]i16 = @splat(@splat(0)),
+};
+
+/// Emits all residual tokens of one macroblock, mirroring `decodeMacroblock`
+/// block-for-block: the same Y2/luma/chroma order, the same context derivation,
+/// and the same `left`/`above` nonzero updates (including the skipped-block
+/// rule). `options.factors` is unused here (levels are already quantized).
+/// Returns true when any block carries a nonzero coefficient.
+pub fn writeMacroblock(
+    writer: *bool_writer.BoolWriter,
+    options: MacroblockOptions,
+    left: *NonzeroFlags,
+    above: *NonzeroFlags,
+    levels: *const MacroblockLevels,
+) Error!bool {
+    if (options.skip) {
+        left.luma = @splat(false);
+        left.chroma_u = @splat(false);
+        left.chroma_v = @splat(false);
+        above.luma = @splat(false);
+        above.chroma_u = @splat(false);
+        above.chroma_v = @splat(false);
+        if (options.has_y2) {
+            left.y2 = false;
+            above.y2 = false;
+        }
+        return false;
+    }
+
+    var any_nonzero = false;
+
+    if (options.has_y2) {
+        const context = contextFromFlags(left.y2, above.y2);
+        const last = try writeBlock(writer, &options.probabilities[plane_y2], context, 0, &levels.y2);
+        const nonzero = last > 0;
+        left.y2 = nonzero;
+        above.y2 = nonzero;
+        any_nonzero = any_nonzero or nonzero;
+    }
+
+    const luma_plane: usize = if (options.has_y2) plane_y_after_y2 else plane_y_no_y2;
+    const luma_first: u8 = if (options.has_y2) 1 else 0;
+    for (0..4) |sub_y| {
+        for (0..4) |sub_x| {
+            const context = contextFromFlags(left.luma[sub_y], above.luma[sub_x]);
+            const last = try writeBlock(
+                writer,
+                &options.probabilities[luma_plane],
+                context,
+                luma_first,
+                &levels.luma[sub_y * 4 + sub_x],
+            );
+            const nonzero = last > luma_first;
+            left.luma[sub_y] = nonzero;
+            above.luma[sub_x] = nonzero;
+            any_nonzero = any_nonzero or nonzero;
+        }
+    }
+
+    inline for (.{ "chroma_u", "chroma_v" }) |field| {
+        for (0..2) |sub_y| {
+            for (0..2) |sub_x| {
+                const left_flags = &@field(left, field);
+                const above_flags = &@field(above, field);
+                const context = contextFromFlags(left_flags[sub_y], above_flags[sub_x]);
+                const last = try writeBlock(
+                    writer,
+                    &options.probabilities[plane_chroma],
+                    context,
+                    0,
+                    &@field(levels, field)[sub_y * 2 + sub_x],
+                );
+                const nonzero = last > 0;
+                left_flags[sub_y] = nonzero;
+                above_flags[sub_x] = nonzero;
+                any_nonzero = any_nonzero or nonzero;
+            }
+        }
+    }
+
+    return any_nonzero;
 }
 
 const test_factors = quant.Factors{
@@ -838,4 +961,129 @@ fn fuzzDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         _ = decodeMacroblock(&reader, options, &left, &above, &coefficients) catch return;
         has_y2 = !has_y2;
     }
+}
+
+// Identity dequant: with every factor 1, decodeBlock stores the transmitted
+// level unchanged, so a writeBlock/decodeBlock round-trip recovers the exact
+// raster levels and pins the production writer against the decoder.
+const unit_factors = quant.Factors{
+    .y1_dc = 1,
+    .y1_ac = 1,
+    .y2_dc = 1,
+    .y2_ac = 1,
+    .uv_dc = 1,
+    .uv_ac = 1,
+};
+
+fn testLevelsRoundTrip(
+    plane: usize,
+    first_context: u2,
+    first_position: u8,
+    levels: [coefficient_count]i16,
+    expected_last: u8,
+) !void {
+    const probabilities = &token_probs.default_probabilities[plane];
+
+    var buffer: [256]u8 = undefined;
+    var writer = bool_writer.BoolWriter.init(&buffer);
+    const written_last = try writeBlock(&writer, probabilities, first_context, first_position, &levels);
+    try writer.writeLiteral(0x9, 4); // Sentinel.
+    const encoded = try writer.finish();
+
+    var reader = bool_reader.BoolReader.init(encoded);
+    var decoded: [coefficient_count]i16 = @splat(0);
+    const decoded_last = try decodeBlock(&reader, probabilities, first_context, first_position, .{ 1, 1 }, &decoded);
+
+    try std.testing.expectEqual(expected_last, written_last);
+    try std.testing.expectEqual(expected_last, decoded_last);
+
+    // The DC (raster 0) is never transmitted when first_position == 1.
+    var expected = levels;
+    if (first_position == 1) expected[0] = 0;
+    try std.testing.expectEqual(expected, decoded);
+    try std.testing.expectEqual(@as(u32, 0x9), try reader.readLiteral(4));
+}
+
+test "writeBlock round-trips raster levels through decodeBlock" {
+    // Empty blocks: immediate EOB ends at the first position.
+    try testLevelsRoundTrip(plane_y_no_y2, 0, 0, @splat(0), 0);
+    try testLevelsRoundTrip(plane_y_after_y2, 2, 1, @splat(0), 1);
+
+    // DC plus a couple of AC coefficients (trailing zeros dropped).
+    var small: [coefficient_count]i16 = @splat(0);
+    small[zigzag[0]] = 3;
+    small[zigzag[1]] = -2;
+    small[zigzag[2]] = 1;
+    try testLevelsRoundTrip(plane_y_no_y2, 0, 0, small, 3);
+
+    // Interior zeros are coded; only the trailing run is dropped.
+    var gapped: [coefficient_count]i16 = @splat(0);
+    gapped[zigzag[0]] = 5;
+    gapped[zigzag[4]] = -7;
+    try testLevelsRoundTrip(plane_y_no_y2, 1, 0, gapped, 5);
+
+    // A nonzero at the final scan position drives last_position to 16 with no
+    // terminating EOB.
+    var full: [coefficient_count]i16 = @splat(0);
+    full[zigzag[15]] = 9;
+    try testLevelsRoundTrip(plane_chroma, 0, 0, full, 16);
+
+    // first_position == 1 ignores the DC slot entirely.
+    var after_y2: [coefficient_count]i16 = @splat(0);
+    after_y2[zigzag[0]] = 99; // dropped (DC lives in Y2)
+    after_y2[zigzag[1]] = -4;
+    try testLevelsRoundTrip(plane_y_after_y2, 1, 1, after_y2, 2);
+}
+
+test "writeMacroblock round-trips raster levels through decodeMacroblock" {
+    const options = MacroblockOptions{
+        .probabilities = &token_probs.default_probabilities,
+        .factors = &unit_factors,
+        .has_y2 = true,
+        .skip = false,
+    };
+
+    var levels = MacroblockLevels{};
+    // Y2 DC and one AC.
+    levels.y2[zigzag[0]] = -6;
+    levels.y2[zigzag[1]] = 2;
+    // Luma blocks carry AC only (DC routed through Y2): leave raster slot 0 at 0.
+    levels.luma[0][zigzag[1]] = 4;
+    levels.luma[0][zigzag[2]] = -1;
+    levels.luma[5][zigzag[3]] = 7;
+    levels.luma[15][zigzag[2]] = -35;
+    levels.chroma_u[0][zigzag[0]] = -1;
+    levels.chroma_v[2][zigzag[0]] = 19;
+
+    var buffer: [2048]u8 = undefined;
+    var writer = bool_writer.BoolWriter.init(&buffer);
+    var write_left = NonzeroFlags.zero;
+    var write_above = NonzeroFlags.zero;
+    const wrote_nonzero = try writeMacroblock(&writer, options, &write_left, &write_above, &levels);
+    try writer.writeLiteral(0x6, 4);
+    const encoded = try writer.finish();
+
+    var reader = bool_reader.BoolReader.init(encoded);
+    var read_left = NonzeroFlags.zero;
+    var read_above = NonzeroFlags.zero;
+    var decoded: MacroblockCoefficients = undefined;
+    const read_nonzero = try decodeMacroblock(&reader, options, &read_left, &read_above, &decoded);
+
+    try std.testing.expect(wrote_nonzero);
+    try std.testing.expectEqual(wrote_nonzero, read_nonzero);
+
+    // Identity dequant: decoded coefficients equal the transmitted levels.
+    try std.testing.expectEqual(levels.y2, decoded.y2.coefficients);
+    for (0..luma_block_count) |k| {
+        var expected = levels.luma[k];
+        expected[0] = 0; // luma DC never transmitted under Y2
+        try std.testing.expectEqual(expected, decoded.luma[k].coefficients);
+    }
+    try std.testing.expectEqual(levels.chroma_u[0], decoded.chroma_u[0].coefficients);
+    try std.testing.expectEqual(levels.chroma_v[2], decoded.chroma_v[2].coefficients);
+
+    // The encode and decode passes must derive identical nonzero contexts.
+    try std.testing.expectEqual(read_left, write_left);
+    try std.testing.expectEqual(read_above, write_above);
+    try std.testing.expectEqual(@as(u32, 0x6), try reader.readLiteral(4));
 }

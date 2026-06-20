@@ -121,6 +121,44 @@ fn resolveFactors(quant_indices: *const frame_header.QuantIndices, base_index: i
     };
 }
 
+/// Maximum coefficient level the token coder represents (libwebp's MAX_LEVEL).
+/// Forward quantization caps here, though valid residuals stay well below it: a
+/// 4x4 DC tops out near 2040 and dequantizes (`level * factor`) back within
+/// i16 range, so the decoder's wrapping store never actually wraps.
+pub const max_level = 2047;
+
+/// Quantizes one DCT/WHT coefficient to the signed level whose dequantization
+/// `level * factor` approximates `coeff`. `factor` is the matching dequant
+/// factor from `Factors` (DC factor for coefficient 0, AC factor otherwise), so
+/// reconstruction multiplies the same `level * factor` the decoder will. The
+/// 3/8-of-a-step additive bias rounds toward zero, favoring shorter tokens;
+/// this mirrors libwebp's baseline quantization bias. Quality (the exact bias)
+/// is refined in step 8b — correctness does not depend on it.
+pub fn quantizeCoefficient(coeff: i32, factor: u16) i16 {
+    assert(factor >= 1);
+    const q: i32 = factor;
+    const magnitude: i32 = if (coeff < 0) -coeff else coeff;
+    const level = @min(@divFloor(magnitude * 8 + 3 * q, 8 * q), max_level);
+    return @intCast(if (coeff < 0) -level else level);
+}
+
+/// Dequantizes one coefficient level the way `tokens.decodeBlock` stores it:
+/// `level * factor` truncated to a wrapping i16. The encoder uses this to build
+/// the exact reconstruction block the decoder will, so both run the shared
+/// inverse transform on identical inputs.
+pub fn dequantize(level: i16, factor: u16) i16 {
+    return @truncate(@as(i32, level) * @as(i32, factor));
+}
+
+/// Maps a 0..100 quality knob to a base AC quantizer index (0 = finest detail,
+/// 127 = coarsest). Monotone and adequate for the step 8a baseline; a
+/// perceptually tuned mapping is deferred to step 8b.
+pub fn baseQuantIndexForQuality(quality: u8) u8 {
+    const q: u32 = @min(quality, 100);
+    const index = ((100 - q) * index_max + 50) / 100;
+    return @intCast(@min(index, index_max));
+}
+
 fn lookupDc(index: i32) u16 {
     return dc_lookup[clampIndex(index)];
 }
@@ -261,4 +299,39 @@ test "applies relative and absolute segment quantizers" {
     try std.testing.expectEqual(ac_lookup[index_max], absolute_factors[2].y1_ac);
     // Negative absolute indices clamp to the bottom of the table.
     try std.testing.expectEqual(ac_lookup[0], absolute_factors[3].y1_ac);
+}
+
+test "quantizeCoefficient is sign-symmetric and dequantizes within i16" {
+    try std.testing.expectEqual(@as(i16, 0), quantizeCoefficient(0, 4));
+
+    // A coefficient one factor in size rounds to level 1 (8/8 > 3/8 bias).
+    try std.testing.expectEqual(@as(i16, 1), quantizeCoefficient(40, 40));
+    try std.testing.expectEqual(@as(i16, -1), quantizeCoefficient(-40, 40));
+
+    // The 3/8 additive bias rounds up only past 0.625 of a step, biasing
+    // toward zero so near-threshold coefficients drop out.
+    try std.testing.expectEqual(@as(i16, 0), quantizeCoefficient(24, 40)); // 0.60 -> 0
+    try std.testing.expectEqual(@as(i16, 1), quantizeCoefficient(26, 40)); // 0.65 -> 1
+
+    // The largest realistic DC coefficient (~2040) at the finest factor (4)
+    // stays a representable level and dequantizes back inside i16.
+    const level = quantizeCoefficient(2040, dc_lookup[0]);
+    const dequant = @as(i32, level) * dc_lookup[0];
+    try std.testing.expect(level <= max_level);
+    try std.testing.expect(dequant <= std.math.maxInt(i16));
+}
+
+test "baseQuantIndexForQuality is monotone over the quality range" {
+    try std.testing.expectEqual(@as(u8, 0), baseQuantIndexForQuality(100));
+    try std.testing.expectEqual(@as(u8, index_max), baseQuantIndexForQuality(0));
+    try std.testing.expectEqual(@as(u8, 32), baseQuantIndexForQuality(75));
+
+    var previous: u8 = 0;
+    var quality: u8 = 100;
+    while (true) : (quality -= 1) {
+        const index = baseQuantIndexForQuality(quality);
+        try std.testing.expect(index >= previous);
+        previous = index;
+        if (quality == 0) break;
+    }
 }

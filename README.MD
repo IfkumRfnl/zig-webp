@@ -21,12 +21,15 @@ library also exposes bounded option and limit types, image buffers, metadata,
 animation-frame and feature probing, RIFF/WebP demux, static mux, and the
 VP8/VP8L bitstream infrastructure.
 
-Lossless encode has begun: `encodeLossless` turns a typed pixel buffer
-(RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L` WebP file.
-This first slice emits ARGB literals only (no LZ77, transforms, or color cache
-yet — see PLAN.MD step 7), so output is not size-optimized but round-trips
-bit-exactly through this library's decoder for every still VP8L corpus image,
-and `dwebp` decodes it back to the same pixels.
+Encode work is in progress. `encodeLossless` turns a typed pixel buffer
+(RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L` WebP file;
+the current lossless encoder uses the step-7 transform/cache/group machinery
+and round-trips bit-exactly through this library's decoder. `encodeLossy`
+emits a valid baseline `VP8 ` WebP file through the step-8a encoder: fixed
+all-DC prediction, no loop filter, default coefficient probabilities, and one
+token partition. It is correctness-first rather than quality-optimized, and it
+drops alpha until lossy `ALPH` encoding lands in step 8c. The installed
+`zig-webp-encode` tool re-encodes a still WebP as this lossy baseline.
 
 ## Goals
 
@@ -47,6 +50,8 @@ zig build test
 tools/webp-oracle.sh check
 tools/webp-oracle.sh compare-vp8l-corpus .zig-cache/vp8l-diff references/libwebp-test-data
 tools/webp-oracle.sh compare-alpha-corpus .zig-cache/alpha-diff references/libwebp-test-data
+zig build encode-lossy-report
+tools/webp-oracle.sh compare-encode-lossy
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
