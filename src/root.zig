@@ -40,6 +40,7 @@ pub const options = @import("options.zig");
 pub const testing = @import("testing.zig");
 pub const vp8_bool_reader = @import("vp8/bool_reader.zig");
 pub const vp8_bool_writer = @import("vp8/bool_writer.zig");
+pub const vp8_cost = @import("vp8/cost.zig");
 pub const vp8_decoder = @import("vp8/decoder.zig");
 pub const vp8_frame_header = @import("vp8/frame_header.zig");
 pub const vp8_header = @import("vp8/header.zig");
