@@ -165,7 +165,25 @@ fn encodeFramePass(
         while (column < grid.columns) : (column += 1) {
             var levels = tokens.MacroblockLevels{};
             const macroblock = &macroblocks[row * grid.columns + column];
-            encodeMacroblock(source, &reconstruction, &factors, &header.coefficient_probabilities, allow_bpred, grid.columns, column, row, &levels, macroblock);
+            const submode_contexts = gatherSubmodeContexts(
+                macroblocks,
+                grid.columns,
+                column,
+                row,
+            );
+            encodeMacroblock(
+                source,
+                &reconstruction,
+                &factors,
+                &header.coefficient_probabilities,
+                allow_bpred,
+                submode_contexts,
+                grid.columns,
+                column,
+                row,
+                &levels,
+                macroblock,
+            );
             // B_PRED macroblocks code their luma DC per subblock and have no Y2.
             token_options.has_y2 = macroblock.luma_mode != .subblocks;
             _ = try tokens.writeMacroblock(
@@ -302,6 +320,7 @@ fn encodeMacroblock(
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
     allow_bpred: bool,
+    submode_contexts: SubmodeContexts,
     columns: u32,
     mb_column: u32,
     mb_row: u32,
@@ -313,7 +332,19 @@ fn encodeMacroblock(
     // all sixteen positions for a 16x16 mode (which `encodeKeyFrameModes` reads
     // as the B_PRED probability context of later macroblocks).
     var subblock_modes: [modes.subblock_count]modes.SubblockMode = undefined;
-    const luma_mode = selectLuma(source, recon, factors, probabilities, allow_bpred, columns, mb_column, mb_row, levels, &subblock_modes);
+    const luma_mode = selectLuma(
+        source,
+        recon,
+        factors,
+        probabilities,
+        allow_bpred,
+        submode_contexts,
+        columns,
+        mb_column,
+        mb_row,
+        levels,
+        &subblock_modes,
+    );
     const chroma_mode = selectChroma(source, recon, factors, probabilities, mb_column, mb_row, levels);
     macroblock.* = .{
         .segment_id = 0,
@@ -367,6 +398,7 @@ fn selectLuma(
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
     allow_bpred: bool,
+    submode_contexts: SubmodeContexts,
     columns: u32,
     mb_column: u32,
     mb_row: u32,
@@ -434,7 +466,17 @@ fn selectLuma(
     //     mode flag and the sixteen submode signals. Skipped on the fallback
     //     pass for frames whose B_PRED modes overflow the first partition.
     if (allow_bpred) {
-        const bpred = evaluateBpred(&src, recon, factors, probabilities, lambda, columns, mb_column, mb_row);
+        const bpred = evaluateBpred(
+            &src,
+            recon,
+            factors,
+            probabilities,
+            lambda,
+            submode_contexts,
+            columns,
+            mb_column,
+            mb_row,
+        );
         if (bpred.rd.cost(lambda) < best_cost) {
             for (0..luma_block) |r| {
                 recon.luma[(mb_y + r) * stride + mb_x ..][0..luma_block].* = bpred.block[r * luma_block ..][0..luma_block].*;
@@ -468,6 +510,11 @@ const bpred_stride = 24; // 16 block columns + room for column -1 and cols 16..1
 const bpred_margin = 4;
 const bpred_rows = 1 + luma_block;
 
+const SubmodeContexts = struct {
+    above: [modes.subblocks_per_edge]modes.SubblockMode,
+    left: [modes.subblocks_per_edge]modes.SubblockMode,
+};
+
 fn bIndex(row: i32, col: i32) usize {
     return @intCast((row + 1) * bpred_stride + col + bpred_margin);
 }
@@ -485,6 +532,7 @@ fn evaluateBpred(
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
     lambda: u64,
+    submode_contexts: SubmodeContexts,
     columns: u32,
     mb_column: u32,
     mb_row: u32,
@@ -497,9 +545,8 @@ fn evaluateBpred(
     initBpredScratch(&scratch, recon.luma, stride, columns, mb_column, mb_row, has_above, has_left);
 
     const luma_plane = &probabilities[tokens.plane_y_no_y2];
-    // A fixed (DC, DC) submode context is used to estimate signaling cost, the
-    // same simplification the residual cost makes with context 0.
-    const submode_probs = &modes.kf_subblock_mode_probabilities[@intFromEnum(modes.SubblockMode.dc)][@intFromEnum(modes.SubblockMode.dc)];
+    var above_modes = submode_contexts.above;
+    var left_modes = submode_contexts.left;
 
     var result: BpredResult = undefined;
     var total_sse: u64 = 0;
@@ -513,6 +560,8 @@ fn evaluateBpred(
         const sub_x = idx % 4;
         const sub_y = idx / 4;
         const neighbors = gatherSubblockNeighbors(&scratch, sub_x, sub_y);
+        const above_mode = above_modes[sub_x];
+        const left_mode = left_modes[sub_y];
 
         var src_sub: [coeff_count]u8 = undefined;
         for (0..4) |r| {
@@ -551,7 +600,7 @@ fn evaluateBpred(
             const sse = sumSquaredError(&src_sub, &rec);
             // B_PRED luma blocks carry their own DC, so first_position 0.
             const rate = tokens.blockCost(luma_plane, 0, 0, &level) +
-                modes.treeCost(&modes.subblock_mode_tree, submode_probs, @intCast(m));
+                bpredSubmodeCost(above_mode, left_mode, submode);
             const sub_cost = sse + (lambda * rate) / 256;
             if (sub_cost < best_sub_cost) {
                 best_sub_cost = sub_cost;
@@ -573,6 +622,8 @@ fn evaluateBpred(
         result.submodes[idx] = best_submode;
         total_sse += best_sse;
         total_rate += best_rate;
+        above_modes[sub_x] = best_submode;
+        left_modes[sub_y] = best_submode;
     }
 
     for (0..luma_block) |r| {
@@ -582,6 +633,57 @@ fn evaluateBpred(
     }
     result.rd = .{ .distortion = total_sse, .rate = total_rate };
     return result;
+}
+
+fn gatherSubmodeContexts(
+    macroblocks: []const modes.Macroblock,
+    columns: u32,
+    mb_column: u32,
+    mb_row: u32,
+) SubmodeContexts {
+    assert(columns >= 1);
+    assert(mb_column < columns);
+
+    var contexts = SubmodeContexts{
+        .above = @splat(.dc),
+        .left = @splat(.dc),
+    };
+
+    if (mb_row > 0) {
+        const index = @as(usize, mb_row - 1) * columns + mb_column;
+        const macroblock_above = macroblocks[index];
+        for (0..modes.subblocks_per_edge) |sub_x| {
+            contexts.above[sub_x] =
+                macroblock_above.subblock_modes[
+                    (modes.subblocks_per_edge - 1) *
+                        modes.subblocks_per_edge + sub_x
+                ];
+        }
+    }
+
+    if (mb_column > 0) {
+        const index = @as(usize, mb_row) * columns + mb_column - 1;
+        const macroblock_left = macroblocks[index];
+        for (0..modes.subblocks_per_edge) |sub_y| {
+            contexts.left[sub_y] =
+                macroblock_left.subblock_modes[
+                    sub_y * modes.subblocks_per_edge +
+                        modes.subblocks_per_edge - 1
+                ];
+        }
+    }
+
+    return contexts;
+}
+
+fn bpredSubmodeCost(
+    above_mode: modes.SubblockMode,
+    left_mode: modes.SubblockMode,
+    submode: modes.SubblockMode,
+) u32 {
+    const probabilities =
+        &modes.kf_subblock_mode_probabilities[@intFromEnum(above_mode)][@intFromEnum(left_mode)];
+    return modes.treeCost(&modes.subblock_mode_tree, probabilities, @intFromEnum(submode));
 }
 
 fn gatherSubblockNeighbors(
@@ -1001,6 +1103,73 @@ test "B_PRED macroblocks are selected and stay self-consistent" {
         if (mb.luma_mode == .subblocks) bpred_count += 1;
     }
     try std.testing.expect(bpred_count > 0);
+}
+
+test "B_PRED submode cost uses the encoder's mode contexts" {
+    const above_modes = [modes.subblock_count]modes.SubblockMode{
+        .dc,            .vertical,      .horizontal,    .true_motion,
+        .left_down,     .right_down,    .vertical_left, .horizontal_up,
+        .vertical,      .horizontal,    .true_motion,   .dc,
+        .vertical_left, .horizontal_up, .true_motion,   .left_down,
+    };
+    const left_modes = [modes.subblock_count]modes.SubblockMode{
+        .dc,          .dc,          .dc,          .horizontal,
+        .vertical,    .vertical,    .vertical,    .true_motion,
+        .horizontal,  .horizontal,  .horizontal,  .vertical_left,
+        .true_motion, .true_motion, .true_motion, .horizontal_up,
+    };
+    const filler_modes: [modes.subblock_count]modes.SubblockMode = @splat(.dc);
+    const macroblocks = [_]modes.Macroblock{
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .dc,
+            .chroma_mode = .dc,
+            .subblock_modes = filler_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .subblocks,
+            .chroma_mode = .dc,
+            .subblock_modes = above_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .subblocks,
+            .chroma_mode = .dc,
+            .subblock_modes = left_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .dc,
+            .chroma_mode = .dc,
+            .subblock_modes = filler_modes,
+        },
+    };
+
+    const contexts = gatherSubmodeContexts(&macroblocks, 2, 1, 1);
+    try std.testing.expectEqualSlices(
+        modes.SubblockMode,
+        above_modes[12..16],
+        &contexts.above,
+    );
+    try std.testing.expectEqual(
+        [modes.subblocks_per_edge]modes.SubblockMode{
+            left_modes[3],
+            left_modes[7],
+            left_modes[11],
+            left_modes[15],
+        },
+        contexts.left,
+    );
+
+    const submode = modes.SubblockMode.horizontal_up;
+    const contextual_cost = bpredSubmodeCost(contexts.above[0], contexts.left[0], submode);
+    const fixed_dc_cost = bpredSubmodeCost(.dc, .dc, submode);
+    try std.testing.expect(contextual_cost != fixed_dc_cost);
 }
 
 test "full-block neighbor gather mirrors the decoder's synthetic corner" {
