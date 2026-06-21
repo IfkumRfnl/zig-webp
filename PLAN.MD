@@ -410,8 +410,15 @@ auditable:
    the encoder filtering its own reconstruction in place so the self-consistency
    gate still holds. +0.34 dB on the photo corpus at neutral size; `dwebp`
    validity unchanged (0/135 invalid); see the 2026-06-21 oracle row.
-4. **8b-3b (next).** Segmentation (adaptive per-segment quantization), gating on
-   the matched-size luma-PSNR target in step 8b above.
+4. **8b-3b (delivered).** Segmentation (adaptive per-segment quantization): a
+   pre-pass (`src/vp8/segment.zig`) buckets macroblocks into up to four segments
+   by luma complexity (1-D k-means) and gives each segment its own quantizer
+   delta (finer for busier segments — the SSE-optimal direction), written via
+   `frame_header.writeSegmentation` and the per-macroblock segment map. This
+   slice carries the step-8b gate: at matched output size on the photo corpus the
+   mean luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact +0.08 dB,
+   beating it; see the 2026-06-21 oracle row). `dwebp` validity unchanged
+   (0/135 invalid).
 5. Then step 8c: method/quality presets, target-size and target-PSNR modes,
    sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
 

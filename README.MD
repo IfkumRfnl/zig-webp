@@ -26,12 +26,14 @@ Encode work is in progress. `encodeLossless` turns a typed pixel buffer
 the current lossless encoder uses the step-7 transform/cache/group machinery
 and round-trips bit-exactly through this library's decoder. `encodeLossy`
 emits a valid `VP8 ` WebP file with rate-distortion intra mode decision
-(the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock skip coding, and
-the in-loop deblocking filter at a quantizer-derived level; coefficient
-probabilities stay at the RFC defaults and there is one token partition.
-Quality work continues in step 8b (segmentation next), and it drops alpha until
-lossy `ALPH` encoding lands in step 8c. The installed `zig-webp-encode` tool
-re-encodes a still WebP as lossy `VP8 `.
+(the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock skip coding,
+the in-loop deblocking filter at a quantizer-derived level, and adaptive
+per-segment quantization; coefficient probabilities stay at the RFC defaults
+and there is one token partition. Step 8b met its quality gate — at matched
+output size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` —
+so the remaining lossy work is step 8c (presets, target-size/PSNR modes,
+sharp-YUV chroma) and `ALPH` alpha, which is dropped until then. The installed
+`zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
 

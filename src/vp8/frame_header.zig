@@ -323,6 +323,54 @@ fn readFlaggedSignedValue(reader: *bool_reader.BoolReader, bit_count: u6) Error!
     return 0;
 }
 
+/// Writes one flag-then-value field, the inverse of `readFlaggedSignedValue`: a
+/// single 0 bit for zero, otherwise a 1 bit followed by the signed literal.
+fn writeFlaggedSignedValue(writer: *bool_writer.BoolWriter, value: i8, bit_count: u6) Error!void {
+    assert(bit_count >= 4);
+    assert(bit_count <= 7);
+
+    if (value == 0) {
+        try writer.writeBit(0);
+    } else {
+        try writer.writeBit(1);
+        try writer.writeSignedLiteral(value, bit_count);
+    }
+}
+
+/// Writes the segmentation section of the compressed header, the exact inverse
+/// of `parseSegmentation`. A disabled segmentation is a single 0 bit (what the
+/// baseline encoder emitted before per-segment quantization existed). When
+/// enabled, the feature data is always (re)written, so the per-segment quantizer
+/// and filter-strength deltas follow `absolute_values`, and the three segment-map
+/// tree probabilities are coded when `update_map` is set (255 as a bare 0 bit).
+pub fn writeSegmentation(
+    writer: *bool_writer.BoolWriter,
+    segmentation: *const Segmentation,
+) Error!void {
+    try writer.writeBit(@intFromBool(segmentation.enabled));
+    if (!segmentation.enabled) return;
+
+    try writer.writeBit(@intFromBool(segmentation.update_map));
+    try writer.writeBit(1); // Update segment feature data.
+    try writer.writeBit(@intFromBool(segmentation.absolute_values));
+    for (segmentation.quantizer_deltas) |delta| {
+        try writeFlaggedSignedValue(writer, delta, 7);
+    }
+    for (segmentation.filter_strength_deltas) |delta| {
+        try writeFlaggedSignedValue(writer, delta, 6);
+    }
+    if (segmentation.update_map) {
+        for (segmentation.tree_probabilities) |probability| {
+            if (probability == 255) {
+                try writer.writeBit(0);
+            } else {
+                try writer.writeBit(1);
+                try writer.writeLiteral(probability, 8);
+            }
+        }
+    }
+}
+
 // --- Key-frame header encoding (the inverse of the parsing above) -----------
 
 /// Writes the 3-byte uncompressed frame tag for a shown key frame (version 0).
@@ -365,9 +413,10 @@ pub fn writeDefaultCoefficientProbabilities(writer: *bool_writer.BoolWriter) Err
     }
 }
 
-/// Knobs for the compressed first-partition header. Segmentation stays off and
-/// there is one token partition with default coefficient probabilities; the
-/// loop filter, quantizer, and macroblock skip coding vary.
+/// Knobs for the compressed first-partition header. There is one token partition
+/// with default coefficient probabilities; the loop filter, quantizer, macroblock
+/// skip coding, and segmentation vary. `segmentation` defaults to disabled (a
+/// single 0 bit), so callers that predate per-segment quantization are unchanged.
 pub const CompressedHeaderOptions = struct {
     simple_filter: bool = false,
     filter_level: u6 = 0,
@@ -378,12 +427,16 @@ pub const CompressedHeaderOptions = struct {
     /// frame signals `skip_probability` (prob_skip_false) as an 8-bit literal.
     skip_enabled: bool = false,
     skip_probability: u8 = 0,
+    /// Per-segment quantization (and the segment map). When disabled the section
+    /// is a single 0 bit and every macroblock shares `y_ac_quant_index`.
+    segmentation: Segmentation = .disabled,
 };
 
 /// Writes the compressed first-partition header (color space through
-/// mb_no_skip_coeff) in the exact order `parse` reads it back. Segmentation,
-/// loop-filter deltas, and the five per-plane quantizer deltas are all
-/// disabled; the coefficient probabilities stay at the RFC defaults.
+/// mb_no_skip_coeff) in the exact order `parse` reads it back. Loop-filter deltas
+/// and the five per-plane quantizer deltas are disabled and the coefficient
+/// probabilities stay at the RFC defaults; segmentation is written per
+/// `options.segmentation`.
 pub fn writeCompressedHeader(
     writer: *bool_writer.BoolWriter,
     options: CompressedHeaderOptions,
@@ -392,7 +445,7 @@ pub fn writeCompressedHeader(
 
     try writer.writeBit(0); // Color space: YUV as specified.
     try writer.writeBit(0); // Clamping: spec-required pixel clamping.
-    try writer.writeBit(0); // Segmentation disabled.
+    try writeSegmentation(writer, &options.segmentation);
     try writer.writeBit(@intFromBool(options.simple_filter));
     try writer.writeLiteral(options.filter_level, 6);
     try writer.writeLiteral(options.sharpness, 3);
@@ -438,6 +491,41 @@ fn assemblePayload(
     @memcpy(out[header_byte_count + compressed.len ..][0..token_partition_bytes.len], token_partition_bytes);
 
     return out[0..total];
+}
+
+test "writeSegmentation round-trips through parseSegmentation" {
+    var segmentation = Segmentation.disabled;
+    segmentation.enabled = true;
+    segmentation.update_map = true;
+    segmentation.absolute_values = false; // delta mode, as the encoder uses
+    segmentation.quantizer_deltas = .{ 7, -3, 0, 12 };
+    segmentation.filter_strength_deltas = .{ 0, 0, 0, 0 };
+    segmentation.tree_probabilities = .{ 40, 255, 130 };
+
+    var buffer: [64]u8 = undefined;
+    var writer = bool_writer.BoolWriter.init(&buffer);
+    try writeSegmentation(&writer, &segmentation);
+    const bytes = try writer.finish();
+
+    var reader = bool_reader.BoolReader.init(bytes);
+    const parsed = try parseSegmentation(&reader);
+    try std.testing.expect(parsed.enabled);
+    try std.testing.expect(parsed.update_map);
+    try std.testing.expect(!parsed.absolute_values);
+    try std.testing.expectEqual(segmentation.quantizer_deltas, parsed.quantizer_deltas);
+    try std.testing.expectEqual(segmentation.filter_strength_deltas, parsed.filter_strength_deltas);
+    try std.testing.expectEqual(segmentation.tree_probabilities, parsed.tree_probabilities);
+}
+
+test "writeSegmentation emits a single bit when disabled" {
+    var buffer: [8]u8 = undefined;
+    var writer = bool_writer.BoolWriter.init(&buffer);
+    try writeSegmentation(&writer, &Segmentation.disabled);
+    const bytes = try writer.finish();
+
+    var reader = bool_reader.BoolReader.init(bytes);
+    const parsed = try parseSegmentation(&reader);
+    try std.testing.expect(!parsed.enabled);
 }
 
 test "parses a minimal key-frame header" {
