@@ -404,9 +404,15 @@ auditable:
    `tokens.blockCost`) replacing the nonzero-count rate proxy; and **8b-2b** —
    B_PRED itself, scored against the 16x16 modes with that cost model
    (+1.5 dB at −6.6% bytes on the photo corpus; 2026-06-20 oracle rows).
-3. **8b-3 (next).** Add segmentation, skip decisions, and loop-filter level
-   selection, gating on the matched-size luma-PSNR target in step 8b above.
-4. Then step 8c: method/quality presets, target-size and target-PSNR modes,
+3. **8b-3a (delivered).** Macroblock skip coding (`mb_skip_coeff` for all-zero
+   residue, with `prob_skip_false` from the realized skip ratio) and in-loop
+   loop-filter level selection from the quantizer (libwebp's default strength),
+   the encoder filtering its own reconstruction in place so the self-consistency
+   gate still holds. +0.34 dB on the photo corpus at neutral size; `dwebp`
+   validity unchanged (0/135 invalid); see the 2026-06-21 oracle row.
+4. **8b-3b (next).** Segmentation (adaptive per-segment quantization), gating on
+   the matched-size luma-PSNR target in step 8b above.
+5. Then step 8c: method/quality presets, target-size and target-PSNR modes,
    sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
 
 This order keeps early work testable and prevents the project from becoming
