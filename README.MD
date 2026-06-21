@@ -25,11 +25,13 @@ Encode work is in progress. `encodeLossless` turns a typed pixel buffer
 (RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L` WebP file;
 the current lossless encoder uses the step-7 transform/cache/group machinery
 and round-trips bit-exactly through this library's decoder. `encodeLossy`
-emits a valid baseline `VP8 ` WebP file through the step-8a encoder: fixed
-all-DC prediction, no loop filter, default coefficient probabilities, and one
-token partition. It is correctness-first rather than quality-optimized, and it
-drops alpha until lossy `ALPH` encoding lands in step 8c. The installed
-`zig-webp-encode` tool re-encodes a still WebP as this lossy baseline.
+emits a valid `VP8 ` WebP file with rate-distortion intra mode decision
+(the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock skip coding, and
+the in-loop deblocking filter at a quantizer-derived level; coefficient
+probabilities stay at the RFC defaults and there is one token partition.
+Quality work continues in step 8b (segmentation next), and it drops alpha until
+lossy `ALPH` encoding lands in step 8c. The installed `zig-webp-encode` tool
+re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
 

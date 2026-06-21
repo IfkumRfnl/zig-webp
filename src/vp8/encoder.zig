@@ -1,13 +1,17 @@
-//! VP8 lossy encoder — step 8b-1 intra mode decision.
+//! VP8 lossy encoder — step 8b-3a skip decisions and loop-filter selection.
 //!
 //! Produces a valid `VP8 ` key-frame bitstream from source YUV 4:2:0 planes.
-//! Each macroblock now picks its 16x16 luma mode (DC/V/H/TM) and its shared 8x8
-//! chroma mode (DC/V/H/TM) by a rate-distortion score — reconstruction SSE plus
-//! a quantizer-scaled penalty on coded coefficients — instead of the step 8a
-//! all-DC default. B_PRED (per-subblock 4x4 luma intra) stays out until step
-//! 8b-2; segmentation, skip decisions, and the loop filter are off; coefficient
-//! probabilities stay at the RFC defaults; and there is a single token
-//! partition.
+//! Each macroblock picks its luma mode — one of the four 16x16 modes (DC/V/H/TM)
+//! or per-subblock 4x4 B_PRED — and its shared 8x8 chroma mode by a
+//! rate-distortion score (reconstruction SSE plus the VP8 token bit cost).
+//! Macroblocks whose residue quantizes entirely to zero are coded as
+//! `mb_skip_coeff`, with the frame's skip probability derived from the realized
+//! skip ratio. The RFC 6386 section 15 in-loop deblocking filter then runs at a
+//! level chosen from the quantizer (mirroring `cwebp`'s default strength), the
+//! encoder filtering its own reconstruction so a conforming decoder still
+//! reproduces it bit-for-bit. Coefficient probabilities stay at the RFC
+//! defaults, there is a single token partition, and segmentation stays off
+//! until step 8b-3b.
 //!
 //! Correctness rests on one invariant (see PLAN.MD step 8a): the encoder
 //! reconstructs each macroblock by feeding its own quantized levels back through
@@ -29,6 +33,7 @@ const errors = @import("../errors.zig");
 const forward_transform = @import("forward_transform.zig");
 const frame_header = @import("frame_header.zig");
 const image = @import("../image.zig");
+const loop_filter = @import("loop_filter.zig");
 const modes = @import("modes.zig");
 const prediction = @import("prediction.zig");
 const quant = @import("quant.zig");
@@ -68,8 +73,9 @@ pub const Result = struct {
 /// Real mode decision (step 8b) decides each macroblock's modes during the
 /// reconstruction pass and writes partition 0 afterward, so the per-macroblock
 /// mode records, the reconstruction planes, the token scratch, the above-edge
-/// flags, partition 0, and the final bitstream are all reachable at once (each
-/// is held by a `defer` until the function returns). The peak is their sum.
+/// flags, the per-macroblock residual flags (for the loop filter), partition 0,
+/// and the final bitstream are all reachable at once (each is held by a `defer`
+/// until the function returns). The peak is their sum.
 pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
     const grid = modes.MacroblockGrid.init(dimensions);
     const mb_count = grid.macroblockCount();
@@ -83,11 +89,13 @@ pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
         dimensions.height,
     );
     const above_flags_bytes = try elementByteCount(tokens.NonzeroFlags, grid.columns);
+    const has_nonzero_bytes = try elementByteCount(bool, mb_count);
 
     var peak = macroblock_bytes;
     peak = try addByteCounts(peak, reconstruction_bytes);
     peak = try addByteCounts(peak, token_bytes);
     peak = try addByteCounts(peak, above_flags_bytes);
+    peak = try addByteCounts(peak, has_nonzero_bytes);
     peak = try addByteCounts(peak, partition0_bytes);
     peak = try addByteCounts(peak, bitstream_bytes);
     return peak;
@@ -125,7 +133,9 @@ fn encodeFramePass(
     const grid = modes.MacroblockGrid.init(dimensions);
     const mb_count = grid.macroblockCount();
 
-    const header = baselineHeader(dimensions, base_quant_index);
+    // `skip_probability` is filled in below from the per-macroblock skip
+    // decisions, which are only known after the reconstruction pass.
+    var header = baselineHeader(dimensions, base_quant_index);
     // Segmentation is disabled, so every segment shares the frame-level factors.
     const factors = quant.segmentFactors(&header)[0];
 
@@ -151,20 +161,27 @@ fn encodeFramePass(
     defer gpa.free(above_flags);
     @memset(above_flags, tokens.NonzeroFlags.zero);
 
+    // Per-macroblock residual flag for the loop filter's interior-edge decision
+    // (`loop_filter.applyFrame`); equals "not skipped" once skip coding is on.
+    const has_nonzero = try gpa.alloc(bool, mb_count);
+    defer gpa.free(has_nonzero);
+
     var token_options = tokens.MacroblockOptions{
         .probabilities = &header.coefficient_probabilities,
         .factors = &factors, // unused by writeMacroblock; levels are already quantized
         .has_y2 = true, // set per macroblock below: 16x16 modes route DC through Y2
-        .skip = false,
+        .skip = false, // set per macroblock below
     };
 
+    var skip_count: u32 = 0;
     var row: u32 = 0;
     while (row < grid.rows) : (row += 1) {
         var left_flags = tokens.NonzeroFlags.zero;
         var column: u32 = 0;
         while (column < grid.columns) : (column += 1) {
             var levels = tokens.MacroblockLevels{};
-            const macroblock = &macroblocks[row * grid.columns + column];
+            const index = row * grid.columns + column;
+            const macroblock = &macroblocks[index];
             const submode_contexts = gatherSubmodeContexts(
                 macroblocks,
                 grid.columns,
@@ -184,8 +201,18 @@ fn encodeFramePass(
                 &levels,
                 macroblock,
             );
+            // A macroblock whose residue quantizes entirely to zero codes no
+            // tokens: the decoder reconstructs it from prediction alone, exactly
+            // what the encoder already holds. Skip coding is always enabled, so
+            // every such macroblock is skipped and the rest pay one cheap bit.
+            const skip = macroblockAllZero(&levels);
+            macroblock.skip = skip;
+            has_nonzero[index] = !skip;
+            if (skip) skip_count += 1;
+
             // B_PRED macroblocks code their luma DC per subblock and have no Y2.
             token_options.has_y2 = macroblock.luma_mode != .subblocks;
+            token_options.skip = skip;
             _ = try tokens.writeMacroblock(
                 &token_writer,
                 token_options,
@@ -197,12 +224,31 @@ fn encodeFramePass(
     }
     const token_bytes = try token_writer.finish();
 
+    // prob_skip_false from the realized skip ratio (libwebp `CalcSkipProba`).
+    header.skip_probability = calcSkipProbability(skip_count, mb_count);
+
     // --- Partition 0: compressed header followed by the per-macroblock modes
     //     decided above.
     const partition0 = try encodePartition0(gpa, &header, macroblocks, base_quant_index);
     defer gpa.free(partition0.buffer);
     if (partition0.bytes.len > frame_header.first_partition_size_max) {
         return error.FileTooLarge;
+    }
+
+    // --- In-loop deblocking filter (RFC 6386 section 15). Intra prediction only
+    //     ever read unfiltered pixels during the pass above, so filtering the
+    //     finished reconstruction in place — exactly as the decoder does after
+    //     whole-frame reconstruction — keeps the self-consistency gate intact.
+    const filter_type = loop_filter.filterType(&header);
+    if (filter_type != .none) {
+        const strengths = loop_filter.computeStrengths(&header);
+        loop_filter.applyFrame(.{
+            .luma = reconstruction.luma,
+            .chroma_u = reconstruction.chroma_u,
+            .chroma_v = reconstruction.chroma_v,
+            .luma_stride = reconstruction.luma_stride,
+            .chroma_stride = reconstruction.chroma_stride,
+        }, grid, macroblocks, has_nonzero, &strengths, filter_type);
     }
 
     // --- Assemble: uncompressed 10-byte header, partition 0, token partition.
@@ -241,15 +287,25 @@ fn encodePartition0(
     const buffer = try gpa.alloc(u8, partition0Capacity(@intCast(macroblocks.len)));
     errdefer gpa.free(buffer);
     var writer = bool_writer.BoolWriter.init(buffer);
-    try frame_header.writeCompressedHeader(&writer, .{ .y_ac_quant_index = base_quant_index });
+    try frame_header.writeCompressedHeader(&writer, .{
+        .simple_filter = header.loop_filter.simple,
+        .filter_level = @intCast(header.loop_filter.level),
+        .sharpness = @intCast(header.loop_filter.sharpness),
+        .y_ac_quant_index = base_quant_index,
+        .skip_enabled = header.skip_enabled,
+        .skip_probability = header.skip_probability,
+    });
     try modes.encodeKeyFrameModes(&writer, header, macroblocks);
     return .{ .buffer = buffer, .bytes = try writer.finish() };
 }
 
-/// The fixed step 8a key-frame header: one segment, no loop filter, default
-/// coefficient probabilities, skip disabled. Used for both the dequant factors
-/// and the mode-record contexts, and kept consistent with the bits
-/// `frame_header.writeCompressedHeader` emits.
+/// The key-frame header shared by the dequant factors, the loop-filter strength
+/// derivation, and the mode-record contexts, kept consistent with the bits
+/// `frame_header.writeCompressedHeader` emits. One segment, no quantizer or
+/// filter deltas, default coefficient probabilities. The normal (non-simple)
+/// deblocking filter runs at a quantizer-derived level, and macroblock skip
+/// coding is enabled; `skip_probability` is filled in once the skip count is
+/// known.
 fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_header.Header {
     return .{
         .tag = .{ .version = 0, .first_partition_size = 0 },
@@ -259,7 +315,7 @@ fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_head
         .segmentation = .disabled,
         .loop_filter = .{
             .simple = false,
-            .level = 0,
+            .level = loopFilterLevel(base_quant_index),
             .sharpness = 0,
             .delta_enabled = false,
             .ref_frame_deltas = @splat(0),
@@ -275,9 +331,33 @@ fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_head
         },
         .refresh_entropy_probs = false,
         .coefficient_probabilities = token_probs.default_probabilities,
-        .skip_enabled = false,
-        .skip_probability = 0,
+        .skip_enabled = true,
+        .skip_probability = 0, // set per frame from the realized skip ratio
     };
+}
+
+/// Picks the frame's normal-filter loop-filter level from the AC quantizer,
+/// transcribing libwebp's `SetupFilterStrength` for the single-segment,
+/// default-strength (`-f 60`), zero-sharpness case `cwebp -q N` uses: the
+/// sharpness-0 strength curve is the identity (capped at 63), the per-segment
+/// complexity term `beta` is zero, and a sub-2 result disables filtering.
+fn loopFilterLevel(y_ac_index: u8) u8 {
+    assert(y_ac_index <= quant.index_max);
+    const filter_strength = 60; // libwebp default `config->filter_strength`
+    const level0 = 5 * filter_strength; // libwebp `level0`, in [0..500]
+    const qstep: u32 = @as(u32, quant.ac_lookup[y_ac_index]) >> 2;
+    const base_strength: u32 = @min(qstep, 63); // kLevelsFromDelta[0][p] == p, capped
+    const f = base_strength * level0 / 256;
+    if (f < 2) return 0; // libwebp FSTRENGTH_CUTOFF
+    return @intCast(@min(f, 63));
+}
+
+/// prob_skip_false: the probability that a macroblock's skip flag is 0, scaled
+/// to 0..255 from the realized non-skip ratio (libwebp `CalcSkipProba`).
+fn calcSkipProbability(skip_count: u32, mb_count: u32) u8 {
+    if (mb_count == 0) return 255;
+    const coded = mb_count - skip_count; // macroblocks that carry residue
+    return @intCast(@as(u64, coded) * 255 / mb_count);
 }
 
 // The intra modes the mode decision ranks. B_PRED (per-subblock 4x4 luma) is
@@ -974,6 +1054,18 @@ fn blockHasNonzero(coefficients: *const [coeff_count]i16) bool {
     return false;
 }
 
+/// Whether every coded coefficient of the macroblock is zero, across Y2, the
+/// sixteen luma blocks, and the eight chroma blocks. A B_PRED macroblock keeps
+/// its DC in the luma blocks and its Y2 levels at zero, so the same scan covers
+/// both luma layouts. When true the macroblock can be coded as `mb_skip_coeff`.
+fn macroblockAllZero(levels: *const tokens.MacroblockLevels) bool {
+    if (blockHasNonzero(&levels.y2)) return false;
+    for (&levels.luma) |*block| if (blockHasNonzero(block)) return false;
+    for (&levels.chroma_u) |*block| if (blockHasNonzero(block)) return false;
+    for (&levels.chroma_v) |*block| if (blockHasNonzero(block)) return false;
+    return true;
+}
+
 fn bitstreamCapacity(mb_count: u32) Error!u64 {
     var bytes: u64 = frame_header.header_byte_count;
     bytes = try addByteCounts(bytes, @intCast(partition0Capacity(mb_count)));
@@ -1218,4 +1310,103 @@ test "encoded baseline frame is a valid muxable VP8 bitstream" {
     try std.testing.expectEqual(width, parsed.header.picture.dimensions.width);
     try std.testing.expectEqual(height, parsed.header.picture.dimensions.height);
     try std.testing.expectEqual(@as(u8, 1), parsed.token_partitions.count);
+}
+
+test "loop-filter level and skip probability heuristics" {
+    // libwebp SetupFilterStrength, single segment, -f 60, sharpness 0:
+    // q75 -> ac_index 32 -> ac_step 36 -> qstep 9 -> 9*300/256 = 10.
+    try std.testing.expectEqual(@as(u8, 10), loopFilterLevel(quant.baseQuantIndexForQuality(75)));
+    // High quality keeps a small but nonzero level; the level rises with the
+    // quantizer and saturates at the 63 cap for the coarsest steps.
+    try std.testing.expect(loopFilterLevel(quant.baseQuantIndexForQuality(95)) > 0);
+    try std.testing.expect(
+        loopFilterLevel(quant.baseQuantIndexForQuality(20)) >
+            loopFilterLevel(quant.baseQuantIndexForQuality(75)),
+    );
+    try std.testing.expectEqual(@as(u8, 63), loopFilterLevel(quant.index_max));
+
+    // prob_skip_false scales with the share of macroblocks that carry residue.
+    try std.testing.expectEqual(@as(u8, 255), calcSkipProbability(0, 0)); // no MBs
+    try std.testing.expectEqual(@as(u8, 255), calcSkipProbability(0, 100)); // none skip
+    try std.testing.expectEqual(@as(u8, 0), calcSkipProbability(100, 100)); // all skip
+    try std.testing.expectEqual(@as(u8, 127), calcSkipProbability(50, 100)); // half
+}
+
+test "flat content is coded with skipped macroblocks" {
+    const gpa = std.testing.allocator;
+    const width = 64;
+    const height = 64;
+
+    // A uniform field: interior macroblocks predict their flat neighbor exactly
+    // (DC mode), so their residue quantizes to zero and they must be skipped.
+    const argb = try gpa.alloc(u32, width * height);
+    defer gpa.free(argb);
+    @memset(argb, 0xff20_60a0);
+
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
+    defer source.deinit(gpa);
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(75));
+    defer result.deinit(gpa);
+
+    var parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(result.bitstream, &parsed);
+    try std.testing.expect(parsed.header.skip_enabled);
+
+    const grid = modes.MacroblockGrid.init(.{ .width = width, .height = height });
+    const mbs = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
+    defer gpa.free(mbs);
+    try modes.parseKeyFrameModes(&parsed.macroblock_reader, &parsed.header, mbs);
+    var skip_count: usize = 0;
+    for (mbs) |mb| {
+        if (mb.skip) skip_count += 1;
+    }
+    try std.testing.expect(skip_count > 0);
+
+    // Skipped macroblocks code no tokens, so the decoder must still reproduce
+    // the encoder's reconstruction byte-for-byte.
+    var frame = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
+    defer frame.deinit();
+    try std.testing.expectEqualSlices(u8, result.reconstruction.luma, frame.luma);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_u, frame.chroma_u);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_v, frame.chroma_v);
+}
+
+test "loop filter runs and the reconstruction is the filtered frame" {
+    const gpa = std.testing.allocator;
+    const width = 48;
+    const height = 48;
+
+    // A smooth ramp at a coarse quantizer: prediction leaves small per-block DC
+    // steps at the macroblock boundaries (blocking), which is exactly what the
+    // deblocking filter smooths (unlike a hard edge, which it preserves).
+    const argb = try gpa.alloc(u32, width * height);
+    defer gpa.free(argb);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const v: u32 = @intCast(20 + (x + y) * 180 / (width + height));
+            argb[y * width + x] = 0xff00_0000 | (v << 16) | (v << 8) | v;
+        }
+    }
+
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
+    defer source.deinit(gpa);
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(40));
+    defer result.deinit(gpa);
+
+    // The encoder must have chosen a nonzero normal-filter level.
+    var parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(result.bitstream, &parsed);
+    try std.testing.expect(parsed.header.loop_filter.level > 0);
+    try std.testing.expect(!parsed.header.loop_filter.simple);
+
+    // Filtered decode matches the stored reconstruction (self-consistency);
+    // unfiltered decode differs, proving the filter actually changed pixels and
+    // that the encoder stored the filtered frame rather than the raw one.
+    var filtered = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
+    defer filtered.deinit();
+    try std.testing.expectEqualSlices(u8, result.reconstruction.luma, filtered.luma);
+
+    var unfiltered = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = false });
+    defer unfiltered.deinit();
+    try std.testing.expect(!std.mem.eql(u8, result.reconstruction.luma, unfiltered.luma));
 }

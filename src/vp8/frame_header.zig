@@ -365,15 +365,19 @@ pub fn writeDefaultCoefficientProbabilities(writer: *bool_writer.BoolWriter) Err
     }
 }
 
-/// Knobs for the compressed first-partition header. The step 8a baseline keeps
-/// segmentation off, one token partition, default coefficient probabilities,
-/// and skip coding disabled; only the loop filter and quantizer vary.
+/// Knobs for the compressed first-partition header. Segmentation stays off and
+/// there is one token partition with default coefficient probabilities; the
+/// loop filter, quantizer, and macroblock skip coding vary.
 pub const CompressedHeaderOptions = struct {
     simple_filter: bool = false,
     filter_level: u6 = 0,
     sharpness: u3 = 0,
     y_ac_quant_index: u8 = 0,
     refresh_entropy_probs: bool = false,
+    /// mb_no_skip_coeff: when true each macroblock codes a skip flag and the
+    /// frame signals `skip_probability` (prob_skip_false) as an 8-bit literal.
+    skip_enabled: bool = false,
+    skip_probability: u8 = 0,
 };
 
 /// Writes the compressed first-partition header (color space through
@@ -402,7 +406,10 @@ pub fn writeCompressedHeader(
     try writer.writeBit(0); // No uv_ac delta.
     try writer.writeBit(@intFromBool(options.refresh_entropy_probs));
     try writeDefaultCoefficientProbabilities(writer);
-    try writer.writeBit(0); // mb_no_skip_coeff disabled.
+    try writer.writeBit(@intFromBool(options.skip_enabled)); // mb_no_skip_coeff.
+    if (options.skip_enabled) {
+        try writer.writeLiteral(options.skip_probability, 8);
+    }
 }
 
 // --- Test helpers -----------------------------------------------------------
