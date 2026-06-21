@@ -96,10 +96,28 @@ pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
 /// Encodes macroblock-padded source YUV planes into a raw VP8 key-frame
 /// bitstream. `base_quant_index` is the frame-wide AC quantizer index (0..127);
 /// derive it from a quality knob with `quant.baseQuantIndexForQuality`.
+///
+/// B_PRED macroblocks code far more mode data than the 16x16 modes, so on very
+/// large, detail-rich frames the per-macroblock modes can overflow VP8's 19-bit
+/// first-partition size field. When that happens the frame is re-encoded with
+/// B_PRED disabled (16x16 modes code ~1 byte each), which always fits; the
+/// fallback is rare and only costs a second pass on outsized images.
 pub fn encodeAlloc(
     gpa: std.mem.Allocator,
     source: *const color.YuvPlanes,
     base_quant_index: u8,
+) Error!Result {
+    return encodeFramePass(gpa, source, base_quant_index, true) catch |err| switch (err) {
+        error.FileTooLarge => try encodeFramePass(gpa, source, base_quant_index, false),
+        else => err,
+    };
+}
+
+fn encodeFramePass(
+    gpa: std.mem.Allocator,
+    source: *const color.YuvPlanes,
+    base_quant_index: u8,
+    allow_bpred: bool,
 ) Error!Result {
     assert(base_quant_index <= quant.index_max);
 
@@ -133,10 +151,10 @@ pub fn encodeAlloc(
     defer gpa.free(above_flags);
     @memset(above_flags, tokens.NonzeroFlags.zero);
 
-    const token_options = tokens.MacroblockOptions{
+    var token_options = tokens.MacroblockOptions{
         .probabilities = &header.coefficient_probabilities,
         .factors = &factors, // unused by writeMacroblock; levels are already quantized
-        .has_y2 = true, // every 16x16 luma mode routes its DC through the Y2 block
+        .has_y2 = true, // set per macroblock below: 16x16 modes route DC through Y2
         .skip = false,
     };
 
@@ -147,7 +165,27 @@ pub fn encodeAlloc(
         while (column < grid.columns) : (column += 1) {
             var levels = tokens.MacroblockLevels{};
             const macroblock = &macroblocks[row * grid.columns + column];
-            encodeMacroblock(source, &reconstruction, &factors, &header.coefficient_probabilities, column, row, &levels, macroblock);
+            const submode_contexts = gatherSubmodeContexts(
+                macroblocks,
+                grid.columns,
+                column,
+                row,
+            );
+            encodeMacroblock(
+                source,
+                &reconstruction,
+                &factors,
+                &header.coefficient_probabilities,
+                allow_bpred,
+                submode_contexts,
+                grid.columns,
+                column,
+                row,
+                &levels,
+                macroblock,
+            );
+            // B_PRED macroblocks code their luma DC per subblock and have no Y2.
+            token_options.has_y2 = macroblock.luma_mode != .subblocks;
             _ = try tokens.writeMacroblock(
                 &token_writer,
                 token_options,
@@ -281,22 +319,39 @@ fn encodeMacroblock(
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
+    allow_bpred: bool,
+    submode_contexts: SubmodeContexts,
+    columns: u32,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
     macroblock: *modes.Macroblock,
 ) void {
-    const luma_mode = selectLuma(source, recon, factors, probabilities, mb_column, mb_row, levels);
+    // `selectLuma` fills the subblock modes for both cases: the actual per-
+    // subblock choices for B_PRED, or the derived context mode replicated across
+    // all sixteen positions for a 16x16 mode (which `encodeKeyFrameModes` reads
+    // as the B_PRED probability context of later macroblocks).
+    var subblock_modes: [modes.subblock_count]modes.SubblockMode = undefined;
+    const luma_mode = selectLuma(
+        source,
+        recon,
+        factors,
+        probabilities,
+        allow_bpred,
+        submode_contexts,
+        columns,
+        mb_column,
+        mb_row,
+        levels,
+        &subblock_modes,
+    );
     const chroma_mode = selectChroma(source, recon, factors, probabilities, mb_column, mb_row, levels);
     macroblock.* = .{
         .segment_id = 0,
         .skip = false,
         .luma_mode = luma_mode,
         .chroma_mode = chroma_mode,
-        // Non-B_PRED macroblocks contribute a single derived context mode to
-        // their neighbors; `encodeKeyFrameModes` reads this for the B_PRED
-        // probability contexts of later macroblocks.
-        .subblock_modes = @splat(modes.derivedSubblockMode(luma_mode)),
+        .subblock_modes = subblock_modes,
     };
 }
 
@@ -342,9 +397,13 @@ fn selectLuma(
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
+    allow_bpred: bool,
+    submode_contexts: SubmodeContexts,
+    columns: u32,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
+    out_subblock_modes: *[modes.subblock_count]modes.SubblockMode,
 ) modes.LumaMode {
     const stride = recon.luma_stride;
     const mb_x: usize = @as(usize, mb_column) * luma_block;
@@ -366,6 +425,9 @@ fn selectLuma(
     }
 
     const lambda = lambdaFor(factors.y1_ac);
+
+    // --- Best of the four 16x16 modes. Each candidate's rate includes the cost
+    //     of signaling its luma mode, so the B_PRED comparison below is fair.
     var best_cost: u64 = std.math.maxInt(u64);
     var best_mode: modes.LumaMode = .dc;
     var best_block: [luma_pixels]u8 = undefined;
@@ -376,7 +438,7 @@ fn selectLuma(
         var block: [luma_pixels]u8 = undefined;
         var luma_levels: [luma_block][coeff_count]i16 = undefined;
         var y2_levels: [coeff_count]i16 = undefined;
-        const rd = reconstructLuma16(
+        var rd = reconstructLuma16(
             lumaToChromaMode(mode),
             &src,
             &above,
@@ -389,6 +451,7 @@ fn selectLuma(
             &luma_levels,
             &y2_levels,
         );
+        rd.rate += modes.treeCost(&modes.kf_luma_mode_tree, &modes.kf_luma_mode_probabilities, @intFromEnum(mode));
         const cost = rd.cost(lambda);
         if (cost < best_cost) {
             best_cost = cost;
@@ -399,12 +462,296 @@ fn selectLuma(
         }
     }
 
+    // --- B_PRED: per-subblock 4x4 intra. Its rate already includes the B_PRED
+    //     mode flag and the sixteen submode signals. Skipped on the fallback
+    //     pass for frames whose B_PRED modes overflow the first partition.
+    if (allow_bpred) {
+        const bpred = evaluateBpred(
+            &src,
+            recon,
+            factors,
+            probabilities,
+            lambda,
+            submode_contexts,
+            columns,
+            mb_column,
+            mb_row,
+        );
+        if (bpred.rd.cost(lambda) < best_cost) {
+            for (0..luma_block) |r| {
+                recon.luma[(mb_y + r) * stride + mb_x ..][0..luma_block].* = bpred.block[r * luma_block ..][0..luma_block].*;
+            }
+            levels.luma = bpred.levels;
+            levels.y2 = @splat(0); // B_PRED has no Y2 block
+            out_subblock_modes.* = bpred.submodes;
+            return .subblocks;
+        }
+    }
+
     for (0..luma_block) |r| {
         recon.luma[(mb_y + r) * stride + mb_x ..][0..luma_block].* = best_block[r * luma_block ..][0..luma_block].*;
     }
     levels.luma = best_luma;
     levels.y2 = best_y2;
+    out_subblock_modes.* = @splat(modes.derivedSubblockMode(best_mode));
     return best_mode;
+}
+
+// --- B_PRED (per-subblock 4x4 luma intra) ----------------------------------
+//
+// The encoder mirrors the decoder's bordered scratch (`decoder.Scratch`) so the
+// per-subblock prediction, neighbor gathering (including the fixed macroblock-row
+// top-right for right-edge subblocks), and reconstruction are bit-identical: the
+// self-consistency gate then holds for B_PRED exactly as for the 16x16 modes.
+// The loop filter is off in step 8b, so the reconstruction plane equals the
+// decoder's unfiltered top-sample snapshot, which is what the borders read.
+
+const bpred_stride = 24; // 16 block columns + room for column -1 and cols 16..19
+const bpred_margin = 4;
+const bpred_rows = 1 + luma_block;
+
+const SubmodeContexts = struct {
+    above: [modes.subblocks_per_edge]modes.SubblockMode,
+    left: [modes.subblocks_per_edge]modes.SubblockMode,
+};
+
+fn bIndex(row: i32, col: i32) usize {
+    return @intCast((row + 1) * bpred_stride + col + bpred_margin);
+}
+
+const BpredResult = struct {
+    rd: Rd,
+    block: [luma_pixels]u8,
+    levels: [luma_block][coeff_count]i16,
+    submodes: [modes.subblock_count]modes.SubblockMode,
+};
+
+fn evaluateBpred(
+    src: *const [luma_pixels]u8,
+    recon: *const color.YuvPlanes,
+    factors: *const quant.Factors,
+    probabilities: *const token_probs.Table,
+    lambda: u64,
+    submode_contexts: SubmodeContexts,
+    columns: u32,
+    mb_column: u32,
+    mb_row: u32,
+) BpredResult {
+    const stride = recon.luma_stride;
+    const has_above = mb_row > 0;
+    const has_left = mb_column > 0;
+
+    var scratch: [bpred_rows * bpred_stride]u8 = undefined;
+    initBpredScratch(&scratch, recon.luma, stride, columns, mb_column, mb_row, has_above, has_left);
+
+    const luma_plane = &probabilities[tokens.plane_y_no_y2];
+    var above_modes = submode_contexts.above;
+    var left_modes = submode_contexts.left;
+
+    var result: BpredResult = undefined;
+    var total_sse: u64 = 0;
+    var total_rate: u32 = modes.treeCost(
+        &modes.kf_luma_mode_tree,
+        &modes.kf_luma_mode_probabilities,
+        @intFromEnum(modes.LumaMode.subblocks),
+    );
+
+    for (0..modes.subblock_count) |idx| {
+        const sub_x = idx % 4;
+        const sub_y = idx / 4;
+        const neighbors = gatherSubblockNeighbors(&scratch, sub_x, sub_y);
+        const above_mode = above_modes[sub_x];
+        const left_mode = left_modes[sub_y];
+
+        var src_sub: [coeff_count]u8 = undefined;
+        for (0..4) |r| {
+            for (0..4) |c| src_sub[r * 4 + c] = src[(4 * sub_y + r) * luma_block + 4 * sub_x + c];
+        }
+
+        var best_sub_cost: u64 = std.math.maxInt(u64);
+        var best_submode: modes.SubblockMode = .dc;
+        var best_recon: [coeff_count]u8 = undefined;
+        var best_levels: [coeff_count]i16 = undefined;
+        var best_sse: u64 = 0;
+        var best_rate: u32 = 0;
+
+        for (0..modes.subblock_mode_count) |m| {
+            const submode: modes.SubblockMode = @enumFromInt(m);
+            var pred: [coeff_count]u8 = undefined;
+            prediction.predictSubblock(submode, &neighbors, &pred, 4);
+
+            var residual: [coeff_count]i16 = undefined;
+            for (0..coeff_count) |i| residual[i] = @as(i16, src_sub[i]) - @as(i16, pred[i]);
+            var coeffs: [coeff_count]i16 = undefined;
+            forward_transform.forwardDct(&residual, &coeffs);
+
+            var level: [coeff_count]i16 = @splat(0);
+            var dequant: [coeff_count]i16 = @splat(0);
+            level[0] = quant.quantizeCoefficient(coeffs[0], factors.y1_dc);
+            dequant[0] = quant.dequantize(level[0], factors.y1_dc);
+            for (1..coeff_count) |p| {
+                level[p] = quant.quantizeCoefficient(coeffs[p], factors.y1_ac);
+                dequant[p] = quant.dequantize(level[p], factors.y1_ac);
+            }
+
+            var rec: [coeff_count]u8 = pred;
+            if (blockHasNonzero(&dequant)) transform.addInverseDct(&dequant, &rec, 4);
+
+            const sse = sumSquaredError(&src_sub, &rec);
+            // B_PRED luma blocks carry their own DC, so first_position 0.
+            const rate = tokens.blockCost(luma_plane, 0, 0, &level) +
+                bpredSubmodeCost(above_mode, left_mode, submode);
+            const sub_cost = sse + (lambda * rate) / 256;
+            if (sub_cost < best_sub_cost) {
+                best_sub_cost = sub_cost;
+                best_submode = submode;
+                best_recon = rec;
+                best_levels = level;
+                best_sse = sse;
+                best_rate = rate;
+            }
+        }
+
+        // Commit the winning subblock into the scratch so later subblocks
+        // predict from it, exactly as the decoder reconstructs in raster order.
+        for (0..4) |r| {
+            const base = bIndex(@intCast(4 * sub_y + r), @intCast(4 * sub_x));
+            scratch[base..][0..4].* = best_recon[r * 4 ..][0..4].*;
+        }
+        result.levels[idx] = best_levels;
+        result.submodes[idx] = best_submode;
+        total_sse += best_sse;
+        total_rate += best_rate;
+        above_modes[sub_x] = best_submode;
+        left_modes[sub_y] = best_submode;
+    }
+
+    for (0..luma_block) |r| {
+        for (0..luma_block) |c| {
+            result.block[r * luma_block + c] = scratch[bIndex(@intCast(r), @intCast(c))];
+        }
+    }
+    result.rd = .{ .distortion = total_sse, .rate = total_rate };
+    return result;
+}
+
+fn gatherSubmodeContexts(
+    macroblocks: []const modes.Macroblock,
+    columns: u32,
+    mb_column: u32,
+    mb_row: u32,
+) SubmodeContexts {
+    assert(columns >= 1);
+    assert(mb_column < columns);
+
+    var contexts = SubmodeContexts{
+        .above = @splat(.dc),
+        .left = @splat(.dc),
+    };
+
+    if (mb_row > 0) {
+        const index = @as(usize, mb_row - 1) * columns + mb_column;
+        const macroblock_above = macroblocks[index];
+        for (0..modes.subblocks_per_edge) |sub_x| {
+            contexts.above[sub_x] =
+                macroblock_above.subblock_modes[
+                    (modes.subblocks_per_edge - 1) *
+                        modes.subblocks_per_edge + sub_x
+                ];
+        }
+    }
+
+    if (mb_column > 0) {
+        const index = @as(usize, mb_row) * columns + mb_column - 1;
+        const macroblock_left = macroblocks[index];
+        for (0..modes.subblocks_per_edge) |sub_y| {
+            contexts.left[sub_y] =
+                macroblock_left.subblock_modes[
+                    sub_y * modes.subblocks_per_edge +
+                        modes.subblocks_per_edge - 1
+                ];
+        }
+    }
+
+    return contexts;
+}
+
+fn bpredSubmodeCost(
+    above_mode: modes.SubblockMode,
+    left_mode: modes.SubblockMode,
+    submode: modes.SubblockMode,
+) u32 {
+    const probabilities =
+        &modes.kf_subblock_mode_probabilities[@intFromEnum(above_mode)][@intFromEnum(left_mode)];
+    return modes.treeCost(&modes.subblock_mode_tree, probabilities, @intFromEnum(submode));
+}
+
+fn gatherSubblockNeighbors(
+    scratch: *const [bpred_rows * bpred_stride]u8,
+    sub_x: usize,
+    sub_y: usize,
+) prediction.SubblockNeighbors {
+    const above_row: i32 = @as(i32, @intCast(4 * sub_y)) - 1;
+    const sx: i32 = @intCast(4 * sub_x);
+
+    var neighbors: prediction.SubblockNeighbors = undefined;
+    neighbors.above_left = scratch[bIndex(above_row, sx - 1)];
+    neighbors.above = scratch[bIndex(above_row, sx)..][0..4].*;
+    // Right-edge subblocks read the fixed macroblock-row top-right (RFC 12.3),
+    // never in-macroblock pixels.
+    neighbors.above_right = if (sub_x == 3)
+        scratch[bIndex(-1, luma_block)..][0..4].*
+    else
+        scratch[bIndex(above_row, sx + 4)..][0..4].*;
+    for (0..4) |r| {
+        neighbors.left[r] = scratch[bIndex(@as(i32, @intCast(4 * sub_y + r)), sx - 1)];
+    }
+    return neighbors;
+}
+
+fn initBpredScratch(
+    scratch: *[bpred_rows * bpred_stride]u8,
+    plane: []const u8,
+    stride: usize,
+    columns: u32,
+    mb_column: u32,
+    mb_row: u32,
+    has_above: bool,
+    has_left: bool,
+) void {
+    const mb_x: usize = @as(usize, mb_column) * luma_block;
+    const mb_y: usize = @as(usize, mb_row) * luma_block;
+
+    // Above row (cols 0..15) and the macroblock-row top-right (cols 16..19).
+    if (has_above) {
+        for (0..luma_block) |c| scratch[bIndex(-1, @intCast(c))] = plane[(mb_y - 1) * stride + mb_x + c];
+        if (mb_column == columns - 1) {
+            // Rightmost column: replicate the above macroblock's last pixel.
+            const last = plane[(mb_y - 1) * stride + mb_x + luma_block - 1];
+            for (0..4) |c| scratch[bIndex(-1, @intCast(luma_block + c))] = last;
+        } else {
+            for (0..4) |c| {
+                scratch[bIndex(-1, @intCast(luma_block + c))] = plane[(mb_y - 1) * stride + mb_x + luma_block + c];
+            }
+        }
+    } else {
+        for (0..luma_block + 4) |c| scratch[bIndex(-1, @intCast(c))] = prediction.border_above;
+    }
+
+    // Left column (rows 0..15).
+    if (has_left) {
+        for (0..luma_block) |r| scratch[bIndex(@intCast(r), -1)] = plane[(mb_y + r) * stride + mb_x - 1];
+    } else {
+        for (0..luma_block) |r| scratch[bIndex(@intCast(r), -1)] = prediction.border_left;
+    }
+
+    // Above-left corner: same synthetic rule as `gatherFullBlockNeighbors`.
+    scratch[bIndex(-1, -1)] = if (has_above and has_left)
+        plane[(mb_y - 1) * stride + mb_x - 1]
+    else if (!has_above)
+        prediction.border_above
+    else
+        prediction.border_left;
 }
 
 /// Reconstructs one 16x16 luma macroblock for the given mode into the tight
@@ -647,8 +994,12 @@ fn addByteCounts(a: u64, b: u64) Error!u64 {
 // allocations, freed once the partition is finalized; tightening them (or
 // streaming the output) is deferred to the step 10 performance work.
 fn partition0Capacity(mb_count: u32) usize {
-    // Fixed header is ~132 bytes; all-DC modes are well under a byte per MB.
-    return 4096 + @as(usize, mb_count) * 2;
+    // Fixed header is ~132 bytes. A B_PRED macroblock codes the most mode bits:
+    // up to 16 subblock-mode trees of at most 7 booleans plus the luma and
+    // chroma mode trees, ~118 booleans; each boolean is at most 8 bits, so 128
+    // bytes per macroblock bounds it with slack. (Partition 0 must still fit the
+    // 19-bit first_partition_size field, which encodeAlloc enforces separately.)
+    return 4096 + @as(usize, mb_count) * 128;
 }
 
 fn tokenCapacity(mb_count: u32) usize {
@@ -705,6 +1056,120 @@ test "encoder reconstruction matches the decoder byte-for-byte" {
     // synthetic 129. A TrueMotion choice there would diverge if the encoder
     // gathered the wrong corner, so this pins the decoder-mirroring fix.
     try expectSelfConsistent(16, 64);
+}
+
+test "B_PRED macroblocks are selected and stay self-consistent" {
+    const gpa = std.testing.allocator;
+    const width = 48;
+    const height = 48;
+
+    // High-frequency, edge-rich content: 4x4 intra (B_PRED) predicts this far
+    // better than the 16x16 modes, so the rate-distortion decision picks it.
+    const argb = try gpa.alloc(u32, width * height);
+    defer gpa.free(argb);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const v: u32 = @intCast(((x *% 37) ^ (y *% 101) ^ (x *% y)) & 0xff);
+            argb[y * width + x] = 0xff00_0000 | (v << 16) | (v << 8) | v;
+        }
+    }
+
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
+    defer source.deinit(gpa);
+
+    // A fine quantizer makes B_PRED's extra signaling worth its better prediction.
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(95));
+    defer result.deinit(gpa);
+
+    // Self-consistency: the decoder must reproduce the B_PRED reconstruction
+    // byte-for-byte, which only holds if the encoder gathered every subblock
+    // neighbor (including the macroblock-row top-right) exactly as the decoder.
+    var frame = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
+    defer frame.deinit();
+    try std.testing.expectEqualSlices(u8, result.reconstruction.luma, frame.luma);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_u, frame.chroma_u);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_v, frame.chroma_v);
+
+    // Confirm B_PRED was actually exercised (otherwise the check above is vacuous
+    // for the subblock path).
+    var parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(result.bitstream, &parsed);
+    const grid = modes.MacroblockGrid.init(.{ .width = width, .height = height });
+    const mbs = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
+    defer gpa.free(mbs);
+    try modes.parseKeyFrameModes(&parsed.macroblock_reader, &parsed.header, mbs);
+    var bpred_count: usize = 0;
+    for (mbs) |mb| {
+        if (mb.luma_mode == .subblocks) bpred_count += 1;
+    }
+    try std.testing.expect(bpred_count > 0);
+}
+
+test "B_PRED submode cost uses the encoder's mode contexts" {
+    const above_modes = [modes.subblock_count]modes.SubblockMode{
+        .dc,            .vertical,      .horizontal,    .true_motion,
+        .left_down,     .right_down,    .vertical_left, .horizontal_up,
+        .vertical,      .horizontal,    .true_motion,   .dc,
+        .vertical_left, .horizontal_up, .true_motion,   .left_down,
+    };
+    const left_modes = [modes.subblock_count]modes.SubblockMode{
+        .dc,          .dc,          .dc,          .horizontal,
+        .vertical,    .vertical,    .vertical,    .true_motion,
+        .horizontal,  .horizontal,  .horizontal,  .vertical_left,
+        .true_motion, .true_motion, .true_motion, .horizontal_up,
+    };
+    const filler_modes: [modes.subblock_count]modes.SubblockMode = @splat(.dc);
+    const macroblocks = [_]modes.Macroblock{
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .dc,
+            .chroma_mode = .dc,
+            .subblock_modes = filler_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .subblocks,
+            .chroma_mode = .dc,
+            .subblock_modes = above_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .subblocks,
+            .chroma_mode = .dc,
+            .subblock_modes = left_modes,
+        },
+        .{
+            .segment_id = 0,
+            .skip = false,
+            .luma_mode = .dc,
+            .chroma_mode = .dc,
+            .subblock_modes = filler_modes,
+        },
+    };
+
+    const contexts = gatherSubmodeContexts(&macroblocks, 2, 1, 1);
+    try std.testing.expectEqualSlices(
+        modes.SubblockMode,
+        above_modes[12..16],
+        &contexts.above,
+    );
+    try std.testing.expectEqual(
+        [modes.subblocks_per_edge]modes.SubblockMode{
+            left_modes[3],
+            left_modes[7],
+            left_modes[11],
+            left_modes[15],
+        },
+        contexts.left,
+    );
+
+    const submode = modes.SubblockMode.horizontal_up;
+    const contextual_cost = bpredSubmodeCost(contexts.above[0], contexts.left[0], submode);
+    const fixed_dc_cost = bpredSubmodeCost(.dc, .dc, submode);
+    try std.testing.expect(contextual_cost != fixed_dc_cost);
 }
 
 test "full-block neighbor gather mirrors the decoder's synthetic corner" {

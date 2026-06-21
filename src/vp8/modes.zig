@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 
 const bool_reader = @import("bool_reader.zig");
 const bool_writer = @import("bool_writer.zig");
+const cost = @import("cost.zig");
 const errors = @import("../errors.zig");
 const frame_header = @import("frame_header.zig");
 const image = @import("../image.zig");
@@ -493,6 +494,22 @@ fn writeTreeValue(
     for (0..path.len) |step| {
         try writer.writeBool(probabilities[path.probability_indices[step]], path.bits[step]);
     }
+}
+
+/// Cost in 1/256-bit units of coding `value` through `tree` with `probabilities`
+/// — the rate of `writeTreeValue`, summing `cost.boolCost` over the same
+/// root-to-leaf path. The encoder's mode decision adds this mode-signaling cost
+/// to each candidate so the 16x16-vs-B_PRED choice is rate-accurate.
+pub fn treeCost(tree: []const i8, probabilities: []const u8, value: u8) u32 {
+    var path: TreePath = undefined;
+    const found = findTreePath(tree, value, 0, 0, &path);
+    assert(found);
+
+    var bits: u32 = 0;
+    for (0..path.len) |step| {
+        bits += cost.boolCost(probabilities[path.probability_indices[step]], path.bits[step]);
+    }
+    return bits;
 }
 
 /// Writes every macroblock prediction record of a key frame, the exact inverse
