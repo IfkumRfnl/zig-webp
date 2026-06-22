@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 ## Current Position
 
@@ -86,9 +86,18 @@ animated WebP (`VP8X`+`ANIM`+`ANMF`, optional per-frame `ALPH`, optional
 frame against the canvas and the container rules and round-trips through this
 library's demux; `webpinfo`/`webpmux`/`anim_dump` accept output built from real
 encoded frames (see "Step 9 — Animation and Metadata Encode (slice 9a)" and the
-2026-06-23 oracle row). The pixel-level `encodeAnimation` (encoding frames from
-pixel buffers), sub-rectangle/differencing optimization, and metadata-from-pixels
-are slices 9b–9d.
+first 2026-06-23 oracle row). Its second slice — 9b, the pixel-level
+`encodeAnimationFromBuffers` — is now also delivered: `src/animation_encode.zig`
+encodes a caller-supplied ordered list of pixel-buffer frames (each a full-canvas
+or sub-rect `image.Buffer` with its offset, duration, blend/dispose, and lossy or
+lossless codec), reusing the still VP8/VP8L/alpha encode machinery, and muxes them
+via 9a. It carries the step-9 pixel-path gate, which holds: `anim_dump` of four
+generated animations (lossless full-canvas, lossless sub-rect with
+background-dispose, lossy full-canvas, mixed lossless + lossy-alpha) matches this
+library's own composition byte-for-byte across every frame, and all four are
+accepted by `webpinfo` (see "Step 9 — Animation and Metadata Encode (slice 9b)"
+and the second 2026-06-23 oracle row). Inter-frame sub-rectangle/differencing
+optimization and metadata-from-pixels are slices 9c–9d.
 
 ## Cross-Cutting Practices
 
@@ -134,6 +143,52 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 9 — Animation and Metadata Encode (slice 9b: pixel-level encode)
+
+Slice 9b delivers the **pixel-level** animation encoder — the animated analogue
+of the still `encodeLossy`/`encodeLossless`. `animation_encode.encodeAnimationFromBuffers`
+(public `encodeAnimationFromBuffers`) takes a caller-supplied ordered list of
+pixel-buffer frames, encodes each to a bitstream, and muxes them via slice 9a.
+
+- **Inputs.** A `FrameSource` carries the frame's `image.Buffer` (any supported
+  pixel format), its even canvas offset (`x`/`y`), duration, blend/dispose
+  methods, and per-frame codec (`.lossy`/`.lossless`). The buffer's own
+  dimensions are the frame rectangle. An `Options` struct carries the canvas,
+  loop count, background, animation-level metadata, resource limits, and the
+  shared per-frame `quality`/`method`/`alpha_quality` knobs.
+- **Per-frame encode reuses the still machinery** rather than reimplementing
+  codecs: `encode.gatherArgbAlloc` gathers the frame's ARGB, then a lossless
+  frame runs `vp8l_encoder.encodeAlloc` (VP8L carries its own alpha) and a lossy
+  frame runs `color.rgbaToYuv420Alloc` + `vp8_encoder.encodeAlloc`, plus
+  `alpha.encodePlaneAlloc` into an `ALPH` payload when the plane carries
+  transparency (a fully-opaque lossy frame is a plain `VP8 `). Each frame's
+  scratch is freed before the next; the per-frame allocation budgets mirror
+  `encode.zig`'s. The caller dictates the rectangle/blend/dispose; inter-frame
+  optimization is slice 9c.
+- **Mux and validation.** The encoded frames go straight into
+  `mux.encodeAnimation`, which re-validates every rectangle (inside the canvas,
+  even offsets), bitstream dimensions, alpha placement, and the frame/chunk
+  limits — so this layer leans on the mux for the container rules and adds only
+  the canvas/frame-count fast-fail and per-buffer `validate()`.
+
+Round-trip (CI gate, `zig build test`, 378/378 pass, +13 new): an all-lossless
+full-canvas-keyframe animation composites back **byte-for-byte** to its source
+frames through `decodeAnimationAlloc` (the full pixel round-trip); further tests
+cover a lossy frame (decodes at the right dimensions), a lossless sub-rect over a
+keyframe, a lossless alpha frame and a lossy+alpha frame (alpha recovered
+exactly), per-frame blend/dispose (a background-disposed sub-rect clears for the
+next frame), loop count + background round-trip, metadata pass-through, the input
+errors (empty list, odd offset, rect outside canvas) and the frame-count limit,
+and survive allocation failure at every site (`checkAllAllocationFailures` over a
+mixed lossless + lossy-alpha animation). Validity (local, libwebp 1.5.0):
+`tools/webp-oracle.sh compare-anim` confirms `anim_dump` of four generated
+animations (lossless full-canvas, lossless sub-rect with background-dispose,
+lossy full-canvas, mixed lossless + lossy-alpha with alpha-blend) matches this
+library's own composition byte-for-byte across all 8 frames, and `webpinfo`
+reports "No error detected" for all four. See the second 2026-06-23 oracle row.
+Inter-frame sub-rectangle/differencing optimization (9c) and metadata-from-pixels
+(9d) remain.
 
 ### Step 9 — Animation and Metadata Encode (slice 9a: container mux)
 
@@ -632,6 +687,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-22 | VP8 lossy encoder (slice 8c-3) target-size / target-PSNR modes | `EncoderOptions.target_size` (bytes) and `target_psnr` (dB) drive a bounded (≤8-probe, `search_passes_max`) binary search over the quantizer index, re-encoding each probe and keeping the closest-to-target candidate; both unset → byte-identical to the single-pass quality path (asserted at q0/25/50/75/100), both set → `error.InvalidEncodeOptions`. target-PSNR measures full-range BT.601 luma PSNR of the reconstruction (the metric `cwebp` reports). Alpha rides through the search unchanged: the `ALPH` payload is encoded once and reused across probes. Gates (CI `zig build test`, 345/345 pass; `dwebp` `compare-encode-lossy` 0/135 invalid): on the 4 photos target-size lands 0.32–2.83% off (step-8c gate ≤5%), target-PSNR 38.0 dB → 38.01–38.08 dB achieved; a new test confirms target-size on an alpha source still recovers alpha byte-exactly. **This slice carries the step-8c target-size gate and completes the VP8 lossy encoder.** |
 | 2026-06-22 | VP8 lossy encoder (slice 8c-4) sharp (iterative) RGB→YUV chroma | Adds `color.rgbaToYuv420SharpAlloc`, selected by `encodeStaticLossy` when `encode_options.use_sharp_yuv` is set; the default (false) box-average path is byte-identical to before (asserted). Sharp starts from the box grid and runs a bounded 4-pass integer Gauss–Seidel refinement that minimizes, per chroma cell, the residual between the full-resolution chroma target (`rgbToU`/`rgbToV`) and what the decoder's fancy upsampler reconstructs over that cell (a closed-form 9:3:3:1 diamond matching `upsampleFancy`, gated by test); luma is left at full resolution. Self-consistency holds (sharp changes only the source chroma, not the encoder-vs-decoder equivalence). Validity: locally `dwebp` 1.5.0 decodes all 4 sharp photo outputs; `compare-encode-lossy` 0/135 invalid. Quality (reported): on an isolated saturated red/blue color edge the converter gains +2.20 dB RGB PSNR at matched size (13.89 → 16.09); end-to-end (encode q75 → decode, sharp vs box) RGB PSNR +0.55–1.36 dB on signage/foliage/sky and −0.03 dB on portrait — but at matched *quality*, so sharp preserves more chroma detail and the outputs run slightly larger (a matched-size comparison would narrow the gain to roughly the isolated-converter figure). Merged, briefly reverted (#66), and re-applied (#67) during integration; net result is in `main`. |
 | 2026-06-23 | Animation container mux (slice 9a) accepted by `webpinfo`/`webpmux`/`anim_dump` | New `mux.encodeAnimation` (public `encodeAnimation`) assembles already-encoded frame bitstreams into an animated WebP: `VP8X` (animation flag + canvas) → optional `ICCP` → `ANIM` (background + loop count) → one `ANMF` per frame (16-byte frame header + optional lossy `ALPH` + `VP8 `/`VP8L`) → optional `EXIF`/`XMP `. It does not encode pixels — `AnimationImage`/`AnimationFrameImage` carry the bitstreams, the animated analogue of `StaticImage`/`encodeStatic`. Every frame's rectangle (inside the canvas, even offsets), codec, bitstream dimensions, and alpha are validated, and the `VP8X` alpha flag is set iff any frame carries alpha — the same constraints `demux` enforces on read, so a muxed animation always round-trips. Round-trip (CI gate, `zig build test`, 365/365 pass): 12 new tests mux multi-frame lossy+lossless animations and parse them back through `demux` (rects, durations, blend/dispose, loop count, background, metadata), cover the validation errors (odd offset, lossless+`ALPH`, rect outside canvas, dimension mismatch, empty list) and the frame-count limit, and survive allocation failure at every site. Validity (local, libwebp 1.5.0): a 32×32 two-frame animation built from real library-encoded frames (lossless full-canvas + lossy 16×16 sub-rect with background dispose) is accepted by `webpinfo` ("No error detected"), listed correctly by `webpmux -info`, and decoded to per-frame PNGs by `anim_dump`. This is the step-9 container layer; pixel-level `encodeAnimation` from buffers (and the `anim_dump`-matches-our-composition gate) is slice 9b. |
+| 2026-06-23 | Pixel-level animation encode (slice 9b) `anim_dump` matches our composition | New `animation_encode.encodeAnimationFromBuffers` (public `encodeAnimationFromBuffers`) encodes a caller-supplied ordered list of pixel-buffer frames into an animated WebP — the animated analogue of `encodeLossy`/`encodeLossless`. Each `FrameSource` (an `image.Buffer` + even canvas offset + duration + blend/dispose + lossy/lossless codec) is encoded by reusing the still machinery (`encode.gatherArgbAlloc`, then `vp8l_encoder.encodeAlloc` for lossless, or `color.rgbaToYuv420Alloc` + `vp8_encoder.encodeAlloc` + `alpha.encodePlaneAlloc` for lossy+alpha) and muxed via slice 9a; the caller dictates each frame's rectangle/blend/dispose (inter-frame optimization is 9c). Round-trip (**CI gate, `zig build test`, 378/378 pass, +13 new**): an all-lossless full-canvas-keyframe animation composites back **byte-for-byte** to its source frames via `decodeAnimationAlloc`; further tests cover a lossy frame (right dims), a lossless sub-rect over a keyframe, a lossless and a lossy+alpha frame (alpha recovered exactly), per-frame blend/dispose (background-dispose clears a sub-rect for the next frame), loop count + background + metadata round-trip, the input errors (empty list, odd offset, rect outside canvas) and the frame-count limit, and survive allocation failure at every site over a mixed lossless + lossy-alpha animation. **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim` — `anim_dump` of four generated animations (lossless full-canvas, lossless sub-rect with background-dispose, lossy full-canvas, mixed lossless + lossy-alpha with alpha-blend) matches this library's own composition byte-for-byte across all 8 frames (compared=4, failed=0), and `webpinfo` reports "No error detected" for all four.** This carries the step-9 pixel-path gate; sub-rectangle/differencing optimization (9c) and metadata-from-pixels (9d) remain. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
