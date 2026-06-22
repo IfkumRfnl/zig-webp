@@ -1,17 +1,19 @@
-//! VP8 lossy encoder — step 8b-3a skip decisions and loop-filter selection.
+//! VP8 lossy encoder — step 8b-3b adaptive per-segment quantization.
 //!
 //! Produces a valid `VP8 ` key-frame bitstream from source YUV 4:2:0 planes.
-//! Each macroblock picks its luma mode — one of the four 16x16 modes (DC/V/H/TM)
-//! or per-subblock 4x4 B_PRED — and its shared 8x8 chroma mode by a
-//! rate-distortion score (reconstruction SSE plus the VP8 token bit cost).
+//! A pre-pass (`segment.analyze`) buckets the macroblocks into up to four
+//! segments by luma complexity and gives each segment its own quantizer, so
+//! detail-rich regions can be coded finer than flat ones. Each macroblock then
+//! picks its luma mode — one of the four 16x16 modes (DC/V/H/TM) or per-subblock
+//! 4x4 B_PRED — and its shared 8x8 chroma mode by a rate-distortion score
+//! (reconstruction SSE plus the VP8 token bit cost) at its segment's quantizer.
 //! Macroblocks whose residue quantizes entirely to zero are coded as
 //! `mb_skip_coeff`, with the frame's skip probability derived from the realized
 //! skip ratio. The RFC 6386 section 15 in-loop deblocking filter then runs at a
 //! level chosen from the quantizer (mirroring `cwebp`'s default strength), the
 //! encoder filtering its own reconstruction so a conforming decoder still
-//! reproduces it bit-for-bit. Coefficient probabilities stay at the RFC
-//! defaults, there is a single token partition, and segmentation stays off
-//! until step 8b-3b.
+//! reproduces it bit-for-bit. Coefficient probabilities stay at the RFC defaults
+//! and there is a single token partition.
 //!
 //! Correctness rests on one invariant (see PLAN.MD step 8a): the encoder
 //! reconstructs each macroblock by feeding its own quantized levels back through
@@ -20,9 +22,12 @@
 //! it has already reconstructed, then emits exactly those levels. A conforming
 //! decoder therefore reproduces the stored reconstruction bit-for-bit, because
 //! both sides run identical math on identical inputs. The forward transform,
-//! quantizer, and mode decision only affect quality, never this
-//! self-consistency — which is why the encoder gathers prediction neighbors the
-//! way the decoder does, including the synthetic above-left corner.
+//! quantizer, mode decision, and segment assignment only affect quality, never
+//! this self-consistency — the per-segment quantizer the encoder reconstructs
+//! with is exactly the one the header declares, so the decoder resolves the same
+//! factors via `quant.segmentFactors`. This is also why the encoder gathers
+//! prediction neighbors the way the decoder does, including the synthetic
+//! above-left corner.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -37,6 +42,7 @@ const loop_filter = @import("loop_filter.zig");
 const modes = @import("modes.zig");
 const prediction = @import("prediction.zig");
 const quant = @import("quant.zig");
+const segment = @import("segment.zig");
 const token_probs = @import("token_probs.zig");
 const tokens = @import("tokens.zig");
 const transform = @import("transform.zig");
@@ -90,12 +96,18 @@ pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
     );
     const above_flags_bytes = try elementByteCount(tokens.NonzeroFlags, grid.columns);
     const has_nonzero_bytes = try elementByteCount(bool, mb_count);
+    // Per-macroblock segment ids live through the reconstruction pass. The
+    // analysis complexity scratch (one i32 per macroblock) is freed before the
+    // larger reconstruction/token buffers are allocated, so it never raises this
+    // simultaneous-live peak.
+    const segment_id_bytes = try elementByteCount(u2, mb_count);
 
     var peak = macroblock_bytes;
     peak = try addByteCounts(peak, reconstruction_bytes);
     peak = try addByteCounts(peak, token_bytes);
     peak = try addByteCounts(peak, above_flags_bytes);
     peak = try addByteCounts(peak, has_nonzero_bytes);
+    peak = try addByteCounts(peak, segment_id_bytes);
     peak = try addByteCounts(peak, partition0_bytes);
     peak = try addByteCounts(peak, bitstream_bytes);
     return peak;
@@ -136,13 +148,29 @@ fn encodeFramePass(
     // `skip_probability` is filled in below from the per-macroblock skip
     // decisions, which are only known after the reconstruction pass.
     var header = baselineHeader(dimensions, base_quant_index);
-    // Segmentation is disabled, so every segment shares the frame-level factors.
-    const factors = quant.segmentFactors(&header)[0];
 
     // --- Per-macroblock mode records, filled by the reconstruction pass below
     //     and written into partition 0 once every mode is decided.
     const macroblocks = try gpa.alloc(modes.Macroblock, mb_count);
     defer gpa.free(macroblocks);
+
+    // --- Segment analysis: bucket macroblocks by luma complexity and give each
+    //     segment its own quantizer (`header.segmentation`). The complexity
+    //     scratch is freed before the larger reconstruction buffers below; the
+    //     per-macroblock segment ids drive the reconstruction pass. When the
+    //     frame carries too little variation the plan stays disabled and every
+    //     id is 0, so the frame is byte-identical to single-quantizer output.
+    const segment_ids = try gpa.alloc(u2, mb_count);
+    defer gpa.free(segment_ids);
+    {
+        const complexity = try gpa.alloc(i32, mb_count);
+        defer gpa.free(complexity);
+        const plan = segment.analyze(source, grid, base_quant_index, complexity, segment_ids);
+        if (plan.enabled) header.segmentation = plan.segmentation;
+    }
+    // Per-segment dequant factors the encoder reconstructs with — exactly what
+    // the decoder resolves from `header.segmentation` (so self-consistency holds).
+    const segment_factors = quant.segmentFactors(&header);
 
     // --- Reconstruction planes (the encoder's running prediction context and
     //     the artifact the self-consistency gate checks).
@@ -168,7 +196,7 @@ fn encodeFramePass(
 
     var token_options = tokens.MacroblockOptions{
         .probabilities = &header.coefficient_probabilities,
-        .factors = &factors, // unused by writeMacroblock; levels are already quantized
+        .factors = &segment_factors[0], // unused by writeMacroblock; levels are already quantized
         .has_y2 = true, // set per macroblock below: 16x16 modes route DC through Y2
         .skip = false, // set per macroblock below
     };
@@ -182,6 +210,7 @@ fn encodeFramePass(
             var levels = tokens.MacroblockLevels{};
             const index = row * grid.columns + column;
             const macroblock = &macroblocks[index];
+            const segment_id = segment_ids[index];
             const submode_contexts = gatherSubmodeContexts(
                 macroblocks,
                 grid.columns,
@@ -191,13 +220,14 @@ fn encodeFramePass(
             encodeMacroblock(
                 source,
                 &reconstruction,
-                &factors,
+                &segment_factors[segment_id],
                 &header.coefficient_probabilities,
                 allow_bpred,
                 submode_contexts,
                 grid.columns,
                 column,
                 row,
+                segment_id,
                 &levels,
                 macroblock,
             );
@@ -294,6 +324,7 @@ fn encodePartition0(
         .y_ac_quant_index = base_quant_index,
         .skip_enabled = header.skip_enabled,
         .skip_probability = header.skip_probability,
+        .segmentation = header.segmentation,
     });
     try modes.encodeKeyFrameModes(&writer, header, macroblocks);
     return .{ .buffer = buffer, .bytes = try writer.finish() };
@@ -301,11 +332,11 @@ fn encodePartition0(
 
 /// The key-frame header shared by the dequant factors, the loop-filter strength
 /// derivation, and the mode-record contexts, kept consistent with the bits
-/// `frame_header.writeCompressedHeader` emits. One segment, no quantizer or
-/// filter deltas, default coefficient probabilities. The normal (non-simple)
-/// deblocking filter runs at a quantizer-derived level, and macroblock skip
-/// coding is enabled; `skip_probability` is filled in once the skip count is
-/// known.
+/// `frame_header.writeCompressedHeader` emits. Default coefficient probabilities.
+/// Segmentation starts disabled and is replaced by `segment.analyze`'s plan when
+/// adaptive per-segment quantization helps. The normal (non-simple) deblocking
+/// filter runs at a quantizer-derived level, and macroblock skip coding is
+/// enabled; `skip_probability` is filled in once the skip count is known.
 fn baselineHeader(dimensions: image.Dimensions, base_quant_index: u8) frame_header.Header {
     return .{
         .tag = .{ .version = 0, .first_partition_size = 0 },
@@ -404,6 +435,7 @@ fn encodeMacroblock(
     columns: u32,
     mb_column: u32,
     mb_row: u32,
+    segment_id: u2,
     levels: *tokens.MacroblockLevels,
     macroblock: *modes.Macroblock,
 ) void {
@@ -427,7 +459,7 @@ fn encodeMacroblock(
     );
     const chroma_mode = selectChroma(source, recon, factors, probabilities, mb_column, mb_row, levels);
     macroblock.* = .{
-        .segment_id = 0,
+        .segment_id = segment_id,
         .skip = false,
         .luma_mode = luma_mode,
         .chroma_mode = chroma_mode,
@@ -1409,4 +1441,57 @@ test "loop filter runs and the reconstruction is the filtered frame" {
     var unfiltered = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = false });
     defer unfiltered.deinit();
     try std.testing.expect(!std.mem.eql(u8, result.reconstruction.luma, unfiltered.luma));
+}
+
+test "segmentation engages and stays self-consistent on mixed content" {
+    const gpa = std.testing.allocator;
+    const width = 96;
+    const height = 64;
+
+    // Flat left half, high-frequency right half: the two regions have very
+    // different luma complexity, so the analysis splits them across segments and
+    // codes each at its own quantizer.
+    const argb = try gpa.alloc(u32, width * height);
+    defer gpa.free(argb);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const v: u32 = if (x < width / 2)
+                0x40
+            else
+                @intCast(((x *% 53) ^ (y *% 97) ^ (x *% y)) & 0xff);
+            argb[y * width + x] = 0xff00_0000 | (v << 16) | (v << 8) | v;
+        }
+    }
+
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
+    defer source.deinit(gpa);
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(75));
+    defer result.deinit(gpa);
+
+    // Segmentation must be enabled with more than one segment actually used.
+    var parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(result.bitstream, &parsed);
+    try std.testing.expect(parsed.header.segmentation.enabled);
+    try std.testing.expect(parsed.header.segmentation.update_map);
+    try std.testing.expect(!parsed.header.segmentation.absolute_values);
+
+    const grid = modes.MacroblockGrid.init(.{ .width = width, .height = height });
+    const mbs = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
+    defer gpa.free(mbs);
+    try modes.parseKeyFrameModes(&parsed.macroblock_reader, &parsed.header, mbs);
+    var seen = [_]bool{ false, false, false, false };
+    for (mbs) |mb| seen[mb.segment_id] = true;
+    var distinct: usize = 0;
+    for (seen) |s| {
+        if (s) distinct += 1;
+    }
+    try std.testing.expect(distinct >= 2);
+
+    // The decoder resolves each macroblock's per-segment quantizer from the
+    // header and must reproduce the encoder's reconstruction byte-for-byte.
+    var frame = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
+    defer frame.deinit();
+    try std.testing.expectEqualSlices(u8, result.reconstruction.luma, frame.luma);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_u, frame.chroma_u);
+    try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_v, frame.chroma_v);
 }
