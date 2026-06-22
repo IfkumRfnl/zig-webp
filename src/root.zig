@@ -245,9 +245,12 @@ pub fn encodeVP8LBitstream(
 /// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
 /// using the step 8a baseline encoder: a fixed all-DC mode decision, no loop
 /// filter, and default coefficient probabilities (see PLAN.MD step 8a). The
-/// buffer may be `rgba`/`bgra`/`argb` or `rgb`, read row-major honoring stride;
-/// the alpha channel is dropped (lossy alpha via `ALPH` is step 8c).
-/// `encode_options.quality` (0..100) selects the quantizer and
+/// buffer may be `rgba`/`bgra`/`argb` or `rgb`, read row-major honoring stride.
+/// A meaningful (non-fully-opaque) alpha channel is encoded losslessly into an
+/// `ALPH` chunk and emitted as a `VP8X` + `ALPH` + `VP8 ` container (PLAN.MD
+/// step 8c); fully-opaque input emits a plain `VP8 ` file.
+/// `encode_options.quality` (0..100) selects the color quantizer,
+/// `encode_options.alpha_quality` (0..100) the alpha compression effort, and
 /// `encode_options.format` must be `.lossy`. Returns caller-owned bytes.
 pub fn encodeLossy(
     gpa: std.mem.Allocator,
