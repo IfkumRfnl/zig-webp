@@ -34,8 +34,12 @@ size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact
 +0.08 dB). Step 8c then completed the lossy encoder: a `method` (0..6) effort
 knob that scales the rate-distortion search, lossy+alpha via the `ALPH` chunk
 (lossless, byte-exact alpha), target-size and target-PSNR encode modes, and
-optional sharp (iterative) RGB→YUV chroma. What remains on the encode side is
-animation and metadata encode (step 9). The installed `zig-webp-encode` tool
+optional sharp (iterative) RGB→YUV chroma. Animation and metadata encode (step 9)
+is now underway: `encodeAnimation` muxes already-encoded frame bitstreams into a
+valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame `ALPH` and
+`ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of `encodeStatic` —
+accepted by `webpinfo`/`webpmux`/`anim_dump`. Encoding animation frames straight
+from pixel buffers is the next slice. The installed `zig-webp-encode` tool
 re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
