@@ -55,10 +55,14 @@ pub fn encodeStaticLossless(
     }, .{ .limits = encode_options.limits });
 }
 
-/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
-/// with the step 8a baseline encoder: a fixed all-DC mode decision, no loop
-/// filter, and default coefficient probabilities. The buffer's `format` may be
-/// any supported layout. Color always goes through the VP8 lossy path; when the
+/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file.
+/// The encoder performs rate-distortion intra mode decision (16x16/8x8 modes and
+/// per-subblock 4x4 B_PRED), macroblock skip coding, quantizer-derived in-loop
+/// deblocking, and adaptive per-segment quantization, with the search effort
+/// scaled by `encode_options.method` (0..6); coefficient probabilities stay at
+/// the RFC defaults and there is one token partition. The buffer's `format` may
+/// be any supported layout. Color always goes through the VP8 lossy path; when
+/// the
 /// input carries a meaningful (non-fully-opaque) alpha channel, the alpha plane
 /// is encoded losslessly into an `ALPH` chunk and the file is emitted as a
 /// `VP8X` + `ALPH` + `VP8 ` container (step 8c). A fully-opaque input still

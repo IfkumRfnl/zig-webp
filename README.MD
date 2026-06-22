@@ -21,19 +21,22 @@ library also exposes bounded option and limit types, image buffers, metadata,
 animation-frame and feature probing, RIFF/WebP demux, static mux, and the
 VP8/VP8L bitstream infrastructure.
 
-Encode work is in progress. `encodeLossless` turns a typed pixel buffer
-(RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L` WebP file;
-the current lossless encoder uses the step-7 transform/cache/group machinery
-and round-trips bit-exactly through this library's decoder. `encodeLossy`
-emits a valid `VP8 ` WebP file with rate-distortion intra mode decision
-(the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock skip coding,
-the in-loop deblocking filter at a quantizer-derived level, and adaptive
-per-segment quantization; coefficient probabilities stay at the RFC defaults
-and there is one token partition. Step 8b met its quality gate — at matched
-output size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` —
-so the remaining lossy work is step 8c (presets, target-size/PSNR modes,
-sharp-YUV chroma) and `ALPH` alpha, which is dropped until then. The installed
-`zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
+Static encode is implemented for both formats. `encodeLossless` turns a typed
+pixel buffer (RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L`
+WebP file; the lossless encoder uses the step-7 transform/cache/group machinery
+and round-trips bit-exactly through this library's decoder. `encodeLossy` emits
+a valid `VP8 ` (or `VP8X` + `ALPH` + `VP8 `) WebP file with rate-distortion
+intra mode decision (the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock
+skip coding, the in-loop deblocking filter at a quantizer-derived level, and
+adaptive per-segment quantization (coefficient probabilities stay at the RFC
+defaults, one token partition). Step 8b met its quality gate — at matched output
+size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact
++0.08 dB). Step 8c then completed the lossy encoder: a `method` (0..6) effort
+knob that scales the rate-distortion search, lossy+alpha via the `ALPH` chunk
+(lossless, byte-exact alpha), target-size and target-PSNR encode modes, and
+optional sharp (iterative) RGB→YUV chroma. What remains on the encode side is
+animation and metadata encode (step 9). The installed `zig-webp-encode` tool
+re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
 
