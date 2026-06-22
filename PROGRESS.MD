@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 ## Current Position
 
@@ -86,9 +86,29 @@ animated WebP (`VP8X`+`ANIM`+`ANMF`, optional per-frame `ALPH`, optional
 frame against the canvas and the container rules and round-trips through this
 library's demux; `webpinfo`/`webpmux`/`anim_dump` accept output built from real
 encoded frames (see "Step 9 — Animation and Metadata Encode (slice 9a)" and the
-2026-06-23 oracle row). The pixel-level `encodeAnimation` (encoding frames from
-pixel buffers), sub-rectangle/differencing optimization, and metadata-from-pixels
-are slices 9b–9d.
+first 2026-06-23 oracle row).
+
+Slice 9d — **metadata-from-pixels for still encode** — is also delivered.
+`EncoderOptions` gained a `metadata: metadata.RawPayloads = .{}` field, threaded
+into the `mux.encodeStatic` calls in `encodeStaticLossless`/`encodeStaticLossy`,
+so the public still encoders (`encodeLossless`/`encodeLossy`) can now attach raw
+`ICCP`/`EXIF`/`XMP ` (the mux already wrote them; this closes the from-pixels
+API gap). Present metadata forces the extended (`VP8X`) container and the chunks
+emit in spec-canonical order — `VP8X` → `ICCP` → (`ALPH`) → `VP8(L)` → `EXIF` →
+`XMP ` — round-tripping byte-exactly through `demux`; with empty metadata (the
+default) the output is byte-identical to the pre-9d path (asserted by test
+against a direct mux call). Metadata coexists with a lossy `ALPH` chunk and rides
+through the target-size/PSNR searches unchanged. Chunk-order honesty: the
+from-pixels path emits canonical order (there is no caller-specified order to
+preserve there); the `mux.encodeStaticFromDemux` remux path is what preserves
+unknown-chunk order. Animation-level metadata stays owned by 9a's
+`AnimationImage.metadata` (and 9b's `AnimationEncodeOptions.metadata`), not
+duplicated here. The step-9 browser-render gate is set up but not closed:
+metadata-bearing still samples validate cleanly under `webpinfo` (no errors), and
+the full ≥2-browser check is best done once 9b/9c land real pixel animations (see
+"Step 9 — Animation and Metadata Encode (slice 9d)" and the second 2026-06-23
+oracle row). The pixel-level `encodeAnimation` (9b) and frame-optimization (9c)
+remain.
 
 ## Cross-Cutting Practices
 
@@ -134,6 +154,54 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 9 — Animation and Metadata Encode (slice 9d: still-encode metadata)
+
+Slice 9d closes the still pixel-encode metadata gap. The mux already wrote
+`ICCP`/`EXIF`/`XMP ` (and `StaticImage.metadata` supported them), but the public
+still encoders called it with empty metadata, silently dropping any profile/EXIF/
+XMP. 9d threads metadata through.
+
+- **API.** `EncoderOptions` (the shared options bag for both still encoders)
+  gained `metadata: metadata.RawPayloads = .{}` (raw `?[]const u8`
+  `color_profile`/`exif`/`xmp`, caller-owned, written verbatim). It is forwarded
+  into the `mux.encodeStatic` calls in `encodeStaticLossless` and
+  `encodeStaticLossy` (the latter in `encodeLossyPass`, so it also rides every
+  probe of the target-size/PSNR searches). `options.zig` imports `metadata.zig`;
+  `metadata.zig` imports only `container.zig`, so there is no import cycle.
+- **Output.** Present metadata forces the extended (`VP8X`) container and emits
+  the chunks in spec-canonical order — `VP8X` → `ICCP` → (`ALPH`) → `VP8(L)` →
+  `EXIF` → `XMP `. Metadata and a lossy `ALPH` chunk coexist correctly. With
+  empty metadata (the default) the output is byte-identical to the pre-9d path.
+- **Allocation accounting.** The lossy pass charges the live metadata payload
+  bytes against the mux allocation budget alongside the borrowed `ALPH` payload
+  (`metadataByteCount`); the mux's own `validateAllocationBytes(file_size)`
+  remains the authoritative gate.
+- **Chunk-order honesty.** The from-pixels encoders emit canonical order (there
+  is no caller-specified order to preserve on that path). Caller chunk-order
+  preservation is the `mux.encodeStaticFromDemux` remux path's job (unchanged
+  here, already covered by its round-trip test). Animation-level metadata stays
+  owned by 9a's `AnimationImage.metadata`; 9d does not duplicate it.
+
+Round-trip (CI gate, `zig build test`, 370/370 pass): 5 new encode tests assert
+(a) `encodeLossless`/`encodeLossy` with ICCP+EXIF+XMP recover each payload
+byte-exactly through `demux` with the chunks in spec order and the file an
+extended (`VP8X`) container; (b) a lossy+alpha+metadata case keeps `ALPH` and the
+metadata chunks in canonical order and round-trips alpha exactly; (c) the
+empty-metadata lossless path is byte-identical to a direct simple-`VP8L` mux; and
+(d) allocation-failure-at-every-site for both encoders with metadata present. The
+existing lossy "byte-identical with target modes inert" test continues to assert
+the empty-metadata lossy path is unchanged.
+
+Browser-render check (step-9 completion gate): **set up, not closed.** Three
+samples were generated via the new API and the in-main `mux.encodeAnimation` (a
+metadata-bearing lossless still, a metadata-bearing lossy still, and a two-frame
+lossless animation with XMP) and validated with `webpinfo` — all "No error
+detected", with the ICCP/EXIF/XMP/Animation flags and chunk offsets in
+spec-canonical order. The full "renders in ≥2 major browsers" gate is a manual
+step best run once 9b/9c land real pixel animations; it is **not** treated as a
+hard gate for this slice and **not** added to CI. See the second 2026-06-23
+oracle row.
 
 ### Step 9 — Animation and Metadata Encode (slice 9a: container mux)
 
@@ -632,6 +700,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-22 | VP8 lossy encoder (slice 8c-3) target-size / target-PSNR modes | `EncoderOptions.target_size` (bytes) and `target_psnr` (dB) drive a bounded (≤8-probe, `search_passes_max`) binary search over the quantizer index, re-encoding each probe and keeping the closest-to-target candidate; both unset → byte-identical to the single-pass quality path (asserted at q0/25/50/75/100), both set → `error.InvalidEncodeOptions`. target-PSNR measures full-range BT.601 luma PSNR of the reconstruction (the metric `cwebp` reports). Alpha rides through the search unchanged: the `ALPH` payload is encoded once and reused across probes. Gates (CI `zig build test`, 345/345 pass; `dwebp` `compare-encode-lossy` 0/135 invalid): on the 4 photos target-size lands 0.32–2.83% off (step-8c gate ≤5%), target-PSNR 38.0 dB → 38.01–38.08 dB achieved; a new test confirms target-size on an alpha source still recovers alpha byte-exactly. **This slice carries the step-8c target-size gate and completes the VP8 lossy encoder.** |
 | 2026-06-22 | VP8 lossy encoder (slice 8c-4) sharp (iterative) RGB→YUV chroma | Adds `color.rgbaToYuv420SharpAlloc`, selected by `encodeStaticLossy` when `encode_options.use_sharp_yuv` is set; the default (false) box-average path is byte-identical to before (asserted). Sharp starts from the box grid and runs a bounded 4-pass integer Gauss–Seidel refinement that minimizes, per chroma cell, the residual between the full-resolution chroma target (`rgbToU`/`rgbToV`) and what the decoder's fancy upsampler reconstructs over that cell (a closed-form 9:3:3:1 diamond matching `upsampleFancy`, gated by test); luma is left at full resolution. Self-consistency holds (sharp changes only the source chroma, not the encoder-vs-decoder equivalence). Validity: locally `dwebp` 1.5.0 decodes all 4 sharp photo outputs; `compare-encode-lossy` 0/135 invalid. Quality (reported): on an isolated saturated red/blue color edge the converter gains +2.20 dB RGB PSNR at matched size (13.89 → 16.09); end-to-end (encode q75 → decode, sharp vs box) RGB PSNR +0.55–1.36 dB on signage/foliage/sky and −0.03 dB on portrait — but at matched *quality*, so sharp preserves more chroma detail and the outputs run slightly larger (a matched-size comparison would narrow the gain to roughly the isolated-converter figure). Merged, briefly reverted (#66), and re-applied (#67) during integration; net result is in `main`. |
 | 2026-06-23 | Animation container mux (slice 9a) accepted by `webpinfo`/`webpmux`/`anim_dump` | New `mux.encodeAnimation` (public `encodeAnimation`) assembles already-encoded frame bitstreams into an animated WebP: `VP8X` (animation flag + canvas) → optional `ICCP` → `ANIM` (background + loop count) → one `ANMF` per frame (16-byte frame header + optional lossy `ALPH` + `VP8 `/`VP8L`) → optional `EXIF`/`XMP `. It does not encode pixels — `AnimationImage`/`AnimationFrameImage` carry the bitstreams, the animated analogue of `StaticImage`/`encodeStatic`. Every frame's rectangle (inside the canvas, even offsets), codec, bitstream dimensions, and alpha are validated, and the `VP8X` alpha flag is set iff any frame carries alpha — the same constraints `demux` enforces on read, so a muxed animation always round-trips. Round-trip (CI gate, `zig build test`, 365/365 pass): 12 new tests mux multi-frame lossy+lossless animations and parse them back through `demux` (rects, durations, blend/dispose, loop count, background, metadata), cover the validation errors (odd offset, lossless+`ALPH`, rect outside canvas, dimension mismatch, empty list) and the frame-count limit, and survive allocation failure at every site. Validity (local, libwebp 1.5.0): a 32×32 two-frame animation built from real library-encoded frames (lossless full-canvas + lossy 16×16 sub-rect with background dispose) is accepted by `webpinfo` ("No error detected"), listed correctly by `webpmux -info`, and decoded to per-frame PNGs by `anim_dump`. This is the step-9 container layer; pixel-level `encodeAnimation` from buffers (and the `anim_dump`-matches-our-composition gate) is slice 9b. |
+| 2026-06-23 | Still-encode metadata (slice 9d) round-trips through `demux`; samples validate under `webpinfo` | `EncoderOptions` gained `metadata: metadata.RawPayloads = .{}`, threaded into the `mux.encodeStatic` calls in `encodeStaticLossless`/`encodeStaticLossy` (the latter via `encodeLossyPass`, so it rides every target-size/PSNR probe). The public still encoders (`encodeLossless`/`encodeLossy`) can now attach raw `ICCP`/`EXIF`/`XMP ` (the mux already wrote them; this closes the from-pixels API gap). Present metadata forces the extended (`VP8X`) container; the chunks emit in spec-canonical order (`VP8X` → `ICCP` → (`ALPH`) → `VP8(L)` → `EXIF` → `XMP `) and coexist with a lossy `ALPH`. `options.zig` imports `metadata.zig`, which imports only `container.zig` — no import cycle. Round-trip (CI gate, `zig build test`, 370/370 pass): 5 new tests assert lossless and lossy both recover ICCP+EXIF+XMP byte-exactly through `demux` with chunks in spec order; a lossy+alpha+metadata case keeps `ALPH`+metadata in canonical order and round-trips alpha exactly; the empty-metadata lossless path is byte-identical to a direct simple-`VP8L` mux (the lossy empty-metadata path stays covered by the existing 8c-3 byte-identical test); and allocation-failure-at-every-site holds for both encoders with metadata present. Chunk-order honesty: the from-pixels path emits canonical order (no caller-specified order to preserve); the `mux.encodeStaticFromDemux` remux path preserves unknown-chunk order. Browser-render gate set up, not closed: three samples (metadata-bearing lossless still, lossy still, and a 2-frame lossless animation with XMP via in-main `mux.encodeAnimation`) validate under `webpinfo` ("No error detected", ICCP/EXIF/XMP/Animation flags set, chunks in spec order); the ≥2-browser manual check is deferred to once 9b/9c land real pixel animations and is not in CI. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

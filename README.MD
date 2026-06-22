@@ -24,8 +24,12 @@ VP8/VP8L bitstream infrastructure.
 Static encode is implemented for both formats. `encodeLossless` turns a typed
 pixel buffer (RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L`
 WebP file; the lossless encoder uses the step-7 transform/cache/group machinery
-and round-trips bit-exactly through this library's decoder. `encodeLossy` emits
-a valid `VP8 ` (or `VP8X` + `ALPH` + `VP8 `) WebP file with rate-distortion
+and round-trips bit-exactly through this library's decoder. Both still encoders
+also take optional raw `ICCP`/`EXIF`/`XMP ` metadata
+(`EncoderOptions.metadata`); when present the output is an extended (`VP8X`)
+container with those chunks in spec-canonical order, round-tripping byte-exactly
+through `parseWebP` (with empty metadata the output is byte-identical to before).
+`encodeLossy` emits a valid `VP8 ` (or `VP8X` + `ALPH` + `VP8 `) WebP file with rate-distortion
 intra mode decision (the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock
 skip coding, the in-loop deblocking filter at a quantizer-derived level, and
 adaptive per-segment quantization (coefficient probabilities stay at the RFC
@@ -38,9 +42,10 @@ optional sharp (iterative) RGB→YUV chroma. Animation and metadata encode (step
 is now underway: `encodeAnimation` muxes already-encoded frame bitstreams into a
 valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame `ALPH` and
 `ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of `encodeStatic` —
-accepted by `webpinfo`/`webpmux`/`anim_dump`. Encoding animation frames straight
-from pixel buffers is the next slice. The installed `zig-webp-encode` tool
-re-encodes a still WebP as lossy `VP8 `.
+accepted by `webpinfo`/`webpmux`/`anim_dump`, and the still pixel encoders now
+attach metadata (above). Encoding animation frames straight from pixel buffers,
+and frame optimization, are the remaining step-9 slices. The installed
+`zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
 

@@ -3,6 +3,7 @@
 const features = @import("features.zig");
 const image = @import("image.zig");
 const limits = @import("limits.zig");
+const metadata = @import("metadata.zig");
 
 pub const DecoderOptions = struct {
     limits: limits.ResourceLimits = .{},
@@ -16,9 +17,8 @@ pub const DecoderOptions = struct {
     decode_animation: bool = true,
 };
 
-/// Forward-looking surface for the planned encoders (PLAN.MD steps 7-8).
-/// No encode path consumes these options yet; `mux.encodeStatic` takes
-/// `mux.Options`.
+/// Options bag for the still pixel encoders (`encodeLossless`/`encodeLossy`).
+/// The lower-level mux (`mux.encodeStatic`) takes its own `mux.Options`.
 pub const EncoderOptions = struct {
     limits: limits.ResourceLimits = .{},
     format: features.FormatKind = .lossless,
@@ -45,4 +45,12 @@ pub const EncoderOptions = struct {
     /// Use sharp (iterative) RGB→YUV chroma downsampling instead of the box
     /// average. Scaffolded for step 8c-4; not yet honored.
     use_sharp_yuv: bool = false,
+    /// Raw metadata payloads (ICCP color profile, EXIF, XMP) to attach to a
+    /// still encode (step 9d). Each present payload is written verbatim into its
+    /// canonical chunk by the still encoders (`encodeLossless`/`encodeLossy`),
+    /// forcing the extended (`VP8X`) container, and round-trips byte-exactly
+    /// through `demux`. Default `.{}` (all null) leaves the output identical to
+    /// the no-metadata path. The encoders do not parse or validate the payloads;
+    /// the caller owns them and they must outlive the encode call.
+    metadata: metadata.RawPayloads = .{},
 };

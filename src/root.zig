@@ -245,6 +245,12 @@ pub fn encodeAnimation(
 /// prefix-code group, no color cache yet; see PLAN.MD step 7), so the output is
 /// valid and round-trips bit-exactly. `encode_options.format` must be
 /// `.lossless`.
+///
+/// Set `encode_options.metadata` (raw ICCP/EXIF/XMP payloads) to attach metadata
+/// (step 9d); the file is then an extended (`VP8X`) container with those chunks
+/// in spec-canonical order, round-tripping byte-exactly through `parseWebP`.
+/// With the default empty metadata the output is the canonical simple `VP8L`
+/// file, byte-identical to the no-metadata path.
 /// Returns caller-owned bytes (free with the same allocator).
 pub fn encodeLossless(
     gpa: std.mem.Allocator,
@@ -276,7 +282,13 @@ pub fn encodeVP8LBitstream(
 /// input emits a plain `VP8 ` file. `encode_options.quality` (0..100) selects the
 /// color quantizer (or set `target_size`/`target_psnr` for a size/PSNR search),
 /// `encode_options.alpha_quality` (0..100) the alpha compression effort, and
-/// `encode_options.format` must be `.lossy`. Returns caller-owned bytes.
+/// `encode_options.format` must be `.lossy`.
+///
+/// Set `encode_options.metadata` (raw ICCP/EXIF/XMP payloads) to attach metadata
+/// (step 9d); the chunks are written in spec-canonical order and coexist with a
+/// lossy `ALPH` chunk, round-tripping byte-exactly through `parseWebP`. With the
+/// default empty metadata (and no alpha) the output is byte-identical to the
+/// no-metadata path. Returns caller-owned bytes.
 pub fn encodeLossy(
     gpa: std.mem.Allocator,
     buffer: ImageBuffer,
