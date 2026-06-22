@@ -242,14 +242,15 @@ pub fn encodeVP8LBitstream(
     return vp8l_encoder.encodeAlloc(gpa, dimensions, pixels);
 }
 
-/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
-/// using the step 8a baseline encoder: a fixed all-DC mode decision, no loop
-/// filter, and default coefficient probabilities (see PLAN.MD step 8a). The
+/// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file.
+/// The encoder does rate-distortion intra mode decision (16x16/8x8 and 4x4
+/// B_PRED), skip coding, quantizer-derived in-loop deblocking, and per-segment
+/// quantization, with effort scaled by `encode_options.method` (0..6). The
 /// buffer may be `rgba`/`bgra`/`argb` or `rgb`, read row-major honoring stride.
 /// A meaningful (non-fully-opaque) alpha channel is encoded losslessly into an
-/// `ALPH` chunk and emitted as a `VP8X` + `ALPH` + `VP8 ` container (PLAN.MD
-/// step 8c); fully-opaque input emits a plain `VP8 ` file.
-/// `encode_options.quality` (0..100) selects the color quantizer,
+/// `ALPH` chunk and emitted as a `VP8X` + `ALPH` + `VP8 ` container; fully-opaque
+/// input emits a plain `VP8 ` file. `encode_options.quality` (0..100) selects the
+/// color quantizer (or set `target_size`/`target_psnr` for a size/PSNR search),
 /// `encode_options.alpha_quality` (0..100) the alpha compression effort, and
 /// `encode_options.format` must be `.lossy`. Returns caller-owned bytes.
 pub fn encodeLossy(
@@ -273,10 +274,11 @@ pub fn encodeVP8Bitstream(
     return encode.encodeVP8Bitstream(gpa, dimensions, pixels, quality);
 }
 
-/// Decodes a complete WebP file into an owned pixel buffer. Currently
-/// still-lossless (VP8L) only: lossy inputs fail with
-/// `error.UnsupportedImageFormat` and animations with
-/// `error.UnsupportedAnimationDecode`. Allocation is budgeted against
+/// Decodes a complete still WebP file into an owned pixel buffer: lossless
+/// (VP8L), lossy (VP8), and lossy+alpha (the `ALPH` plane composed over color),
+/// to packed `rgba`/`bgra`/`argb`/`rgb` per `DecoderOptions.output_format`.
+/// Animated inputs fail with `error.UnsupportedAnimationDecode` — decode those
+/// via `decodeAnimation` / `AnimationDecoder`. Allocation is budgeted against
 /// `DecoderOptions.limits.allocation_bytes_max`. The caller frees the
 /// result via `OwnedBuffer.deinit`.
 pub fn decodeStatic(
