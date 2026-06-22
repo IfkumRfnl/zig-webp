@@ -119,9 +119,49 @@ pub const EncodeConfig = struct {
     /// Frame-wide AC quantizer index (0..127); derive it from a quality knob
     /// with `quant.baseQuantIndexForQuality`.
     base_quant_index: u8,
-    /// Effort level (0..6, `cwebp -m` compatible). Scaffolded for step 8c-1;
-    /// not yet honored — the rate-distortion search is fixed for now.
+    /// Effort level (0..6, `cwebp -m` compatible): higher trades encode time for
+    /// quality by widening the rate-distortion search (`Effort.fromMethod`).
+    /// Method 4 is the default and reproduces the step-8b encoder byte-for-byte.
     method: u8 = 4,
+};
+
+/// The rate-distortion search effort, derived from `EncodeConfig.method`. Each
+/// field gates one piece of the *existing* search; lower methods switch pieces
+/// off to trade quality for encode speed, and `method >= 4` enables everything
+/// (so it reproduces the step-8b encoder exactly — see `fromMethod`).
+const Effort = struct {
+    /// Evaluate B_PRED (per-subblock 4x4 luma intra) against the 16x16 modes.
+    /// The most expensive search piece — sixteen subblocks each ranking ten
+    /// submodes — so it is the first to drop at lower effort.
+    try_bpred: bool,
+    /// Run `segment.analyze` to assign per-segment quantizers. When off the
+    /// frame is coded single-quantizer (byte-identical to the pre-8b-3b path).
+    analyze_segments: bool,
+    /// How many of the four 16x16 luma / 8x8 chroma intra modes to rank. DC is
+    /// first in both candidate lists, so a count of 1 evaluates DC alone. In
+    /// `[1, 4]`; 4 ranks every mode.
+    intra_mode_count: u8,
+
+    /// Maps a `cwebp -m` method (clamped to 0..6) to a search effort. The tiers
+    /// are coarse on purpose — these are the levers the step-8b search already
+    /// exposes, gated rather than newly invented, and each tier is strictly more
+    /// search than the one below it:
+    ///   * 0..1: DC mode only, no B_PRED, no segmentation (fastest).
+    ///   * 2..3: all four 16x16/chroma modes, still no B_PRED or segmentation.
+    ///   * 4..6: full search — B_PRED, segmentation, every mode.
+    /// Methods 5..6 match method 4 rather than regress below it: the step-8b
+    /// search is already exhaustive over the modes this encoder implements, so
+    /// "equal or more search" means equal here.
+    fn fromMethod(method: u8) Effort {
+        const clamped = @min(method, 6);
+        if (clamped >= 4) {
+            return .{ .try_bpred = true, .analyze_segments = true, .intra_mode_count = 4 };
+        }
+        if (clamped >= 2) {
+            return .{ .try_bpred = false, .analyze_segments = false, .intra_mode_count = 4 };
+        }
+        return .{ .try_bpred = false, .analyze_segments = false, .intra_mode_count = 1 };
+    }
 };
 
 /// Encodes macroblock-padded source YUV planes into a raw VP8 key-frame
@@ -137,8 +177,16 @@ pub fn encodeAlloc(
     source: *const color.YuvPlanes,
     config: EncodeConfig,
 ) Error!Result {
-    return encodeFramePass(gpa, source, config.base_quant_index, true) catch |err| switch (err) {
-        error.FileTooLarge => try encodeFramePass(gpa, source, config.base_quant_index, false),
+    const effort = Effort.fromMethod(config.method);
+    return encodeFramePass(gpa, source, config.base_quant_index, effort) catch |err| switch (err) {
+        // The B_PRED-overflow fallback only disables B_PRED; the rest of the
+        // effort tier (mode count, segmentation) is unchanged. Tiers that never
+        // enable B_PRED cannot overflow this way, so this retry is a no-op there.
+        error.FileTooLarge => blk: {
+            var fallback = effort;
+            fallback.try_bpred = false;
+            break :blk try encodeFramePass(gpa, source, config.base_quant_index, fallback);
+        },
         else => err,
     };
 }
@@ -147,9 +195,11 @@ fn encodeFramePass(
     gpa: std.mem.Allocator,
     source: *const color.YuvPlanes,
     base_quant_index: u8,
-    allow_bpred: bool,
+    effort: Effort,
 ) Error!Result {
     assert(base_quant_index <= quant.index_max);
+    assert(effort.intra_mode_count >= 1);
+    assert(effort.intra_mode_count <= luma_mode_candidates.len);
 
     const dimensions = image.Dimensions{ .width = source.width, .height = source.height };
     const grid = modes.MacroblockGrid.init(dimensions);
@@ -170,9 +220,12 @@ fn encodeFramePass(
     //     per-macroblock segment ids drive the reconstruction pass. When the
     //     frame carries too little variation the plan stays disabled and every
     //     id is 0, so the frame is byte-identical to single-quantizer output.
+    //     Lower-effort tiers skip the analysis entirely (one forward DCT per
+    //     macroblock) and code the frame single-quantizer.
     const segment_ids = try gpa.alloc(u2, mb_count);
     defer gpa.free(segment_ids);
-    {
+    @memset(segment_ids, 0);
+    if (effort.analyze_segments) {
         const complexity = try gpa.alloc(i32, mb_count);
         defer gpa.free(complexity);
         const plan = segment.analyze(source, grid, base_quant_index, complexity, segment_ids);
@@ -232,7 +285,7 @@ fn encodeFramePass(
                 &reconstruction,
                 &segment_factors[segment_id],
                 &header.coefficient_probabilities,
-                allow_bpred,
+                effort,
                 submode_contexts,
                 grid.columns,
                 column,
@@ -401,9 +454,10 @@ fn calcSkipProbability(skip_count: u32, mb_count: u32) u8 {
     return @intCast(@as(u64, coded) * 255 / mb_count);
 }
 
-// The intra modes the mode decision ranks. B_PRED (per-subblock 4x4 luma) is
-// excluded until step 8b-2; the four 16x16/8x8 modes share the same RFC
-// enumeration values for luma and chroma.
+// The full-block intra modes the mode decision ranks, DC first so a reduced
+// effort tier (`Effort.intra_mode_count`) can rank a leading prefix of the list.
+// The four 16x16/8x8 modes share the same RFC enumeration values for luma and
+// chroma; B_PRED (per-subblock 4x4 luma) is ranked separately in `selectLuma`.
 const luma_mode_candidates = [_]modes.LumaMode{ .dc, .vertical, .horizontal, .true_motion };
 const chroma_mode_candidates = [_]modes.ChromaMode{ .dc, .vertical, .horizontal, .true_motion };
 
@@ -440,7 +494,7 @@ fn encodeMacroblock(
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
-    allow_bpred: bool,
+    effort: Effort,
     submode_contexts: SubmodeContexts,
     columns: u32,
     mb_column: u32,
@@ -459,7 +513,7 @@ fn encodeMacroblock(
         recon,
         factors,
         probabilities,
-        allow_bpred,
+        effort,
         submode_contexts,
         columns,
         mb_column,
@@ -467,7 +521,7 @@ fn encodeMacroblock(
         levels,
         &subblock_modes,
     );
-    const chroma_mode = selectChroma(source, recon, factors, probabilities, mb_column, mb_row, levels);
+    const chroma_mode = selectChroma(source, recon, factors, probabilities, effort, mb_column, mb_row, levels);
     macroblock.* = .{
         .segment_id = segment_id,
         .skip = false,
@@ -519,7 +573,7 @@ fn selectLuma(
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
-    allow_bpred: bool,
+    effort: Effort,
     submode_contexts: SubmodeContexts,
     columns: u32,
     mb_column: u32,
@@ -548,15 +602,18 @@ fn selectLuma(
 
     const lambda = lambdaFor(factors.y1_ac);
 
-    // --- Best of the four 16x16 modes. Each candidate's rate includes the cost
-    //     of signaling its luma mode, so the B_PRED comparison below is fair.
+    // --- Best of the ranked 16x16 modes. Each candidate's rate includes the
+    //     cost of signaling its luma mode, so the B_PRED comparison below is
+    //     fair. Lower-effort tiers rank only a leading prefix of the candidate
+    //     list (DC first); at full effort `intra_mode_count` is 4, so the loop
+    //     ranks every mode exactly as the step-8b encoder did.
     var best_cost: u64 = std.math.maxInt(u64);
     var best_mode: modes.LumaMode = .dc;
     var best_block: [luma_pixels]u8 = undefined;
     var best_luma: [luma_block][coeff_count]i16 = undefined;
     var best_y2: [coeff_count]i16 = undefined;
 
-    for (luma_mode_candidates) |mode| {
+    for (luma_mode_candidates[0..effort.intra_mode_count]) |mode| {
         var block: [luma_pixels]u8 = undefined;
         var luma_levels: [luma_block][coeff_count]i16 = undefined;
         var y2_levels: [coeff_count]i16 = undefined;
@@ -585,9 +642,10 @@ fn selectLuma(
     }
 
     // --- B_PRED: per-subblock 4x4 intra. Its rate already includes the B_PRED
-    //     mode flag and the sixteen submode signals. Skipped on the fallback
-    //     pass for frames whose B_PRED modes overflow the first partition.
-    if (allow_bpred) {
+    //     mode flag and the sixteen submode signals. Skipped at lower effort and
+    //     on the fallback pass for frames whose B_PRED modes overflow the first
+    //     partition.
+    if (effort.try_bpred) {
         const bpred = evaluateBpred(
             &src,
             recon,
@@ -961,6 +1019,7 @@ fn selectChroma(
     recon: *color.YuvPlanes,
     factors: *const quant.Factors,
     probabilities: *const token_probs.Table,
+    effort: Effort,
     mb_column: u32,
     mb_row: u32,
     levels: *tokens.MacroblockLevels,
@@ -996,7 +1055,9 @@ fn selectChroma(
     var best_u_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
     var best_v_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
 
-    for (chroma_mode_candidates) |mode| {
+    // Rank the same leading prefix as luma (DC first); full effort ranks all
+    // four, reproducing the step-8b chroma decision exactly.
+    for (chroma_mode_candidates[0..effort.intra_mode_count]) |mode| {
         var u_block: [chroma_pixels]u8 = undefined;
         var v_block: [chroma_pixels]u8 = undefined;
         var u_levels: [tokens.chroma_block_count][coeff_count]i16 = undefined;
@@ -1504,4 +1565,158 @@ test "segmentation engages and stays self-consistent on mixed content" {
     try std.testing.expectEqualSlices(u8, result.reconstruction.luma, frame.luma);
     try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_u, frame.chroma_u);
     try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_v, frame.chroma_v);
+}
+
+// --- Effort knob (step 8c-1) ------------------------------------------------
+
+// A content-rich macroblock grid: a smooth gradient overlaid with a hashed
+// high-frequency texture, so every effort tier has real work to do — the 16x16
+// modes, B_PRED, chroma modes, and segmentation all find something to choose.
+fn renderEffortSource(gpa: std.mem.Allocator, width: u32, height: u32) !color.YuvPlanes {
+    const argb = try gpa.alloc(u32, @as(usize, width) * height);
+    defer gpa.free(argb);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const ramp: u32 = @intCast((x + y) * 200 / (width + height));
+            const noise: u32 = @intCast(((x *% 53) ^ (y *% 97) ^ (x *% y)) & 0x3f);
+            const r: u32 = (ramp + noise) & 0xff;
+            const g: u32 = @intCast((x *% 37 +% y *% 11) & 0xff);
+            const b: u32 = @intCast((y *% 29 +% noise) & 0xff);
+            argb[y * width + x] = 0xff00_0000 | (r << 16) | (g << 8) | b;
+        }
+    }
+    return color.rgbaToYuv420Alloc(gpa, argb, width, height);
+}
+
+test "effort tiers grow monotonically with method" {
+    // Higher method must never search less than a lower one: each gated piece
+    // is enabled at least as early going up the ladder. `cwebp -m` clamps to
+    // 0..6, and method 4 is the full-search default; 5 and 6 match it.
+    var previous = Effort.fromMethod(0);
+    var method: u8 = 1;
+    while (method <= 8) : (method += 1) {
+        const current = Effort.fromMethod(method);
+        try std.testing.expect(current.intra_mode_count >= previous.intra_mode_count);
+        try std.testing.expect(@intFromBool(current.try_bpred) >= @intFromBool(previous.try_bpred));
+        try std.testing.expect(@intFromBool(current.analyze_segments) >= @intFromBool(previous.analyze_segments));
+        previous = current;
+    }
+
+    // Method 4 is the full-search tier; 5, 6, and out-of-range values clamp to
+    // it rather than regressing below it.
+    const full = Effort.fromMethod(4);
+    try std.testing.expect(full.try_bpred);
+    try std.testing.expect(full.analyze_segments);
+    try std.testing.expectEqual(@as(u8, luma_mode_candidates.len), full.intra_mode_count);
+    try std.testing.expectEqual(full, Effort.fromMethod(5));
+    try std.testing.expectEqual(full, Effort.fromMethod(6));
+    try std.testing.expectEqual(full, Effort.fromMethod(255));
+
+    // The lowest tier is DC-only with no B_PRED and no segmentation.
+    const fastest = Effort.fromMethod(0);
+    try std.testing.expect(!fastest.try_bpred);
+    try std.testing.expect(!fastest.analyze_segments);
+    try std.testing.expectEqual(@as(u8, 1), fastest.intra_mode_count);
+}
+
+test "method 4 reproduces the default-config encode byte-for-byte" {
+    const gpa = std.testing.allocator;
+    const width = 96;
+    const height = 64;
+
+    var source = try renderEffortSource(gpa, width, height);
+    defer source.deinit(gpa);
+
+    const base_quant_index = quant.baseQuantIndexForQuality(75);
+
+    // The scaffold's default method is 4, and 5/6 clamp to the same full search,
+    // so all three must emit byte-identical bitstreams — the invariant that lets
+    // 8c-1 land without disturbing the step-8b gate.
+    var reference = try encodeAlloc(gpa, &source, .{ .base_quant_index = base_quant_index });
+    defer reference.deinit(gpa);
+
+    for ([_]u8{ 4, 5, 6 }) |method| {
+        var result = try encodeAlloc(gpa, &source, .{
+            .base_quant_index = base_quant_index,
+            .method = method,
+        });
+        defer result.deinit(gpa);
+        try std.testing.expectEqualSlices(u8, reference.bitstream, result.bitstream);
+    }
+}
+
+test "lower-effort methods stay self-consistent and valid" {
+    const gpa = std.testing.allocator;
+    const width = 80;
+    const height = 48;
+
+    var source = try renderEffortSource(gpa, width, height);
+    defer source.deinit(gpa);
+
+    const base_quant_index = quant.baseQuantIndexForQuality(75);
+
+    // Every method, not just the default, must produce a bitstream a conforming
+    // decoder reproduces byte-for-byte — the effort knob only narrows the search,
+    // never the self-consistency invariant.
+    for ([_]u8{ 0, 1, 2, 3, 4, 6 }) |method| {
+        var result = try encodeAlloc(gpa, &source, .{
+            .base_quant_index = base_quant_index,
+            .method = method,
+        });
+        defer result.deinit(gpa);
+
+        var frame = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
+        defer frame.deinit();
+        try std.testing.expectEqual(width, frame.width);
+        try std.testing.expectEqual(height, frame.height);
+        try std.testing.expectEqualSlices(u8, result.reconstruction.luma, frame.luma);
+        try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_u, frame.chroma_u);
+        try std.testing.expectEqualSlices(u8, result.reconstruction.chroma_v, frame.chroma_v);
+    }
+}
+
+test "lower-effort methods skip B_PRED and segmentation in the bitstream" {
+    const gpa = std.testing.allocator;
+    const width = 96;
+    const height = 64;
+
+    var source = try renderEffortSource(gpa, width, height);
+    defer source.deinit(gpa);
+
+    const base_quant_index = quant.baseQuantIndexForQuality(95); // fine quant favors B_PRED
+    const grid = modes.MacroblockGrid.init(.{ .width = width, .height = height });
+
+    // Method 1 (DC only) must emit no B_PRED macroblocks and no segmentation,
+    // while the full-effort method 4 emits at least one B_PRED macroblock on the
+    // same edge-rich source — proving the knob actually gates the search.
+    var fast = try encodeAlloc(gpa, &source, .{ .base_quant_index = base_quant_index, .method = 1 });
+    defer fast.deinit(gpa);
+    var full = try encodeAlloc(gpa, &source, .{ .base_quant_index = base_quant_index, .method = 4 });
+    defer full.deinit(gpa);
+
+    const fast_bpred = try countBpredMacroblocks(gpa, fast.bitstream, grid);
+    const full_bpred = try countBpredMacroblocks(gpa, full.bitstream, grid);
+    try std.testing.expectEqual(@as(usize, 0), fast_bpred);
+    try std.testing.expect(full_bpred > 0);
+
+    var fast_parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(fast.bitstream, &fast_parsed);
+    try std.testing.expect(!fast_parsed.header.segmentation.enabled);
+}
+
+fn countBpredMacroblocks(
+    gpa: std.mem.Allocator,
+    bitstream: []const u8,
+    grid: modes.MacroblockGrid,
+) !usize {
+    var parsed: frame_header.Parsed = undefined;
+    try frame_header.parse(bitstream, &parsed);
+    const mbs = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
+    defer gpa.free(mbs);
+    try modes.parseKeyFrameModes(&parsed.macroblock_reader, &parsed.header, mbs);
+    var count: usize = 0;
+    for (mbs) |mb| {
+        if (mb.luma_mode == .subblocks) count += 1;
+    }
+    return count;
 }
