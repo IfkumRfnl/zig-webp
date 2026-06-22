@@ -144,7 +144,7 @@ fn assertLossyRoundTrip(
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
 
-    var result = try vp8_encoder.encodeAlloc(gpa, &source, vp8_quant.baseQuantIndexForQuality(lossy_quality));
+    var result = try vp8_encoder.encodeAlloc(gpa, &source, .{ .base_quant_index = vp8_quant.baseQuantIndexForQuality(lossy_quality) });
     defer result.deinit(gpa);
 
     var frame = try vp8_decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
