@@ -27,6 +27,7 @@ pub const Error = error{
     InvalidChunkOrder,
     InvalidChunkPadding,
     InvalidCorpusPath,
+    InvalidEncodeOptions,
     InvalidExtendedHeaderReservedBits,
     InvalidExtendedHeaderSize,
     InvalidFeatureFlags,
@@ -89,6 +90,7 @@ pub fn category(err: Error) Category {
         error.TruncatedBitstream,
         => .bitstream,
 
+        error.InvalidEncodeOptions,
         error.UnsupportedAlphaCompression,
         error.UnsupportedAnimationDecode,
         error.UnsupportedAnimationMux,
@@ -137,6 +139,7 @@ test "classifies representative errors" {
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8LImageData));
     try std.testing.expectEqual(Category.bitstream, category(error.InvalidVP8LTransform));
     try std.testing.expectEqual(Category.bitstream, category(error.TruncatedBitstream));
+    try std.testing.expectEqual(Category.unsupported, category(error.InvalidEncodeOptions));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAlphaCompression));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationDecode));
     try std.testing.expectEqual(Category.unsupported, category(error.UnsupportedAnimationMux));
