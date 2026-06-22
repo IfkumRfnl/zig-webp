@@ -37,8 +37,10 @@ pub const EncoderOptions = struct {
     /// quality to reach it. Mutually exclusive with `target_size`. Scaffolded
     /// for step 8c-3; not yet honored.
     target_psnr: ?f32 = null,
-    /// Alpha-plane quality (0..100) for lossy+alpha (`ALPH`) output. Scaffolded
-    /// for step 8c-2; not yet honored — lossy encode currently drops alpha.
+    /// Alpha-plane compression effort (0..100) for lossy+alpha (`ALPH`) output
+    /// (step 8c-2). 0 emits an uncompressed `ALPH` chunk; 1..100 also tries the
+    /// lossless VP8L form and keeps whichever is smaller. Alpha is always
+    /// lossless — this knob trades encode work for size, never fidelity.
     alpha_quality: u8 = 100,
     /// Use sharp (iterative) RGB→YUV chroma downsampling instead of the box
     /// average. Scaffolded for step 8c-4; not yet honored.

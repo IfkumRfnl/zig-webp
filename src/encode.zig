@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const alpha = @import("alpha.zig");
 const color = @import("color.zig");
 const container = @import("container.zig");
 const errors = @import("errors.zig");
@@ -56,10 +57,19 @@ pub fn encodeStaticLossless(
 /// Encodes a caller-supplied pixel buffer into a complete lossy (VP8) WebP file
 /// with the step 8a baseline encoder: a fixed all-DC mode decision, no loop
 /// filter, and default coefficient probabilities. The buffer's `format` may be
-/// any supported layout; the alpha channel is dropped (lossy alpha via `ALPH`
-/// is step 8c), so RGBA input encodes color only. `encode_options.quality`
-/// (0..100) selects the quantizer. `encode_options.format` must be `.lossy`.
-/// The returned bytes are caller-owned (free with `gpa`).
+/// any supported layout. Color always goes through the VP8 lossy path; when the
+/// input carries a meaningful (non-fully-opaque) alpha channel, the alpha plane
+/// is encoded losslessly into an `ALPH` chunk and the file is emitted as a
+/// `VP8X` + `ALPH` + `VP8 ` container (step 8c). A fully-opaque input still
+/// emits a plain `VP8 ` file, byte-identical to the alpha-free path. Lossy WebP
+/// carries straight (non-premultiplied) alpha, so the color bytes are unchanged
+/// by the alpha channel.
+///
+/// `encode_options.quality` (0..100) selects the color quantizer;
+/// `encode_options.alpha_quality` (0..100) selects the alpha compression effort
+/// (0 = uncompressed ALPH, 1..100 = lossless VP8L, smaller kept). Alpha is
+/// always lossless. `encode_options.format` must be `.lossy`. The returned bytes
+/// are caller-owned (free with `gpa`).
 pub fn encodeStaticLossy(
     gpa: std.mem.Allocator,
     buffer: image.Buffer,
@@ -87,6 +97,14 @@ pub fn encodeStaticLossy(
     defer gpa.free(argb);
     gatherArgb(buffer, argb);
 
+    // Extract the straight (non-premultiplied) alpha plane. A fully-opaque
+    // plane is left as no ALPH chunk so the output matches the color-only path
+    // byte-for-byte.
+    const alpha_plane = try gpa.alloc(u8, pixel_count);
+    defer gpa.free(alpha_plane);
+    for (argb, alpha_plane) |value, *sample| sample.* = vp8l_pixel.alpha(value);
+    const has_alpha = alpha.planeHasTransparency(alpha_plane);
+
     var source = if (encode_options.use_sharp_yuv)
         try color.rgbaToYuv420SharpAlloc(gpa, argb, dimensions.width, dimensions.height)
     else
@@ -100,6 +118,21 @@ pub fn encodeStaticLossy(
     });
     defer result.deinit(gpa);
 
+    // Encode the alpha plane into an ALPH payload only when it carries
+    // transparency; the VP8L alpha encoder's scratch is bounded by the same
+    // per-pixel budget as the color path.
+    var alpha_payload: ?[]u8 = null;
+    defer if (alpha_payload) |payload| gpa.free(payload);
+    if (has_alpha) {
+        try validateAlphaAllocationBudget(dimensions, pixel_count_u64, encode_options.limits);
+        alpha_payload = try alpha.encodePlaneAlloc(
+            gpa,
+            alpha_plane,
+            dimensions,
+            encode_options.alpha_quality,
+        );
+    }
+
     try validateLossyMuxAllocationBudget(
         dimensions,
         pixel_count_u64,
@@ -111,6 +144,8 @@ pub fn encodeStaticLossy(
         .canvas = dimensions,
         .format = .lossy,
         .bitstream = result.bitstream,
+        .alpha = alpha_payload,
+        .has_alpha = has_alpha,
     }, .{ .limits = encode_options.limits });
 }
 
@@ -176,6 +211,22 @@ fn validateLossyInitialAllocationBudget(
     try budget.reserveElements(vp8l_pixel.Pixel, pixel_count);
     try budget.reserveBytes(try color.yuv420AllocationBytes(dimensions.width, dimensions.height));
     try budget.reserveBytes(try vp8_encoder.allocationBytesMax(dimensions));
+}
+
+/// Reserves the alpha-encode scratch against the allocation limits: the
+/// extracted plane and its forward-filtered copy (one byte per pixel each), the
+/// VP8L source pixels (4 bytes per pixel), and the VP8L encoder's worst-case
+/// output buffer. This runs only when the input actually carries transparency.
+fn validateAlphaAllocationBudget(
+    dimensions: image.Dimensions,
+    pixel_count: u64,
+    resource_limits: limits.ResourceLimits,
+) errors.Error!void {
+    var budget = AllocationBudget.init(resource_limits);
+    try budget.reserveElements(u8, pixel_count); // extracted alpha plane
+    try budget.reserveElements(u8, pixel_count); // forward-filtered plane
+    try budget.reserveElements(vp8l_pixel.Pixel, pixel_count); // VP8L source
+    try budget.reserveBytes(@intCast(try vp8l_encoder.maxEncodedSize(dimensions)));
 }
 
 fn validateLossyMuxAllocationBudget(
@@ -462,6 +513,8 @@ test "lossy static encode survives allocation failure at every site" {
     const height = 9;
     const dims = try image.Dimensions.init(width, height);
     var pixels: [width * height * 4]u8 = undefined;
+    // `i % 256` cycles the alpha byte too, so some pixels are transparent: this
+    // exercises the alpha-encode allocations under failure, not just color.
     for (&pixels, 0..) |*p, i| p.* = @intCast(i % 256);
 
     const buffer = image.Buffer{
@@ -472,4 +525,159 @@ test "lossy static encode survives allocation failure at every site" {
     };
 
     try testing.checkAllAllocationFailures(testing.allocator, encodeLossyAllocationProbe, .{buffer});
+}
+
+const synth = @import("testing/synth.zig");
+const demux = @import("demux.zig");
+
+test "encodeStaticLossy recovers the alpha plane exactly for alpha sources" {
+    const decode = @import("decode.zig");
+
+    // The synth set's RGBA alpha cases: a smooth ramp, a hard binary checker,
+    // and a fully-transparent plane over non-zero RGB. Lossy alpha must be
+    // lossless, so the recovered alpha must match byte-for-byte regardless of
+    // the (lossy) color tolerance.
+    for (synth.sources) |source| {
+        if (source.format != .rgba) continue;
+        switch (source.content) {
+            .alpha_gradient, .alpha_checker, .alpha_transparent_rgb => {},
+            else => continue,
+        }
+
+        const rendered = try synth.render(testing.allocator, source);
+        defer rendered.deinit();
+
+        const encoded = try encodeStaticLossy(
+            testing.allocator,
+            rendered.buffer,
+            .{ .format = .lossy },
+        );
+        defer testing.allocator.free(encoded);
+
+        // The container must advertise alpha (VP8X + ALPH + VP8 ).
+        var parsed = try demux.parse(testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        try testing.expect(parsed.features.has_alpha);
+        try testing.expect(parsed.features.alpha != null);
+
+        var decoded = try decode.decodeStatic(
+            testing.allocator,
+            encoded,
+            .{ .output_format = .rgba },
+        );
+        defer decoded.deinit();
+
+        const width: usize = source.width;
+        const height: usize = source.height;
+        try testing.expectEqual(@as(u32, @intCast(width)), decoded.buffer.dimensions.width);
+        try testing.expectEqual(@as(u32, @intCast(height)), decoded.buffer.dimensions.height);
+
+        // Compare the alpha channel only (channel 3); color is lossy.
+        const out_stride: usize = decoded.buffer.stride;
+        for (0..height) |y| {
+            for (0..width) |x| {
+                const src_alpha = rendered.pixels[(y * width + x) * 4 + 3];
+                const out_alpha = decoded.buffer.pixels[y * out_stride + x * 4 + 3];
+                try testing.expectEqual(src_alpha, out_alpha);
+            }
+        }
+    }
+}
+
+test "encodeStaticLossy alpha round-trips under the uncompressed ALPH form" {
+    const decode = @import("decode.zig");
+
+    const source = synth.Source{
+        .name = "alpha_checker_33x33_rgba",
+        .width = 33,
+        .height = 33,
+        .format = .rgba,
+        .content = .alpha_checker,
+    };
+    const rendered = try synth.render(testing.allocator, source);
+    defer rendered.deinit();
+
+    // alpha_quality == 0 forces the uncompressed ALPH form; it must still
+    // recover the plane exactly.
+    const encoded = try encodeStaticLossy(
+        testing.allocator,
+        rendered.buffer,
+        .{ .format = .lossy, .alpha_quality = 0 },
+    );
+    defer testing.allocator.free(encoded);
+
+    var parsed = try demux.parse(testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const alpha_chunk = parsed.features.alpha orelse return error.TestUnexpectedResult;
+    // Uncompressed header: compression bits (0..1) are 0.
+    try testing.expectEqual(@as(u8, 0), alpha_chunk.payload(encoded)[0] & 0x03);
+
+    var decoded = try decode.decodeStatic(
+        testing.allocator,
+        encoded,
+        .{ .output_format = .rgba },
+    );
+    defer decoded.deinit();
+
+    const out_stride: usize = decoded.buffer.stride;
+    for (0..source.height) |y| {
+        for (0..source.width) |x| {
+            const src_alpha = rendered.pixels[(y * source.width + x) * 4 + 3];
+            const out_alpha = decoded.buffer.pixels[y * out_stride + x * 4 + 3];
+            try testing.expectEqual(src_alpha, out_alpha);
+        }
+    }
+}
+
+test "encodeStaticLossy keeps fully-opaque output byte-identical to the color-only path" {
+    const width = 18;
+    const height = 10;
+    const dims = try image.Dimensions.init(width, height);
+
+    // Build the same image as RGB and as fully-opaque RGBA. The RGBA path must
+    // detect the opaque plane, skip the ALPH chunk, and produce identical bytes.
+    var rgb_pixels: [width * height * 3]u8 = undefined;
+    var rgba_pixels: [width * height * 4]u8 = undefined;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const r: u8 = @intCast((x * 14) % 256);
+            const g: u8 = @intCast((y * 25) % 256);
+            const b: u8 = @intCast(((x + y) * 8) % 256);
+            const rgb_base = (y * width + x) * 3;
+            rgb_pixels[rgb_base + 0] = r;
+            rgb_pixels[rgb_base + 1] = g;
+            rgb_pixels[rgb_base + 2] = b;
+            const rgba_base = (y * width + x) * 4;
+            rgba_pixels[rgba_base + 0] = r;
+            rgba_pixels[rgba_base + 1] = g;
+            rgba_pixels[rgba_base + 2] = b;
+            rgba_pixels[rgba_base + 3] = 255;
+        }
+    }
+
+    const rgb_buffer = image.Buffer{
+        .pixels = &rgb_pixels,
+        .dimensions = dims,
+        .stride = width * 3,
+        .format = .rgb,
+    };
+    const rgba_buffer = image.Buffer{
+        .pixels = &rgba_pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    const from_rgb = try encodeStaticLossy(testing.allocator, rgb_buffer, .{ .format = .lossy });
+    defer testing.allocator.free(from_rgb);
+    const from_rgba = try encodeStaticLossy(testing.allocator, rgba_buffer, .{ .format = .lossy });
+    defer testing.allocator.free(from_rgba);
+
+    try testing.expectEqualSlices(u8, from_rgb, from_rgba);
+
+    // And it is a plain simple `VP8 ` file (no VP8X / ALPH).
+    var parsed = try demux.parse(testing.allocator, from_rgba, .{});
+    defer parsed.deinit();
+    try testing.expect(!parsed.features.has_alpha);
+    try testing.expectEqual(features.FileKind.simple, parsed.features.file_kind);
 }

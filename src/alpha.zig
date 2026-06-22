@@ -7,6 +7,7 @@ const bit_writer = @import("bit_writer.zig");
 const errors = @import("errors.zig");
 const image = @import("image.zig");
 const vp8l_decoder = @import("vp8l/decoder.zig");
+const vp8l_encoder = @import("vp8l/encoder.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
 
 pub const header_size = 1;
@@ -237,6 +238,182 @@ fn gradientPredictor(left: u8, top: u8, top_left: u8) u8 {
     return @intCast(std.math.clamp(prediction, 0, 255));
 }
 
+// ---------------------------------------------------------------------------
+// Alpha-plane encoding (the inverse of the decode paths above).
+//
+// An ALPH chunk is a 1-byte header (compression, filter, preprocessing,
+// reserved) followed by the alpha stream. We always preprocess = none (lossless
+// alpha; the levels-quantization preprocessing is a lossy optimization we leave
+// for later). Two compressions are produced and the smaller is kept:
+//   - none: the forward-filtered plane verbatim (one byte per pixel);
+//   - lossless: the forward-filtered plane carried in the green channel of a
+//     headerless VP8L image stream, exactly what `decodeLossless` reads back.
+// Either way the decode side reconstructs the plane bit-exactly, so lossy+alpha
+// WebP round-trips its alpha losslessly.
+// ---------------------------------------------------------------------------
+
+/// The four candidate row filters, tried in turn so the cheapest encoded plane
+/// wins. `none` is always valid; the others reduce residual entropy on smooth
+/// or structured alpha.
+const filter_candidates = [_]Filter{ .none, .horizontal, .vertical, .gradient };
+
+/// Encodes an alpha plane (one byte per pixel, `dimensions.width *
+/// dimensions.height` long, row-major) into a complete ALPH chunk payload
+/// (header byte included). The result is caller-owned (free with `gpa`).
+///
+/// `alpha_quality` selects the compression effort: 0 forces the uncompressed
+/// form (fastest, largest); 1..100 enables the lossless VP8L form and keeps
+/// whichever of {uncompressed, VP8L} is smaller. Alpha is always lossless here
+/// regardless of the value — the quality knob only trades encode work for size,
+/// it never degrades the recovered alpha. The chosen filter is the one with the
+/// smallest encoded stream.
+pub fn encodePlaneAlloc(
+    gpa: std.mem.Allocator,
+    plane: []const u8,
+    dimensions: image.Dimensions,
+    alpha_quality: u8,
+) errors.Error![]u8 {
+    const pixel_count: usize = @intCast(try dimensions.pixelCount());
+    assert(plane.len == pixel_count);
+
+    const filtered = try gpa.alloc(u8, pixel_count);
+    defer gpa.free(filtered);
+
+    // alpha_quality 0 forces the uncompressed form; any positive value also
+    // tries the lossless VP8L form and keeps whichever is smaller.
+    const try_lossless = alpha_quality > 0;
+
+    var best: ?[]u8 = null;
+    errdefer if (best) |payload| gpa.free(payload);
+    var best_stream_len: usize = std.math.maxInt(usize);
+
+    for (filter_candidates) |filter| {
+        forwardFilterPlane(filter, plane, dimensions, filtered);
+
+        // Uncompressed candidate: header byte + filtered plane.
+        const raw_stream_len = pixel_count;
+        if (raw_stream_len < best_stream_len) {
+            const payload = try gpa.alloc(u8, header_size + raw_stream_len);
+            payload[0] = encodeHeaderByte(.none, filter, .none);
+            @memcpy(payload[header_size..], filtered);
+            if (best) |old| gpa.free(old);
+            best = payload;
+            best_stream_len = raw_stream_len;
+        }
+
+        if (!try_lossless) continue;
+
+        // Lossless candidate: the filtered bytes in the green channel of a
+        // headerless VP8L image stream.
+        const stream = try encodeLosslessStream(gpa, filtered, dimensions);
+        defer gpa.free(stream);
+        if (stream.len < best_stream_len) {
+            const payload = try gpa.alloc(u8, header_size + stream.len);
+            payload[0] = encodeHeaderByte(.lossless, filter, .none);
+            @memcpy(payload[header_size..], stream);
+            if (best) |old| gpa.free(old);
+            best = payload;
+            best_stream_len = stream.len;
+        }
+    }
+
+    // A non-empty plane always produces at least the uncompressed candidate.
+    assert(best != null);
+    return best.?;
+}
+
+/// Returns true when the plane carries meaningful (non-fully-opaque) alpha. A
+/// fully-opaque plane needs no ALPH chunk, so callers skip alpha encoding and
+/// emit a plain `VP8 ` file.
+pub fn planeHasTransparency(plane: []const u8) bool {
+    for (plane) |sample| {
+        if (sample != 255) return true;
+    }
+    return false;
+}
+
+/// Packs the ALPH header byte: compression in bits 0..1, filter in bits 2..3,
+/// preprocessing in bits 4..5, reserved bits 6..7 left zero — exactly the
+/// layout `parseHeader` decodes.
+fn encodeHeaderByte(
+    compression: Compression,
+    filter: Filter,
+    preprocessing: Preprocessing,
+) u8 {
+    return @as(u8, @intFromEnum(compression)) |
+        (@as(u8, @intFromEnum(filter)) << 2) |
+        (@as(u8, @intFromEnum(preprocessing)) << 4);
+}
+
+/// Compresses a filtered alpha plane as a headerless VP8L image stream whose
+/// green channel carries each filtered byte (red/blue 0, alpha 255 = opaque so
+/// the stream itself stays alpha-free). This is the exact inverse of
+/// `decodeLossless`, which reads the green channel back out. Caller owns the
+/// returned bytes (free with `gpa`).
+fn encodeLosslessStream(
+    gpa: std.mem.Allocator,
+    filtered: []const u8,
+    dimensions: image.Dimensions,
+) errors.Error![]u8 {
+    const pixel_count = filtered.len;
+    const pixels = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    defer gpa.free(pixels);
+    for (filtered, pixels) |sample, *value| {
+        value.* = vp8l_pixel.fromChannels(255, 0, sample, 0);
+    }
+    return vp8l_encoder.encodeImageStreamAlloc(gpa, dimensions, pixels);
+}
+
+/// Forward row-filters the plane in encode direction: `residual = value -
+/// prediction`, where the prediction is the spec predictor over the original
+/// (= reconstructed, since lossless) neighbors. This mirrors `unfilterRow`'s
+/// per-filter edge fallbacks (vertical/gradient fall back to horizontal on the
+/// top row; horizontal predicts from the pixel above at x == 0).
+pub fn forwardFilterPlane(
+    filter: Filter,
+    plane: []const u8,
+    dimensions: image.Dimensions,
+    out: []u8,
+) void {
+    const width: usize = dimensions.width;
+    const height: usize = dimensions.height;
+    assert(plane.len == width * height);
+    assert(out.len == plane.len);
+
+    if (filter == .none) {
+        @memcpy(out, plane);
+        return;
+    }
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            const index = y * width + x;
+            const value = plane[index];
+            const left = if (x > 0) plane[index - 1] else null;
+            const top = if (y > 0) plane[index - width] else null;
+            const top_left = if (x > 0 and y > 0) plane[index - width - 1] else null;
+
+            const prediction = forwardPrediction(filter, left, top, top_left);
+            out[index] = value -% prediction;
+        }
+    }
+}
+
+fn forwardPrediction(filter: Filter, left: ?u8, top: ?u8, top_left: ?u8) u8 {
+    return switch (filter) {
+        .none => 0,
+        .horizontal => left orelse top orelse 0,
+        .vertical => top orelse left orelse 0,
+        .gradient => prediction: {
+            if (top == null) break :prediction left orelse 0;
+            if (left == null) break :prediction top.?;
+            break :prediction gradientPredictor(left.?, top.?, top_left.?);
+        },
+    };
+}
+
 test "parses ALPH header fields" {
     const header = try parseHeader(&.{0b00_01_10_01});
 
@@ -336,12 +513,11 @@ test "raw alpha round-trips through forward filtering" {
         sample.* = @truncate(index *% 41 +% 13);
     }
 
-    const filters = [_]Filter{ .none, .horizontal, .vertical, .gradient };
-    for (filters) |filter| {
+    const dimensions = try image.Dimensions.init(width, height);
+    for (filter_candidates) |filter| {
         var filtered: [width * height]u8 = undefined;
-        forwardFilterPlane(filter, &plane, width, height, &filtered);
+        forwardFilterPlane(filter, &plane, dimensions, &filtered);
 
-        const dimensions = try image.Dimensions.init(width, height);
         var decoded: [width * height]u8 = undefined;
         const header = Header{
             .compression = .none,
@@ -458,40 +634,6 @@ fn writeSimplePrefixCode(writer: *bit_writer.BitWriter, symbol: u8) errors.Error
     try writer.writeBit(0);
     try writer.writeBit(if (symbol <= 1) 0 else 1);
     try writer.writeBits(symbol, if (symbol <= 1) 1 else 8);
-}
-
-/// Test-only forward filter applying the spec predictors in encode direction.
-fn forwardFilterPlane(
-    filter: Filter,
-    plane: []const u8,
-    width: usize,
-    height: usize,
-    out: []u8,
-) void {
-    var y: usize = 0;
-    while (y < height) : (y += 1) {
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const index = y * width + x;
-            const value = plane[index];
-            const left = if (x > 0) plane[index - 1] else null;
-            const top = if (y > 0) plane[index - width] else null;
-            const top_left = if (x > 0 and y > 0) plane[index - width - 1] else null;
-
-            const prediction: u8 = switch (filter) {
-                .none => 0,
-                .horizontal => left orelse top orelse 0,
-                .vertical => top orelse left orelse 0,
-                .gradient => prediction: {
-                    if (top == null) break :prediction left orelse 0;
-                    if (left == null) break :prediction top.?;
-                    break :prediction gradientPredictor(left.?, top.?, top_left.?);
-                },
-            };
-
-            out[index] = value -% prediction;
-        }
-    }
 }
 
 test "fuzz alpha plane decode" {

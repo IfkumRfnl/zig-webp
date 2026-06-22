@@ -131,6 +131,34 @@ const Encoder = struct {
     }
 
     fn run(self: *Encoder) Error![]u8 {
+        // Assemble the full bitstream into a single allocation sized by the
+        // worst-case bound, then trim to the exact written length. The 5-byte
+        // VP8L header is written into the front; the image stream follows.
+        const capacity = try maxEncodedSize(self.dimensions);
+        const buffer = try self.gpa.alloc(u8, capacity);
+        errdefer self.gpa.free(buffer);
+
+        const stream_len = try self.encodeStreamInto(buffer[header.byte_count..]);
+        const total_len = header.byte_count + stream_len;
+
+        // Write the header into the front of the buffer.
+        writeImageHeader(buffer[0..header.byte_count], self.dimensions, self.has_alpha);
+
+        // Trim to the exact encoded length.
+        if (self.gpa.resize(buffer, total_len)) {
+            return buffer[0..total_len];
+        }
+        const exact = try self.gpa.alloc(u8, total_len);
+        @memcpy(exact, buffer[0..total_len]);
+        self.gpa.free(buffer);
+        return exact;
+    }
+
+    /// Emits the headerless VP8L image stream (transform list + main image)
+    /// into `out`, returning the byte length written. This is everything the
+    /// decoder's `decodeImageStream` consumes, i.e. a full `VP8L` chunk minus
+    /// the 5-byte image header. The ALPH lossless alpha path reuses it.
+    fn encodeStreamInto(self: *Encoder, out: []u8) Error!usize {
         // Plan: decide the transform stack and produce the transformed main
         // image plus the transform records to emit.
         var plan = try Plan.build(self.gpa, self.dimensions, self.source);
@@ -146,13 +174,7 @@ const Encoder = struct {
         defer self.gpa.free(tokens);
         const token_stream = try tokenize(self.gpa, main_dimensions, main_pixels, tokens);
 
-        // Assemble the full bitstream into a single allocation sized by the
-        // worst-case bound, then trim to the exact written length.
-        const capacity = try maxEncodedSize(self.dimensions);
-        const buffer = try self.gpa.alloc(u8, capacity);
-        errdefer self.gpa.free(buffer);
-
-        var writer = bit_writer.BitWriter.init(buffer[header.byte_count..]);
+        var writer = bit_writer.BitWriter.init(out);
 
         // Transform list: emit each transform record, then a terminator 0 bit.
         // Spatial (predictor/color) transforms operate on the full image, so
@@ -167,21 +189,47 @@ const Encoder = struct {
         try emitMainImage(self.gpa, &writer, main_dimensions, main_pixels, token_stream);
 
         const image_bytes = try writer.finish();
-        const total_len = header.byte_count + image_bytes.len;
-
-        // Write the header into the front of the buffer.
-        writeImageHeader(buffer[0..header.byte_count], self.dimensions, self.has_alpha);
-
-        // Trim to the exact encoded length.
-        if (self.gpa.resize(buffer, total_len)) {
-            return buffer[0..total_len];
-        }
-        const exact = try self.gpa.alloc(u8, total_len);
-        @memcpy(exact, buffer[0..total_len]);
-        self.gpa.free(buffer);
-        return exact;
+        return image_bytes.len;
     }
 };
+
+/// Encodes the `width`x`height` ARGB pixel array as a headerless VP8L image
+/// stream into a freshly allocated buffer the caller owns and frees with `gpa`.
+/// Unlike `encodeAlloc` the result omits the 5-byte VP8L image header, so it is
+/// the exact inverse of the decoder's `decodeImageStream` — the form a
+/// VP8L-compressed `ALPH` chunk carries (alpha bytes in the green channel).
+pub fn encodeImageStreamAlloc(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
+) Error![]u8 {
+    const pixel_count = try dimensions.pixelCount();
+    if (pixels.len != pixel_count) return error.OutputTooLarge;
+    if (dimensions.width == 0 or dimensions.height == 0) return error.InvalidVP8LHeader;
+    if (dimensions.width > dimension_max or dimensions.height > dimension_max) {
+        return error.InvalidVP8LHeader;
+    }
+
+    var encoder = try Encoder.init(gpa, dimensions, pixels);
+    defer encoder.deinit();
+
+    // The headerless stream is strictly shorter than the full encoding, whose
+    // bound already accounts for the (now absent) 5-byte header.
+    const capacity = try maxEncodedSize(dimensions);
+    const buffer = try gpa.alloc(u8, capacity);
+    errdefer gpa.free(buffer);
+
+    const stream_len = try encoder.encodeStreamInto(buffer);
+
+    // Trim to the exact encoded length.
+    if (gpa.resize(buffer, stream_len)) {
+        return buffer[0..stream_len];
+    }
+    const exact = try gpa.alloc(u8, stream_len);
+    @memcpy(exact, buffer[0..stream_len]);
+    gpa.free(buffer);
+    return exact;
+}
 
 /// Returns a safe upper bound on the encoded byte length for the given
 /// dimensions. The transform records add a bounded amount; the token stream is
