@@ -113,19 +113,9 @@ pub fn allocationBytesMax(dimensions: image.Dimensions) Error!u64 {
     return peak;
 }
 
-/// Tunables for a single VP8 frame encode. Bundled into a struct so quality
-/// knobs can be added without churning every `encodeAlloc` call site.
-pub const EncodeConfig = struct {
-    /// Frame-wide AC quantizer index (0..127); derive it from a quality knob
-    /// with `quant.baseQuantIndexForQuality`.
-    base_quant_index: u8,
-    /// Effort level (0..6, `cwebp -m` compatible). Scaffolded for step 8c-1;
-    /// not yet honored — the rate-distortion search is fixed for now.
-    method: u8 = 4,
-};
-
 /// Encodes macroblock-padded source YUV planes into a raw VP8 key-frame
-/// bitstream.
+/// bitstream. `base_quant_index` is the frame-wide AC quantizer index (0..127);
+/// derive it from a quality knob with `quant.baseQuantIndexForQuality`.
 ///
 /// B_PRED macroblocks code far more mode data than the 16x16 modes, so on very
 /// large, detail-rich frames the per-macroblock modes can overflow VP8's 19-bit
@@ -135,10 +125,10 @@ pub const EncodeConfig = struct {
 pub fn encodeAlloc(
     gpa: std.mem.Allocator,
     source: *const color.YuvPlanes,
-    config: EncodeConfig,
+    base_quant_index: u8,
 ) Error!Result {
-    return encodeFramePass(gpa, source, config.base_quant_index, true) catch |err| switch (err) {
-        error.FileTooLarge => try encodeFramePass(gpa, source, config.base_quant_index, false),
+    return encodeFramePass(gpa, source, base_quant_index, true) catch |err| switch (err) {
+        error.FileTooLarge => try encodeFramePass(gpa, source, base_quant_index, false),
         else => err,
     };
 }
@@ -1166,7 +1156,7 @@ fn expectSelfConsistent(width: u32, height: u32) !void {
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
 
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(75) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(75));
     defer result.deinit(gpa);
 
     var frame = try decoder.decodeFrame(gpa, result.bitstream, .{ .apply_loop_filter = true });
@@ -1212,7 +1202,7 @@ test "B_PRED macroblocks are selected and stay self-consistent" {
     defer source.deinit(gpa);
 
     // A fine quantizer makes B_PRED's extra signaling worth its better prediction.
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(95) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(95));
     defer result.deinit(gpa);
 
     // Self-consistency: the decoder must reproduce the B_PRED reconstruction
@@ -1343,7 +1333,7 @@ test "encoded baseline frame is a valid muxable VP8 bitstream" {
 
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(50) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(50));
     defer result.deinit(gpa);
 
     // The header must parse and report the source dimensions.
@@ -1387,7 +1377,7 @@ test "flat content is coded with skipped macroblocks" {
 
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(75) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(75));
     defer result.deinit(gpa);
 
     var parsed: frame_header.Parsed = undefined;
@@ -1432,7 +1422,7 @@ test "loop filter runs and the reconstruction is the filtered frame" {
 
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(40) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(40));
     defer result.deinit(gpa);
 
     // The encoder must have chosen a nonzero normal-filter level.
@@ -1475,7 +1465,7 @@ test "segmentation engages and stays self-consistent on mixed content" {
 
     var source = try color.rgbaToYuv420Alloc(gpa, argb, width, height);
     defer source.deinit(gpa);
-    var result = try encodeAlloc(gpa, &source, .{ .base_quant_index = quant.baseQuantIndexForQuality(75) });
+    var result = try encodeAlloc(gpa, &source, quant.baseQuantIndexForQuality(75));
     defer result.deinit(gpa);
 
     // Segmentation must be enabled with more than one segment actually used.

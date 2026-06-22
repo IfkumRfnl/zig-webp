@@ -87,17 +87,11 @@ pub fn encodeStaticLossy(
     defer gpa.free(argb);
     gatherArgb(buffer, argb);
 
-    var source = if (encode_options.use_sharp_yuv)
-        try color.rgbaToYuv420SharpAlloc(gpa, argb, dimensions.width, dimensions.height)
-    else
-        try color.rgbaToYuv420Alloc(gpa, argb, dimensions.width, dimensions.height);
+    var source = try color.rgbaToYuv420Alloc(gpa, argb, dimensions.width, dimensions.height);
     defer source.deinit(gpa);
 
     const base_quant_index = vp8_quant.baseQuantIndexForQuality(encode_options.quality);
-    var result = try vp8_encoder.encodeAlloc(gpa, &source, .{
-        .base_quant_index = base_quant_index,
-        .method = encode_options.method,
-    });
+    var result = try vp8_encoder.encodeAlloc(gpa, &source, base_quant_index);
     defer result.deinit(gpa);
 
     try validateLossyMuxAllocationBudget(
@@ -137,9 +131,11 @@ pub fn encodeVP8Bitstream(
     var source = try color.rgbaToYuv420Alloc(gpa, pixels, dimensions.width, dimensions.height);
     defer source.deinit(gpa);
 
-    var result = try vp8_encoder.encodeAlloc(gpa, &source, .{
-        .base_quant_index = vp8_quant.baseQuantIndexForQuality(quality),
-    });
+    var result = try vp8_encoder.encodeAlloc(
+        gpa,
+        &source,
+        vp8_quant.baseQuantIndexForQuality(quality),
+    );
     result.reconstruction.deinit(gpa);
     return result.bitstream;
 }
