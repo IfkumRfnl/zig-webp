@@ -78,6 +78,18 @@ and target-size lands within 5% — 0.32–2.83% on the photos). See the five
 the remaining lossy work is performance (step 10) and release hardening
 (step 11).
 
+Step 9 (animation and metadata encode) is now underway. Its first slice — 9a, the
+animation **container mux** — is delivered: `mux.encodeAnimation` (public
+`encodeAnimation`) assembles already-encoded frame bitstreams into a valid
+animated WebP (`VP8X`+`ANIM`+`ANMF`, optional per-frame `ALPH`, optional
+`ICCP`/`EXIF`/`XMP `), the animated analogue of `encodeStatic`. It validates every
+frame against the canvas and the container rules and round-trips through this
+library's demux; `webpinfo`/`webpmux`/`anim_dump` accept output built from real
+encoded frames (see "Step 9 — Animation and Metadata Encode (slice 9a)" and the
+2026-06-23 oracle row). The pixel-level `encodeAnimation` (encoding frames from
+pixel buffers), sub-rectangle/differencing optimization, and metadata-from-pixels
+are slices 9b–9d.
+
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
@@ -122,6 +134,42 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 9 — Animation and Metadata Encode (slice 9a: container mux)
+
+Slice 9a delivers the animation **container muxer** — the step-9 analogue of
+`encodeStatic`. `mux.encodeAnimation` (public `encodeAnimation`) assembles
+already-encoded frame bitstreams into a valid animated WebP; it does not encode
+pixels (that is slice 9b).
+
+- **Inputs.** `AnimationImage` carries the canvas, loop count, background color,
+  optional metadata, and an ordered list of `AnimationFrameImage` frames. Each
+  frame supplies its rectangle, duration, blend/dispose methods, codec
+  (`.lossy`/`.lossless`), the raw `VP8 `/`VP8L` bitstream, and an optional lossy
+  `ALPH` payload — the bitstream-carrying analogue of `StaticImage`.
+- **Output layout.** `VP8X` (animation flag + canvas) → optional `ICCP` → `ANIM`
+  (background + loop count) → one `ANMF` per frame (16-byte frame header +
+  optional `ALPH` + image) → optional `EXIF`/`XMP `. The `VP8X` alpha flag is set
+  iff any frame carries alpha.
+- **Validation.** Every frame's rectangle must lie inside the canvas with even
+  offsets (the container stores them in 2-pixel units), its bitstream dimensions
+  must equal the rectangle, `ALPH` is rejected on `.lossless` frames, and the
+  duration fits the 24-bit field — the same constraints `demux` enforces on read,
+  so a muxed animation always round-trips. Resource limits bound frame count,
+  chunk count, and the single output allocation.
+
+Round-trip (CI gate, `zig build test`, 365/365 pass): 12 new tests mux
+multi-frame lossy+lossless animations and parse them back through `demux`
+(rects, durations, blend/dispose, loop count, background, metadata), cover the
+validation errors (odd offset, lossless+`ALPH`, rect outside canvas, dimension
+mismatch, empty list) and the frame-count limit, and survive allocation failure
+at every site. Validity (local, libwebp 1.5.0): a 32×32 two-frame animation
+built from real library-encoded frames (lossless full-canvas + lossy 16×16
+sub-rect with background dispose) is accepted by `webpinfo` ("No error
+detected"), listed correctly by `webpmux -info`, and decoded to per-frame images
+by `anim_dump`. See the 2026-06-23 oracle row. Pixel-level `encodeAnimation`
+from buffers (and the `anim_dump`-matches-our-composition gate), inter-frame
+optimization, and metadata-from-pixels are slices 9b–9d.
 
 ### Step 8 — VP8 Lossy Encoder (step 8c: controls and parity)
 
@@ -583,6 +631,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-22 | VP8 lossy encoder (slice 8c-2) lossy+alpha via the `ALPH` chunk | `encodeStaticLossy` encodes the straight (non-premultiplied) alpha plane into an `ALPH` chunk and emits a `VP8X`+`ALPH`+`VP8 ` container; a fully-opaque input still emits a plain `VP8 ` file byte-identical to the color-only path. Alpha is lossless: the plane is row-filtered (best of none/H/V/gradient) and stored as the cheaper of uncompressed or a headerless VP8L stream (`src/alpha.zig` `encodePlaneAlloc`, reusing the step-7 encoder's new `encodeImageStreamAlloc`), the exact inverse of `alpha.zig` decode; `encode_options.alpha_quality` selects 0 = uncompressed / 1..100 = lossless VP8L. Round-trip (CI gate, `zig build test`): the synth RGBA alpha cases (ramp, binary checker, transparent-over-nonzero-RGB) recover the alpha plane byte-exactly through `decodeStatic`; fully-opaque output is asserted byte-identical to the `VP8 `-only path. Validity: locally `dwebp -pam` recovers alpha byte-for-byte on the re-encoded libwebp alpha fixtures (all four filters + the color-cache fixture), and `compare-encode-lossy` is 0/135 invalid. Note: the `compare-encode-lossy` *size* ratio is now skewed (aggregate ~1.98x) because our output carries `ALPH` alpha while its `cwebp -q -noalpha` baseline strips it — validity is the gate; a fair alpha-vs-alpha size comparison needs an alpha-carrying `cwebp` baseline (a tooling follow-up). |
 | 2026-06-22 | VP8 lossy encoder (slice 8c-3) target-size / target-PSNR modes | `EncoderOptions.target_size` (bytes) and `target_psnr` (dB) drive a bounded (≤8-probe, `search_passes_max`) binary search over the quantizer index, re-encoding each probe and keeping the closest-to-target candidate; both unset → byte-identical to the single-pass quality path (asserted at q0/25/50/75/100), both set → `error.InvalidEncodeOptions`. target-PSNR measures full-range BT.601 luma PSNR of the reconstruction (the metric `cwebp` reports). Alpha rides through the search unchanged: the `ALPH` payload is encoded once and reused across probes. Gates (CI `zig build test`, 345/345 pass; `dwebp` `compare-encode-lossy` 0/135 invalid): on the 4 photos target-size lands 0.32–2.83% off (step-8c gate ≤5%), target-PSNR 38.0 dB → 38.01–38.08 dB achieved; a new test confirms target-size on an alpha source still recovers alpha byte-exactly. **This slice carries the step-8c target-size gate and completes the VP8 lossy encoder.** |
 | 2026-06-22 | VP8 lossy encoder (slice 8c-4) sharp (iterative) RGB→YUV chroma | Adds `color.rgbaToYuv420SharpAlloc`, selected by `encodeStaticLossy` when `encode_options.use_sharp_yuv` is set; the default (false) box-average path is byte-identical to before (asserted). Sharp starts from the box grid and runs a bounded 4-pass integer Gauss–Seidel refinement that minimizes, per chroma cell, the residual between the full-resolution chroma target (`rgbToU`/`rgbToV`) and what the decoder's fancy upsampler reconstructs over that cell (a closed-form 9:3:3:1 diamond matching `upsampleFancy`, gated by test); luma is left at full resolution. Self-consistency holds (sharp changes only the source chroma, not the encoder-vs-decoder equivalence). Validity: locally `dwebp` 1.5.0 decodes all 4 sharp photo outputs; `compare-encode-lossy` 0/135 invalid. Quality (reported): on an isolated saturated red/blue color edge the converter gains +2.20 dB RGB PSNR at matched size (13.89 → 16.09); end-to-end (encode q75 → decode, sharp vs box) RGB PSNR +0.55–1.36 dB on signage/foliage/sky and −0.03 dB on portrait — but at matched *quality*, so sharp preserves more chroma detail and the outputs run slightly larger (a matched-size comparison would narrow the gain to roughly the isolated-converter figure). Merged, briefly reverted (#66), and re-applied (#67) during integration; net result is in `main`. |
+| 2026-06-23 | Animation container mux (slice 9a) accepted by `webpinfo`/`webpmux`/`anim_dump` | New `mux.encodeAnimation` (public `encodeAnimation`) assembles already-encoded frame bitstreams into an animated WebP: `VP8X` (animation flag + canvas) → optional `ICCP` → `ANIM` (background + loop count) → one `ANMF` per frame (16-byte frame header + optional lossy `ALPH` + `VP8 `/`VP8L`) → optional `EXIF`/`XMP `. It does not encode pixels — `AnimationImage`/`AnimationFrameImage` carry the bitstreams, the animated analogue of `StaticImage`/`encodeStatic`. Every frame's rectangle (inside the canvas, even offsets), codec, bitstream dimensions, and alpha are validated, and the `VP8X` alpha flag is set iff any frame carries alpha — the same constraints `demux` enforces on read, so a muxed animation always round-trips. Round-trip (CI gate, `zig build test`, 365/365 pass): 12 new tests mux multi-frame lossy+lossless animations and parse them back through `demux` (rects, durations, blend/dispose, loop count, background, metadata), cover the validation errors (odd offset, lossless+`ALPH`, rect outside canvas, dimension mismatch, empty list) and the frame-count limit, and survive allocation failure at every site. Validity (local, libwebp 1.5.0): a 32×32 two-frame animation built from real library-encoded frames (lossless full-canvas + lossy 16×16 sub-rect with background dispose) is accepted by `webpinfo` ("No error detected"), listed correctly by `webpmux -info`, and decoded to per-frame PNGs by `anim_dump`. This is the step-9 container layer; pixel-level `encodeAnimation` from buffers (and the `anim_dump`-matches-our-composition gate) is slice 9b. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

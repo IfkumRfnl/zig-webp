@@ -71,6 +71,13 @@ pub const AlphaFilter = alpha.Filter;
 pub const AlphaHeader = alpha.Header;
 pub const AlphaPreprocessing = alpha.Preprocessing;
 pub const AnimationFrame = animation.Frame;
+/// Inputs to `encodeAnimation`: global canvas/loop/background plus an ordered
+/// list of pre-encoded `AnimationFrameImage` frames and optional metadata.
+pub const AnimationImage = mux.AnimationImage;
+/// One pre-encoded frame for `encodeAnimation`: placement, timing, blend/dispose
+/// methods, and the already-encoded VP8/VP8L bitstream (plus optional lossy
+/// `ALPH`). Distinct from `AnimationFrame`, which is a decoded/parsed frame.
+pub const AnimationFrameImage = mux.FrameImage;
 /// Streaming animated-WebP decoder: composites one frame at a time onto a
 /// reused canvas (bounded memory). The caller owns it and must `deinit`.
 pub const AnimationDecoder = animation_decode.Decoder;
@@ -211,6 +218,23 @@ pub fn encodeStatic(
     encode_options: MuxOptions,
 ) Error![]u8 {
     return mux.encodeStatic(gpa, static_image, encode_options);
+}
+
+/// Muxes already-encoded animation frames (`AnimationImage`) into a complete
+/// animated WebP file: `VP8X` + `ANIM` + one `ANMF` per frame (with optional
+/// per-frame `ALPH`), plus optional `ICCP`/`EXIF`/`XMP ` metadata. It does not
+/// encode pixels — each frame supplies its own VP8/VP8L bitstream — and is the
+/// animated analogue of `encodeStatic`. Every frame's rectangle, even-offset,
+/// codec, dimensions, and alpha are validated against the canvas and the
+/// container rules, so the output round-trips through `parseWebP` and is
+/// accepted by `webpinfo`/`webpmux`. Returns caller-owned bytes (free with the
+/// same allocator).
+pub fn encodeAnimation(
+    gpa: std.mem.Allocator,
+    anim: AnimationImage,
+    encode_options: MuxOptions,
+) Error![]u8 {
+    return mux.encodeAnimation(gpa, anim, encode_options);
 }
 
 /// Encodes a caller-supplied pixel buffer into a complete lossless (VP8L)

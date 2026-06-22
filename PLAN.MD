@@ -442,3 +442,26 @@ roadmap is step 9 (animation and metadata encode), step 10 (performance), step
 11 (robustness hardening), and step 12 (public API and release criteria); the
 near-term focus moves to step 9 unless performance or hardening is prioritized
 first.
+
+Step 9 (animation and metadata encode) is broken into reviewable slices,
+mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
+then pixels, then quality):
+
+1. **9a (delivered).** The animation **container mux**: `mux.encodeAnimation`
+   (public `encodeAnimation`) assembles already-encoded frame bitstreams into a
+   valid `VP8X`+`ANIM`+`ANMF` animation (optional per-frame `ALPH`, optional
+   `ICCP`/`EXIF`/`XMP `), validating every frame against the canvas and the
+   container rules. It does not encode pixels. Output round-trips through this
+   library's demux and is accepted by `webpinfo`/`webpmux`/`anim_dump` (see
+   `PROGRESS.MD` and the 2026-06-23 oracle row).
+2. **9b (planned).** Public `encodeAnimation` from pixel buffers: encode each
+   frame (lossy or lossless, with alpha) into a bitstream and mux it via 9a;
+   full-canvas frames first. Carries the step-9 gate that `anim_dump` of the
+   output matches this library's own `decodeAnimation` composition byte-for-byte.
+3. **9c (planned).** Frame optimization: sub-rectangle detection, inter-frame
+   differencing, blend/dispose strategy, and keyframe insertion (libwebp
+   `WebPAnimEncoder`-style), preserving the 9b gate.
+4. **9d (planned).** Metadata-from-pixels and chunk-order preservation for both
+   still and animation encode, plus the browser-render check. The mux layer
+   already writes `ICCP`/`EXIF`/`XMP ` in spec order; this closes the
+   pixel-encode public-API gap.
