@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 
 ## Current Position
 
@@ -60,8 +60,23 @@ adaptive per-segment quantization (8b-3b). Slice 8b-3b carries the step-8b
 acceptance gate, and it holds: at matched output size on the photo corpus the
 mean BT.601 luma PSNR is 40.79 dB versus 40.70 dB for `cwebp -q 75 -m 4` (+0.08
 dB, inside the 1.0 dB target with room to spare; see the second 2026-06-21 oracle
-row). What remains for the lossy encoder is step 8c (presets, target-size/PSNR
-modes, sharp-YUV chroma, and `ALPH` alpha).
+row).
+
+Step 8c (controls and parity features) is now also delivered, **completing the
+VP8 lossy encoder**. It landed as an options scaffold (inert `EncoderOptions`
+knobs + an `EncodeConfig` struct, so the slices could be built in parallel
+without colliding on the public surface) followed by four slices: **8c-1** a
+`method` (0..6) effort knob that scales the rate-distortion search (method 4, the
+default, is byte-identical to the 8b encoder; methods 5–6 currently clamp to 4),
+**8c-2** lossy+alpha via the `ALPH` chunk (lossless alpha, byte-exact round-trip),
+**8c-3** target-size and target-PSNR modes (a bounded quantizer search), and
+**8c-4** sharp (iterative) RGB→YUV chroma. Every slice keeps its default path
+byte-identical to 8b and holds `dwebp` validity (0/135 invalid); the step-8c gate
+holds (the method-preset matrix encodes the corpus with no validity regression,
+and target-size lands within 5% — 0.32–2.83% on the photos). See the five
+2026-06-22 oracle rows. With step 8c done the lossy encoder is feature-complete;
+the remaining lossy work is performance (step 10) and release hardening
+(step 11).
 
 ## Cross-Cutting Practices
 
@@ -107,6 +122,44 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 8 — VP8 Lossy Encoder (step 8c: controls and parity)
+
+Step 8c completes the VP8 lossy encoder with its controls and parity features,
+landed as an options scaffold plus four reviewable slices. Every piece keeps its
+default path byte-identical to the 8b encoder and holds `dwebp` validity at
+0/135 invalid:
+
+- **Scaffold.** Inert `EncoderOptions` knobs (`method`, `target_size`,
+  `target_psnr`, `alpha_quality`, `use_sharp_yuv`) and an `EncodeConfig` struct
+  on `vp8.encoder.encodeAlloc`, landed first so the four slices could be built
+  in parallel without colliding on the public surface.
+- **8c-1 — method/effort knob.** `method` (0..6, `cwebp -m` compatible) scales
+  the rate-distortion search via an `Effort` tier (DC-only at 0–1, all 16x16 /
+  chroma modes at 2–3, full B_PRED + segmentation at 4–6). Method 4 (the
+  default) is byte-identical to the 8b encoder; methods 5–6 currently clamp to 4
+  (no extra search above the 8b baseline yet — the knob's present value is the
+  faster low end: m2 ≈ 2.2x and m0 ≈ 3.4x faster than m4).
+- **8c-2 — lossy+alpha (`ALPH`).** The straight (non-premultiplied) alpha plane
+  is row-filtered and stored as the cheaper of uncompressed or a headerless VP8L
+  stream (reusing the step-7 encoder), emitted as a `VP8X`+`ALPH`+`VP8 `
+  container; `alpha_quality` selects 0 = uncompressed / 1..100 = lossless VP8L.
+  Fully-opaque inputs stay byte-identical to the color-only path. Alpha
+  round-trips byte-exactly through `decodeStatic` and `dwebp -pam`.
+- **8c-3 — target-size / target-PSNR.** A bounded (≤8-probe) binary search over
+  the quantizer index hits a requested byte size or BT.601 luma PSNR; both
+  unset → byte-identical to the single-pass quality path, both set →
+  `error.InvalidEncodeOptions`. The `ALPH` payload is encoded once and reused
+  across probes (it is independent of the color quantizer).
+- **8c-4 — sharp-YUV.** Optional iterative (bounded 4-pass Gauss–Seidel) chroma
+  downsampling (`use_sharp_yuv`) that minimizes the residual against the
+  decoder's fancy upsampler; the default box-average path is unchanged.
+
+The step-8c acceptance gate holds: the method-preset matrix encodes the corpus
+with no validity regression (0/135 across methods) and target-size lands within
+5% (0.32–2.83% on the photos). See the five 2026-06-22 oracle rows. With step 8c
+done the VP8 lossy encoder is feature-complete; remaining lossy work is
+performance (step 10) and release hardening (step 11).
 
 ### Step 8 — VP8 Lossy Encoder (slice 8a)
 
@@ -525,6 +578,11 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-21 | VP8 lossy encoder (slice 8b-3a) skip decisions + loop-filter selection | Adds two header-level quality features. A macroblock whose residue quantizes entirely to zero is now coded as `mb_skip_coeff` (no residual tokens emitted), with the frame's `prob_skip_false` derived from the realized skip ratio (libwebp `CalcSkipProba`); skip coding is always enabled, which is valid for any ratio and avoids a buffering pass. The RFC 6386 §15 in-loop deblocking filter runs at a level chosen from the AC quantizer (libwebp `SetupFilterStrength`, single segment, default `-f 60`, sharpness 0, normal filter; e.g. q75 → level 10), and the encoder filters its finished reconstruction in place via the decoder's own `loop_filter.applyFrame`. Self-consistency (CI gate, `zig build test`): intra prediction reads only unfiltered pixels during the pass, so filtering the whole frame afterward leaves the decoder's filtered output byte-identical to the encoder's stored reconstruction; the gate now exercises both skip and filtering (q75 → level 10), with new tests that flat content is skipped, that filtering actually changes pixels (and unfiltered decode does not match), and that the level / skip-probability heuristics hold. Validity (`tools/webp-oracle.sh compare-encode-lossy`, libwebp 1.5.0): `dwebp` decodes all 135 stills, 0 invalid. Quality (reported, q75): on the 4-photo corpus mean BT.601 luma PSNR 39.65 → 39.99 dB (+0.34) at +0.08% bytes (63,614 → 63,668; every photo flat-or-better in PSNR, foliage also smaller); over the 34-source report +0.48 dB (36.82 → 37.30); per-file median size vs `cwebp -q 75 -noalpha` unchanged at 1.088x. The PSNR gain is entirely the deblocking filter (skip never alters the reconstruction); skip coding is byte-neutral on this textured corpus — it shrinks low-detail content but the per-frame skip overhead offsets that on busy photos — and pays off more on flat content. Segmentation (adaptive quant) and the matched-size PSNR gate close in slice 8b-3b. |
 
 | 2026-06-21 | VP8 lossy encoder (slice 8b-3b) segmentation: matched-size luma-PSNR gate vs `cwebp -q 75 -m 4` | Adds adaptive per-segment quantization — the step-8b gate slice. A pre-pass (`src/vp8/segment.zig`) buckets macroblocks into up to four segments by luma complexity (summed \|AC\| of the source luma subblocks, integer 1-D k-means, ≤6 iterations) and assigns each segment a quantizer delta on the frame base — finer for busier segments, the SSE-optimal direction, spread ±4 indices — emitted through the new `frame_header.writeSegmentation` and the per-macroblock segment map (`modes.encodeKeyFrameModes`). Flat/uniform or low-variation frames keep segmentation off, byte-identical to 8b-3a. The encoder reconstructs each macroblock with its segment's factors — exactly what the decoder resolves from the header via `quant.segmentFactors` — so the self-consistency gate holds. Self-consistency (CI gate, `zig build test`): the decoder reproduces the encoder's reconstruction byte-for-byte across every macroblock geometry × content × alpha and the 4 photos, plus a new mixed flat/textured case that exercises ≥2 segments; `frame_header.writeSegmentation` round-trips through `parseSegmentation` and `segment.zig` unit tests cover the k-means split, the uniform-collapse fallback, and the tree-probability derivation. Validity (`tools/webp-oracle.sh compare-encode-lossy`, libwebp 1.5.0): `dwebp` decodes all 135 stills, 0 invalid; the per-file median size vs `cwebp -q 75 -noalpha` is unchanged at 1.088x (the symmetric spread is bit-neutral at a fixed base quantizer). **Gate (matched output size, photo corpus, BT.601 luma PSNR vs `cwebp -q 75 -m 4`):** mean 40.79 dB vs cwebp 40.70 dB, **+0.08 dB** — inside the 1.0 dB target and ahead of `cwebp`; per photo: foliage +0.42, sky +0.31, portrait +0.04, signage −0.44 (sizes matched within 0.2–4.2%). Against the 8b-3a uniform-quant baseline at matched size (−0.02 dB vs cwebp), segmentation adds +0.10 dB. The spread magnitude was tuned by measurement: the matched-size gain plateaus across spreads 2..5 (≈+0.1 dB), is neutral by spread 6, and goes negative by spread 12 (coarsened segments then lose more than refined ones gain). |
+
+| 2026-06-22 | VP8 lossy encoder (slice 8c-1) method/quality effort knob | Honors `EncodeConfig.method` (0..6, `cwebp -m` compatible) to scale the rate-distortion search via an `Effort` tier (`src/vp8/encoder.zig`), threaded `encodeAlloc` → `encodeFramePass` → `encodeMacroblock` → `selectLuma`/`selectChroma`: methods 0–1 code DC-only (no B_PRED, no segmentation), 2–3 evaluate all four 16x16/chroma intra modes, 4–6 run the full search (B_PRED + segmentation). **Method 4 — the default, matching the 8b gate's `-m 4` — is byte-identical to the 8b encoder** (asserted by test); methods 5–6 clamp to 4, i.e. no extra search above the 8b baseline yet, so the knob's present value is the faster low end. Self-consistency (CI gate, `zig build test`) and `dwebp` validity (`tools/webp-oracle.sh compare-encode-lossy`, libwebp 1.5.0: 0/135 invalid) hold. Quality/speed (reported, 4 photos, q75): m4 and m6 identical in size and PSNR; m2 ≈ 2.2x faster than m4 (~10 vs ~22 ms) at −0.9 to −1.4 dB luma; m0 ≈ 3.4x faster (DC-only). |
+| 2026-06-22 | VP8 lossy encoder (slice 8c-2) lossy+alpha via the `ALPH` chunk | `encodeStaticLossy` encodes the straight (non-premultiplied) alpha plane into an `ALPH` chunk and emits a `VP8X`+`ALPH`+`VP8 ` container; a fully-opaque input still emits a plain `VP8 ` file byte-identical to the color-only path. Alpha is lossless: the plane is row-filtered (best of none/H/V/gradient) and stored as the cheaper of uncompressed or a headerless VP8L stream (`src/alpha.zig` `encodePlaneAlloc`, reusing the step-7 encoder's new `encodeImageStreamAlloc`), the exact inverse of `alpha.zig` decode; `encode_options.alpha_quality` selects 0 = uncompressed / 1..100 = lossless VP8L. Round-trip (CI gate, `zig build test`): the synth RGBA alpha cases (ramp, binary checker, transparent-over-nonzero-RGB) recover the alpha plane byte-exactly through `decodeStatic`; fully-opaque output is asserted byte-identical to the `VP8 `-only path. Validity: locally `dwebp -pam` recovers alpha byte-for-byte on the re-encoded libwebp alpha fixtures (all four filters + the color-cache fixture), and `compare-encode-lossy` is 0/135 invalid. Note: the `compare-encode-lossy` *size* ratio is now skewed (aggregate ~1.98x) because our output carries `ALPH` alpha while its `cwebp -q -noalpha` baseline strips it — validity is the gate; a fair alpha-vs-alpha size comparison needs an alpha-carrying `cwebp` baseline (a tooling follow-up). |
+| 2026-06-22 | VP8 lossy encoder (slice 8c-3) target-size / target-PSNR modes | `EncoderOptions.target_size` (bytes) and `target_psnr` (dB) drive a bounded (≤8-probe, `search_passes_max`) binary search over the quantizer index, re-encoding each probe and keeping the closest-to-target candidate; both unset → byte-identical to the single-pass quality path (asserted at q0/25/50/75/100), both set → `error.InvalidEncodeOptions`. target-PSNR measures full-range BT.601 luma PSNR of the reconstruction (the metric `cwebp` reports). Alpha rides through the search unchanged: the `ALPH` payload is encoded once and reused across probes. Gates (CI `zig build test`, 345/345 pass; `dwebp` `compare-encode-lossy` 0/135 invalid): on the 4 photos target-size lands 0.32–2.83% off (step-8c gate ≤5%), target-PSNR 38.0 dB → 38.01–38.08 dB achieved; a new test confirms target-size on an alpha source still recovers alpha byte-exactly. **This slice carries the step-8c target-size gate and completes the VP8 lossy encoder.** |
+| 2026-06-22 | VP8 lossy encoder (slice 8c-4) sharp (iterative) RGB→YUV chroma | Adds `color.rgbaToYuv420SharpAlloc`, selected by `encodeStaticLossy` when `encode_options.use_sharp_yuv` is set; the default (false) box-average path is byte-identical to before (asserted). Sharp starts from the box grid and runs a bounded 4-pass integer Gauss–Seidel refinement that minimizes, per chroma cell, the residual between the full-resolution chroma target (`rgbToU`/`rgbToV`) and what the decoder's fancy upsampler reconstructs over that cell (a closed-form 9:3:3:1 diamond matching `upsampleFancy`, gated by test); luma is left at full resolution. Self-consistency holds (sharp changes only the source chroma, not the encoder-vs-decoder equivalence). Validity: locally `dwebp` 1.5.0 decodes all 4 sharp photo outputs; `compare-encode-lossy` 0/135 invalid. Quality (reported): on an isolated saturated red/blue color edge the converter gains +2.20 dB RGB PSNR at matched size (13.89 → 16.09); end-to-end (encode q75 → decode, sharp vs box) RGB PSNR +0.55–1.36 dB on signage/foliage/sky and −0.03 dB on portrait — but at matched *quality*, so sharp preserves more chroma detail and the outputs run slightly larger (a matched-size comparison would narrow the gain to roughly the isolated-converter figure). Merged, briefly reverted (#66), and re-applied (#67) during integration; net result is in `main`. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

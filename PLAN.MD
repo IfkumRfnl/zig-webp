@@ -374,7 +374,8 @@ input.
 
 ## Near-Term Work Items
 
-Steps 0 through 7 are complete and the VP8 lossy encoder (step 8) is underway.
+Steps 0 through 7 are complete and the VP8 lossy encoder (step 8) is now
+feature-complete through step 8c.
 Step 7 (VP8L lossless encoder) met both gates: every encode-corpus image
 round-trips bit-exactly and the median compressed size is 1.04x
 `cwebp -lossless` (see `PROGRESS.MD`). Its optional near-lossless preprocessing
@@ -419,8 +420,25 @@ auditable:
    mean luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact +0.08 dB,
    beating it; see the 2026-06-21 oracle row). `dwebp` validity unchanged
    (0/135 invalid).
-5. Then step 8c: method/quality presets, target-size and target-PSNR modes,
-   sharp-YUV chroma, and alpha (`ALPH`) encoding for lossy+alpha output.
+5. **8c (delivered).** Controls and parity features, completing the VP8 lossy
+   encoder. An options scaffold (inert `EncoderOptions` knobs + an `EncodeConfig`
+   struct, landed first so the slices could be built in parallel) then four
+   slices: **8c-1** a `method` (0..6) effort knob scaling the rate-distortion
+   search (method 4 byte-identical to 8b; 5–6 currently clamp to 4); **8c-2**
+   lossy+alpha via the `ALPH` chunk (lossless alpha, byte-exact round-trip);
+   **8c-3** target-size and target-PSNR modes (a bounded quantizer search — this
+   slice carries the step-8c ≤5% target-size gate, landing 0.32–2.83% off on the
+   photos); and **8c-4** sharp (iterative) RGB→YUV chroma. Each keeps its default
+   path byte-identical to 8b and holds `dwebp` validity (0/135 invalid); the
+   step-8c gate holds (the method-preset matrix has no validity regression and
+   target-size lands within 5%). See the five 2026-06-22 oracle rows in
+   `PROGRESS.MD`.
 
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
+
+With step 8c delivered, the VP8 lossy encoder is feature-complete. The remaining
+roadmap is step 9 (animation and metadata encode), step 10 (performance), step
+11 (robustness hardening), and step 12 (public API and release criteria); the
+near-term focus moves to step 9 unless performance or hardening is prioritized
+first.
