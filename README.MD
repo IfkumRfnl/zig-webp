@@ -42,10 +42,14 @@ optional sharp (iterative) RGB→YUV chroma. Animation and metadata encode (step
 is now underway: `encodeAnimation` muxes already-encoded frame bitstreams into a
 valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame `ALPH` and
 `ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of `encodeStatic` —
-accepted by `webpinfo`/`webpmux`/`anim_dump`, and the still pixel encoders now
-attach metadata (above). Encoding animation frames straight from pixel buffers,
-and frame optimization, are the remaining step-9 slices. The installed
-`zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
+accepted by `webpinfo`/`webpmux`/`anim_dump`. `encodeAnimationFromBuffers` builds
+on it to encode an ordered list of pixel-buffer frames (each full-canvas or
+sub-rect, lossy or lossless, with alpha) straight into an animated WebP, reusing
+the still encoders per frame; its output composites back through this library's
+`decodeAnimation` and matches libwebp's `anim_dump` byte-for-byte. The still pixel
+encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). Automatic
+inter-frame sub-rectangle/differencing optimization is the remaining step-9 slice.
+The installed `zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
 
 ## Goals
 

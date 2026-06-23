@@ -23,6 +23,7 @@ const encode = @import("encode.zig");
 pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
 pub const animation_decode = @import("animation_decode.zig");
+pub const animation_encode = @import("animation_encode.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
 pub const color = @import("color.zig");
@@ -89,6 +90,15 @@ pub const CompositedFrame = animation_decode.Frame;
 /// Result of `decodeAnimation`: every composited frame as its own buffer.
 pub const DecodedAnimation = animation_decode.OwnedAnimation;
 pub const DecodedAnimationFrame = animation_decode.OwnedFrame;
+/// One source frame for `encodeAnimationFromBuffers`: a pixel buffer plus its
+/// canvas offset, duration, blend/dispose methods, and per-frame codec. Distinct
+/// from `AnimationFrameImage` (a pre-encoded bitstream for the mux-level
+/// `encodeAnimation`) — this carries pixels for the encoder to compress.
+pub const AnimationFrameSource = animation_encode.FrameSource;
+/// Options for `encodeAnimationFromBuffers`: canvas, loop count, background,
+/// metadata, resource limits, and the shared per-frame quality/method/alpha
+/// knobs.
+pub const AnimationEncodeOptions = animation_encode.Options;
 pub const BitReader = bit_reader.BitReader;
 pub const BitWriter = bit_writer.BitWriter;
 pub const ByteReader = bit_reader.ByteReader;
@@ -235,6 +245,24 @@ pub fn encodeAnimation(
     encode_options: MuxOptions,
 ) Error![]u8 {
     return mux.encodeAnimation(gpa, anim, encode_options);
+}
+
+/// Encodes an ordered list of pixel-buffer frames (`AnimationFrameSource`) into
+/// a complete animated WebP file. Each frame's pixels are compressed to a
+/// `VP8 `/`VP8L` bitstream — lossless via the VP8L encoder, lossy via the VP8
+/// encoder plus an optional lossless `ALPH` plane — and the frames are muxed via
+/// `encodeAnimation`. This is the pixel-level animated analogue of
+/// `encodeLossy`/`encodeLossless`; the caller dictates each frame's rectangle,
+/// blend, and dispose (automatic sub-rectangle/differencing optimization is a
+/// later step). The output round-trips through `decodeAnimation` and is accepted
+/// by `webpinfo`/`webpmux`/`anim_dump`. Returns caller-owned bytes (free with
+/// the same allocator).
+pub fn encodeAnimationFromBuffers(
+    gpa: std.mem.Allocator,
+    frame_sources: []const AnimationFrameSource,
+    encode_options: AnimationEncodeOptions,
+) Error![]u8 {
+    return animation_encode.encodeAnimationFromBuffers(gpa, frame_sources, encode_options);
 }
 
 /// Encodes a caller-supplied pixel buffer into a complete lossless (VP8L)

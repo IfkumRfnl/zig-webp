@@ -454,10 +454,14 @@ then pixels, then quality):
    container rules. It does not encode pixels. Output round-trips through this
    library's demux and is accepted by `webpinfo`/`webpmux`/`anim_dump` (see
    `PROGRESS.MD` and the 2026-06-23 oracle row).
-2. **9b (planned).** Public `encodeAnimation` from pixel buffers: encode each
-   frame (lossy or lossless, with alpha) into a bitstream and mux it via 9a;
-   full-canvas frames first. Carries the step-9 gate that `anim_dump` of the
-   output matches this library's own `decodeAnimation` composition byte-for-byte.
+2. **9b (delivered).** Public `encodeAnimationFromBuffers` from pixel buffers:
+   `src/animation_encode.zig` encodes each caller-supplied frame (lossy or
+   lossless, with alpha) into a `VP8 `/`VP8L` bitstream — reusing the still
+   encode machinery — and muxes them via 9a. The caller dictates each frame's
+   rectangle (full-canvas or sub-rect), blend, and dispose. Carries the step-9
+   gate that `anim_dump` of the output matches this library's own
+   `decodeAnimation` composition byte-for-byte (see `PROGRESS.MD` and the
+   2026-06-23 9b oracle row).
 3. **9c (planned).** Frame optimization: sub-rectangle detection, inter-frame
    differencing, blend/dispose strategy, and keyframe insertion (libwebp
    `WebPAnimEncoder`-style), preserving the 9b gate.
