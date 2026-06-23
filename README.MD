@@ -50,9 +50,15 @@ composites back through this library's `decodeAnimation` and matches libwebp's
 `anim_dump` byte-for-byte. `encodeAnimationMinimized` adds automatic frame
 optimization: it takes full-canvas frames and derives a minimal `ANMF` layout
 (sub-rectangle detection, inter-frame differencing with a blend-vs-replace
-strategy, dispose selection, and keyframe insertion) that composites back to
-exactly the input canvases — byte-exact for lossless input — tracking the
-decoder's reconstructed canvas so lossy error never accumulates. The still pixel
+strategy, dispose selection, and keyframe insertion) that composites back to the
+input canvases — byte-exact for lossless input, and within the codec's tolerance
+for lossy — tracking the decoder's reconstructed canvas so lossy error never
+accumulates. **Lossy frames are inter-frame optimized too:** the change rect is
+detected against a source-quality carryover canvas with a quality-derived
+content-change tolerance (`AnimationMinimizeOptions.tolerance`), so lossy
+animations shrink to sub-rects instead of full-canvas keyframes (≈48% smaller
+than a naive per-frame lossy encode on a moving-region sample, within ~0.1 dB of
+its luma PSNR). The still pixel
 encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). The only open
 step-9 item is the manual ≥2-browser render confirmation (two sample animations
 under `testdata/animation/`). The installed `zig-webp-encode` tool re-encodes a still WebP as

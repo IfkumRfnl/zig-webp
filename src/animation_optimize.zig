@@ -32,6 +32,22 @@
 //! diffs against the *source* canvas — it tracks the decoder's *reconstructed*
 //! canvas (re-decoding each frame it encodes and compositing with the exact
 //! `animation_decode` rules), so lossy reconstruction error never accumulates.
+//!
+//! **Lossy frames (slice 9c-2):** a lossy frame is never byte-exact, so an exact
+//! diff against the reconstructed previous canvas would flag almost every pixel
+//! as "changed" (VP8 noise differs everywhere) and the rect would be the whole
+//! canvas every frame — that is why 9c punted on lossy shrink. 9c-2 fixes it by
+//! diffing with a *content-change tolerance* `T` instead of exact equality: a
+//! pixel counts as unchanged when its alpha matches and every RGB channel
+//! differs by at most `T` (weighted by destination alpha, mirroring libwebp's
+//! `PixelsAreSimilar`). Pixels within tolerance are inherited from the previous
+//! decoded frame — visually close, not exact. `T` defaults to a quality-derived
+//! value (`qualityToMaxDiff`, libwebp's `QualityToMaxDiff`); a caller may
+//! override it via `Options.tolerance`. Lossless frames always use `T = 0`
+//! (exact), so the lossless byte-exact gate is unchanged. The blend/transparent
+//! path still uses exact equality even for lossy (only the rect *detection* uses
+//! tolerance), and bounded drift from inherited regions is capped by the
+//! existing `keyframe_interval`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -89,6 +105,15 @@ pub const Options = struct {
     /// `[1, keyframe_interval_max]`). A keyframe is also forced whenever a frame
     /// changes the whole canvas. Bounds how far decode must walk back to seek.
     keyframe_interval: u32 = 16,
+    /// Per-channel content-change tolerance for `.lossy` frames (0..255). A
+    /// pixel counts as unchanged when its alpha matches the previous canvas and
+    /// every RGB channel differs by at most this many levels (alpha-weighted),
+    /// so a smaller diff rectangle is detected and inherited regions are reused.
+    /// `null` (the default) derives it from `quality` via `qualityToMaxDiff`
+    /// (libwebp's `QualityToMaxDiff`: ~5 at q=75, 1 at q=100, 31 at q=0); set it
+    /// explicitly to trade size against drift. Lossless frames always use 0
+    /// (exact), so this knob never affects the byte-exact lossless path.
+    tolerance: ?u8 = null,
 };
 
 /// Upper bound on `keyframe_interval`, so a hostile option cannot defer
@@ -99,11 +124,13 @@ const channels = 4;
 
 /// Encodes a sequence of full-canvas frames into a minimized animated WebP: the
 /// optimizer derives sub-rectangles, blend/dispose methods, and keyframes that
-/// composite back to exactly the input canvases, then reuses the slice-9b
-/// per-frame encoder and `mux.encodeAnimation`. The output round-trips through
+/// composite back to the input canvases, then reuses the slice-9b per-frame
+/// encoder and `mux.encodeAnimation`. The output round-trips through
 /// `decodeAnimation` (byte-exact for all-lossless input, after transparent-RGB
 /// canonicalization: fully-transparent pixels are normalized to `0,0,0,0` to
-/// match libwebp `anim_dump`, so RGB hidden behind alpha=0 is not preserved) and
+/// match libwebp `anim_dump`, so RGB hidden behind alpha=0 is not preserved;
+/// within the codec's tolerance for lossy frames, which also shrink — see
+/// `Options.tolerance`) and
 /// is accepted by `webpinfo`/`webpmux`/`anim_dump`.
 ///
 /// Returns caller-owned bytes (free with `gpa`).
@@ -191,10 +218,11 @@ const Rect = struct {
 };
 
 /// Carries the optimizer's running state across frames: the decoder's
-/// reconstructed canvas (`prev_canvas`), the previous frame's rectangle and
-/// keyframe status (mirroring `animation_decode.Decoder.PrevFrame`, needed to
-/// reproduce the "skip blending inside the previous background-disposed rect"
-/// rule and keyframe detection), and the keyframe counter.
+/// reconstructed canvas (`prev_canvas`), a *source-quality* carryover canvas
+/// (`carryover`), the previous frame's rectangle and keyframe status (mirroring
+/// `animation_decode.Decoder.PrevFrame`, needed to reproduce the "skip blending
+/// inside the previous background-disposed rect" rule and keyframe detection),
+/// and the keyframe counter.
 const Optimizer = struct {
     gpa: std.mem.Allocator,
     canvas: image.Dimensions,
@@ -203,8 +231,18 @@ const Optimizer = struct {
 
     /// What the decoder holds *before* the next frame (i.e. after the previous
     /// frame was composited and its dispose applied). Packed RGBA, canvas-sized,
-    /// with fully-transparent pixels' RGB zeroed (matching the decoder).
+    /// with fully-transparent pixels' RGB zeroed (matching the decoder). Used for
+    /// the blend-exactness check and the reconstructed-canvas correctness model.
     prev_canvas: []u8,
+    /// The change-rect reference canvas: the *original source* pixels carried
+    /// over frame to frame — the rect region updated to each emitted frame's
+    /// source, inherited regions keeping the earlier source, dispose clears
+    /// applied. The diff is `carryover` vs the current source `target`, so VP8
+    /// reconstruction noise never inflates the rect (it lives only in
+    /// `prev_canvas`). For lossless frames `carryover == prev_canvas` exactly
+    /// (the source round-trips bit-for-bit), so the byte-exact gate is unchanged.
+    /// Mirrors libwebp's `canvas_carryover`.
+    carryover: []u8,
     /// Canvas-sized scratch reused to gather each frame's desired RGBA canvas.
     target: []u8,
 
@@ -229,9 +267,10 @@ const Optimizer = struct {
         if (row_bytes > std.math.maxInt(u32)) return error.OutputTooLarge;
         const canvas_bytes = pixel_count * channels;
 
-        // Two canvas-sized scratch buffers; bound against the budget up front
+        // Three canvas-sized scratch buffers; bound against the budget up front
         // (the per-frame encoder charges its own scratch separately).
         var budget: u64 = 0;
+        budget = try addBytes(budget, canvas_bytes);
         budget = try addBytes(budget, canvas_bytes);
         budget = try addBytes(budget, canvas_bytes);
         try encode_options.limits.validateAllocationBytes(budget);
@@ -239,6 +278,10 @@ const Optimizer = struct {
         const prev_canvas = try gpa.alloc(u8, @intCast(canvas_bytes));
         errdefer gpa.free(prev_canvas);
         @memset(prev_canvas, 0);
+
+        const carryover = try gpa.alloc(u8, @intCast(canvas_bytes));
+        errdefer gpa.free(carryover);
+        @memset(carryover, 0);
 
         const target = try gpa.alloc(u8, @intCast(canvas_bytes));
         errdefer gpa.free(target);
@@ -249,6 +292,7 @@ const Optimizer = struct {
             .encode_options = encode_options,
             .stride = @intCast(row_bytes),
             .prev_canvas = prev_canvas,
+            .carryover = carryover,
             .target = target,
             .prev = null,
             .frames_since_keyframe = 0,
@@ -257,15 +301,16 @@ const Optimizer = struct {
 
     fn deinit(self: *Optimizer) void {
         self.gpa.free(self.prev_canvas);
+        self.gpa.free(self.carryover);
         self.gpa.free(self.target);
         self.* = undefined;
     }
 
     /// Derives the rectangle, blend, and dispose for one frame, encodes it via
-    /// the slice-9b per-frame encoder, then updates `prev_canvas` to exactly
-    /// what the decoder will hold after this frame (re-decoding the bitstream
-    /// and compositing with the `animation_decode` rules). `next`, if present,
-    /// is the following input frame (used only for the dispose lookahead).
+    /// the slice-9b per-frame encoder, then updates `prev_canvas` (the decoder's
+    /// reconstruction) and `carryover` (the source-quality reference) for the
+    /// next frame. `next`, if present, is the following input frame (used only
+    /// for the dispose lookahead).
     fn encodeNext(
         self: *Optimizer,
         input: FrameInput,
@@ -276,7 +321,15 @@ const Optimizer = struct {
         gatherCanvasRgba(input.buffer, self.target, self.stride);
         const target = self.target;
 
-        const diff = self.changeRect(self.prev_canvas, target);
+        // The content-change tolerance is 0 (exact) for lossless frames and the
+        // configured / quality-derived value for lossy frames. It drives the
+        // sub-rect detection and dispose lookahead. The diff is against the
+        // *source-quality* carryover, not the reconstructed canvas, so VP8 noise
+        // never inflates the rect.
+        const tolerance = self.toleranceFor(input.format);
+        const lossy = input.format == .lossy;
+
+        const diff = self.changeRect(self.carryover, target, tolerance);
         const interval = std.math.clamp(self.encode_options.keyframe_interval, 1, keyframe_interval_max);
         const force_interval = self.frames_since_keyframe + 1 >= interval;
         const full_change = !diff.isEmpty() and diff.isFullCanvas(self.canvas);
@@ -293,7 +346,7 @@ const Optimizer = struct {
 
         if (is_keyframe) {
             // Full-canvas verbatim replace: the decoder clears then copies, so
-            // the reconstruction equals `target` exactly.
+            // the reconstruction equals `target` (within the codec's tolerance).
             rect = .{ .x = 0, .y = 0, .width = self.canvas.width, .height = self.canvas.height };
             blend = .replace;
         } else if (diff.isEmpty()) {
@@ -308,15 +361,18 @@ const Optimizer = struct {
             frame_format = .lossless;
         } else {
             // A sub-rectangle frame. Snap to even offsets (the container stores
-            // them in 2-pixel units), then decide blend vs replace.
+            // them in 2-pixel units), then decide blend vs replace. The
+            // blend/transparent path is restricted to lossless: it relies on
+            // equal-to-prev pixels reconstructing exactly, which a lossy frame
+            // cannot guarantee, so lossy sub-rects are always verbatim replace.
             rect = snapToEvenOffsets(diff, self.canvas);
-            if (self.blendCandidateExact(target, rect)) {
+            if (!lossy and self.blendCandidateExact(target, rect)) {
                 blend = .alpha_blend;
                 make_transparent = true;
             } else {
                 blend = .replace;
             }
-            dispose = self.chooseDispose(next, rect);
+            dispose = self.chooseDispose(next, rect, tolerance);
         }
 
         // Build the cropped sub-frame the per-frame encoder will compress.
@@ -370,10 +426,23 @@ const Optimizer = struct {
         };
     }
 
+    /// The content-change tolerance for a frame of the given codec: 0 (exact)
+    /// for lossless, and the configured / quality-derived value for lossy. A
+    /// lossless frame must round-trip byte-exactly, so it can never tolerate a
+    /// nonzero diff; only lossy frames inherit near-equal pixels.
+    fn toleranceFor(self: *const Optimizer, format: features.FormatKind) u8 {
+        return switch (format) {
+            .lossless => 0,
+            .lossy => self.encode_options.tolerance orelse
+                qualityToMaxDiff(self.encode_options.quality),
+        };
+    }
+
     /// Re-decodes `frame_image`'s bitstream and composites it into `prev_canvas`
-    /// using the exact `animation_decode` rules, then applies this frame's
-    /// dispose — leaving `prev_canvas` equal to what the decoder holds before
-    /// the next frame.
+    /// (the decoder's reconstruction), and in parallel updates `carryover` (the
+    /// source-quality reference) with this frame's `target` content over the same
+    /// rect, then applies this frame's dispose to both — leaving each equal to
+    /// its respective canvas before the next frame.
     fn commit(
         self: *Optimizer,
         frame_image: mux.FrameImage,
@@ -399,12 +468,35 @@ const Optimizer = struct {
         if (is_keyframe) @memset(self.prev_canvas, 0);
         self.composite(rect, blend, is_keyframe, decoded.buffer);
 
+        // Maintain the source-quality carryover alongside the reconstruction:
+        // the rect region takes this frame's source pixels (`target`), which is
+        // the content the decoder shows there (exactly for replace/keyframe;
+        // within tolerance for a lossy rect; equal to prev for a lossless blend).
+        // Inherited regions keep their earlier source pixels untouched.
+        self.copyTargetIntoCarryover(rect);
+
         // The previous frame's dispose was applied at its own commit (mirroring
         // the decoder applying it before this frame). Apply this dispose now,
         // for the next frame.
-        if (dispose == .background) self.clearRect(rect);
+        if (dispose == .background) {
+            self.clearRect(self.prev_canvas, rect);
+            self.clearRect(self.carryover, rect);
+        }
 
         self.prev = .{ .rect = rect.frameRect(), .dispose = dispose, .was_keyframe = is_keyframe };
+    }
+
+    /// Copies the current frame's source `target` pixels into `carryover` over
+    /// `rect`, so the carryover reflects the content this frame established (in
+    /// source quality) for the next frame's change-rect comparison.
+    fn copyTargetIntoCarryover(self: *Optimizer, rect: Rect) void {
+        const row_span = @as(usize, rect.width) * channels;
+        var y: u32 = 0;
+        while (y < rect.height) : (y += 1) {
+            const canvas_y = rect.y + y;
+            const off = @as(usize, canvas_y) * self.stride + @as(usize, rect.x) * channels;
+            @memcpy(self.carryover[off..][0..row_span], self.target[off..][0..row_span]);
+        }
     }
 
     /// Composites a decoded sub-frame onto `prev_canvas`, bit-for-bit matching
@@ -441,21 +533,25 @@ const Optimizer = struct {
         }
     }
 
-    fn clearRect(self: *Optimizer, rect: Rect) void {
+    /// Clears `rect` of `canvas` to fully-transparent (RGBA zero), modeling
+    /// dispose-to-background. Applied to both `prev_canvas` and `carryover`.
+    fn clearRect(self: *Optimizer, canvas: []u8, rect: Rect) void {
         const row_span = @as(usize, rect.width) * channels;
         var y: u32 = 0;
         while (y < rect.height) : (y += 1) {
             const canvas_y = rect.y + y;
-            const row = self.prev_canvas[@as(usize, canvas_y) * self.stride ..];
+            const row = canvas[@as(usize, canvas_y) * self.stride ..];
             @memset(row[@as(usize, rect.x) * channels ..][0..row_span], 0);
         }
     }
 
-    /// Computes the minimal change rectangle between `base` (the previous
-    /// reconstructed canvas) and `target` (the desired canvas), both packed
-    /// RGBA at `self.stride`. Mirrors libwebp's `MinimizeChangeRectangle` for
-    /// lossless (exact pixel compare). Returns an empty rect if identical.
-    fn changeRect(self: *const Optimizer, base: []const u8, target: []const u8) Rect {
+    /// Computes the minimal change rectangle between `base` (the source-quality
+    /// carryover canvas) and `target` (the desired source canvas), both packed
+    /// RGBA at `self.stride`. Mirrors libwebp's `MinimizeChangeRectangle`: a
+    /// pixel counts as changed when it is not `pixelsSimilar` within `tolerance`
+    /// (0 = exact, for lossless; >0 inherits near-equal pixels, for lossy).
+    /// Returns an empty rect when no pixel changed.
+    fn changeRect(self: *const Optimizer, base: []const u8, target: []const u8, tolerance: u8) Rect {
         const w = self.canvas.width;
         const h = self.canvas.height;
 
@@ -471,7 +567,7 @@ const Optimizer = struct {
             var x: u32 = 0;
             while (x < w) : (x += 1) {
                 const off = @as(usize, x) * channels;
-                if (!std.mem.eql(u8, base_row[off..][0..4], target_row[off..][0..4])) {
+                if (!pixelsSimilar(base_row[off..][0..4], target_row[off..][0..4], tolerance)) {
                     if (x < min_x) min_x = x;
                     if (x + 1 > max_x) max_x = x + 1;
                     if (y < min_y) min_y = y;
@@ -562,23 +658,34 @@ const Optimizer = struct {
     /// canvas — so it never reads `prev_canvas` after `commit`. With dispose
     /// none the after-canvas is `target`; with dispose background it is `target`
     /// with `rect` cleared.
-    fn chooseDispose(self: *const Optimizer, next: ?FrameInput, rect: Rect) animation.DisposeMethod {
+    fn chooseDispose(
+        self: *const Optimizer,
+        next: ?FrameInput,
+        rect: Rect,
+        tolerance: u8,
+    ) animation.DisposeMethod {
         const next_input = next orelse return .none;
         const next_buffer = next_input.buffer;
-        const none_area = self.lookaheadDiffArea(self.target, next_buffer, null);
-        const bg_area = self.lookaheadDiffArea(self.target, next_buffer, rect);
+        // The next frame will detect its own rect with its own codec's
+        // tolerance; use the larger of this frame's and the next frame's so the
+        // lookahead estimate matches whichever diff that frame actually runs.
+        const next_tolerance = @max(tolerance, self.toleranceFor(next_input.format));
+        const none_area = self.lookaheadDiffArea(self.target, next_buffer, null, next_tolerance);
+        const bg_area = self.lookaheadDiffArea(self.target, next_buffer, rect, next_tolerance);
         return if (bg_area < none_area) .background else .none;
     }
 
     /// Change-rect area between the canvas-after-this-frame (`after_canvas`) and
     /// the next frame's desired canvas. `clear`, if set, treats that rectangle
     /// of the after-canvas as transparent (modeling dispose-to-background).
-    /// Returns only the area, for comparing dispose choices.
+    /// `tolerance` matches the next frame's content-change criterion. Returns
+    /// only the area, for comparing dispose choices.
     fn lookaheadDiffArea(
         self: *const Optimizer,
         after_canvas: []const u8,
         next_buffer: image.Buffer,
         clear: ?Rect,
+        tolerance: u8,
     ) u64 {
         const w = self.canvas.width;
         const h = self.canvas.height;
@@ -600,7 +707,7 @@ const Optimizer = struct {
                 gatherPixelRgba(next_buffer, x, y, &next_pixel);
                 // The next canvas is also gathered with transparent-RGB zeroing.
                 if (next_pixel[3] == 0) next_pixel = transparent;
-                if (!std.mem.eql(u8, after_pixel, next_pixel[0..4])) {
+                if (!pixelsSimilar(after_pixel, next_pixel[0..4], tolerance)) {
                     if (x < min_x) min_x = x;
                     if (x + 1 > max_x) max_x = x + 1;
                     if (y < min_y) min_y = y;
@@ -615,6 +722,36 @@ const Optimizer = struct {
 
 fn addBytes(acc: u64, add: u64) errors.Error!u64 {
     return std.math.add(u64, acc, add) catch error.AllocationLimitExceeded;
+}
+
+/// Maps a 0..100 quality to a per-channel content-change tolerance, matching
+/// libwebp's `QualityToMaxDiff` (`max_diff = 31*(1-sqrt(q/100)) + 1*sqrt(q/100)`,
+/// rounded): 31 at q=0, ~5 at q=75, 1 at q=100. A higher quality demands a
+/// tighter match before a pixel is treated as unchanged.
+pub fn qualityToMaxDiff(quality: u8) u8 {
+    const q = @as(f64, @floatFromInt(@min(quality, 100)));
+    const val = std.math.sqrt(q / 100.0);
+    const max_diff = 31.0 * (1.0 - val) + 1.0 * val;
+    return @intFromFloat(max_diff + 0.5);
+}
+
+/// True when two packed-RGBA pixels are within `tolerance` per channel. With
+/// `tolerance == 0` this is exact equality (the lossless criterion). Otherwise
+/// it mirrors libwebp's `PixelsAreSimilar`: alpha must match exactly, and each
+/// RGB channel's absolute difference, weighted by the destination alpha, must be
+/// at most `tolerance * 255` — so a fully transparent target ignores RGB and a
+/// fully opaque one requires `|diff| <= tolerance`.
+fn pixelsSimilar(a: *const [4]u8, b: *const [4]u8, tolerance: u8) bool {
+    if (tolerance == 0) return std.mem.eql(u8, a, b);
+    if (a[3] != b[3]) return false;
+    const dst_alpha: u32 = b[3];
+    const bound: u32 = @as(u32, tolerance) * 255;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const diff: u32 = @abs(@as(i32, a[i]) - @as(i32, b[i]));
+        if (diff * dst_alpha > bound) return false;
+    }
+    return true;
 }
 
 /// Snaps a change rect to even x/y offsets (the container stores offsets in
@@ -710,6 +847,7 @@ fn blendPixelNonPremult(dst: []u8, src: []const u8) void {
 const testing = std.testing;
 const animation_decode = @import("animation_decode.zig");
 const demux = @import("demux.zig");
+const metrics = @import("testing/metrics.zig");
 
 fn rgbaBuffer(pixels: []u8, width: u32, height: u32) errors.Error!image.Buffer {
     return .{
@@ -1112,4 +1250,177 @@ test "minimized encode survives allocation failure at every site" {
         .{ .buffer = try rgbaBuffer(&f1, w, h), .format = .lossy },
     };
     try testing.checkAllAllocationFailures(gpa, minimizedAllocationProbe, .{@as([]const FrameInput, &frames)});
+}
+
+test "qualityToMaxDiff matches libwebp's QualityToMaxDiff at reference points" {
+    // 31*(1-sqrt(q/100)) + 1*sqrt(q/100), rounded — libwebp's table.
+    try testing.expectEqual(@as(u8, 31), qualityToMaxDiff(0));
+    try testing.expectEqual(@as(u8, 10), qualityToMaxDiff(50));
+    try testing.expectEqual(@as(u8, 5), qualityToMaxDiff(75));
+    try testing.expectEqual(@as(u8, 4), qualityToMaxDiff(80));
+    try testing.expectEqual(@as(u8, 1), qualityToMaxDiff(100));
+}
+
+test "pixelsSimilar is exact at tolerance 0 and alpha-weighted above it" {
+    const a = [_]u8{ 100, 100, 100, 255 };
+    const b = [_]u8{ 103, 100, 100, 255 }; // R off by 3
+    // Exact compare: a difference of 3 is "changed".
+    try testing.expect(!pixelsSimilar(&a, &b, 0));
+    // Tolerance 5 on a fully-opaque pixel admits |diff| <= 5.
+    try testing.expect(pixelsSimilar(&a, &b, 5));
+    try testing.expect(!pixelsSimilar(&a, &.{ 110, 100, 100, 255 }, 5)); // off by 10
+    // Alpha must match exactly even within tolerance.
+    try testing.expect(!pixelsSimilar(&a, &.{ 100, 100, 100, 254 }, 5));
+    // A fully-transparent destination ignores RGB (dst_alpha == 0).
+    try testing.expect(pixelsSimilar(&.{ 9, 9, 9, 0 }, &.{ 250, 250, 250, 0 }, 1));
+}
+
+/// Builds a `frame_count`-frame moving-region animation: a fixed textured
+/// background with an opaque square that slides diagonally across the canvas.
+/// Each frame is a freshly allocated full-canvas RGBA buffer the caller frees.
+fn buildMovingRegionFrames(
+    gpa: std.mem.Allocator,
+    w: u32,
+    h: u32,
+    frame_count: u32,
+    square: u32,
+) ![]const []u8 {
+    const buffers = try gpa.alloc([]u8, frame_count);
+    var built: usize = 0;
+    errdefer {
+        for (buffers[0..built]) |b| gpa.free(b);
+        gpa.free(buffers);
+    }
+    var i: u32 = 0;
+    while (i < frame_count) : (i += 1) {
+        const buf = try gpa.alloc(u8, @as(usize, w) * h * 4);
+        built += 1;
+        // Smoothly varying textured background (good lossy target).
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
+                const base = (@as(usize, y) * w + x) * 4;
+                buf[base + 0] = @intCast((x * 4 + y * 2) % 256);
+                buf[base + 1] = @intCast((y * 4 + x) % 256);
+                buf[base + 2] = @intCast((x * 2 + y * 3 + 40) % 256);
+                buf[base + 3] = 255;
+            }
+        }
+        // The moving opaque square (even offsets so the rect needs no snapping).
+        const sx = (i * 2) % (w - square);
+        const sy = (i * 2) % (h - square);
+        paintSquare(buf, w, sx & ~@as(u32, 1), sy & ~@as(u32, 1), square, square, .{ 240, 30, 30, 255 });
+        buffers[i] = buf;
+    }
+    return buffers;
+}
+
+fn freeFrameBuffers(gpa: std.mem.Allocator, buffers: []const []u8) void {
+    for (buffers) |b| gpa.free(b);
+    gpa.free(@constCast(buffers));
+}
+
+test "a lossy moving-region animation shrinks at least one ANMF rect and decodes valid" {
+    const gpa = testing.allocator;
+    const w = 64;
+    const h = 48;
+    const frame_count = 5;
+
+    const buffers = try buildMovingRegionFrames(gpa, w, h, frame_count, 16);
+    defer freeFrameBuffers(gpa, buffers);
+
+    var frames: [frame_count]FrameInput = undefined;
+    for (buffers, 0..) |buf, idx| {
+        frames[idx] = .{ .buffer = try rgbaBuffer(buf, w, h), .duration_ms = 100, .format = .lossy };
+    }
+
+    const encoded = try encodeAnimationMinimized(gpa, &frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+        .quality = 75,
+        .keyframe_interval = 16,
+    });
+    defer gpa.free(encoded);
+
+    // Decodes without error at the canvas dimensions for every frame.
+    var animated = try animation_decode.decodeAnimationAlloc(gpa, encoded, .{});
+    defer animated.deinit();
+    try testing.expectEqual(@as(usize, frame_count), animated.frames.len);
+    for (animated.frames) |frame| {
+        try testing.expectEqual(@as(u32, w), frame.buffer.dimensions.width);
+        try testing.expectEqual(@as(u32, h), frame.buffer.dimensions.height);
+    }
+
+    // At least one ANMF rect must be smaller than the canvas — the whole point
+    // of lossy inter-frame optimization (9c emitted only full-canvas keyframes).
+    var parsed = try demux.parse(gpa, encoded, .{});
+    defer parsed.deinit();
+    var any_shrunk = false;
+    for (parsed.frames) |frame| {
+        if (frame.rect.width < w or frame.rect.height < h) any_shrunk = true;
+    }
+    try testing.expect(any_shrunk);
+}
+
+test "lossy minimized PSNR stays within tolerance of the naive full-canvas encode" {
+    const gpa = testing.allocator;
+    const w = 64;
+    const h = 48;
+    const frame_count = 6;
+
+    const buffers = try buildMovingRegionFrames(gpa, w, h, frame_count, 16);
+    defer freeFrameBuffers(gpa, buffers);
+
+    // Optimized (minimized) encode.
+    var min_frames: [frame_count]FrameInput = undefined;
+    for (buffers, 0..) |buf, idx| {
+        min_frames[idx] = .{ .buffer = try rgbaBuffer(buf, w, h), .duration_ms = 100, .format = .lossy };
+    }
+    const minimized = try encodeAnimationMinimized(gpa, &min_frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+        .quality = 75,
+    });
+    defer gpa.free(minimized);
+
+    // Naive: every frame a full-canvas lossy replace keyframe (9b API), the
+    // baseline the optimizer must not meaningfully degrade against.
+    var naive_sources: [frame_count]animation_encode.FrameSource = undefined;
+    for (buffers, 0..) |buf, idx| {
+        naive_sources[idx] = .{
+            .buffer = try rgbaBuffer(buf, w, h),
+            .duration_ms = 100,
+            .blend_method = .replace,
+            .format = .lossy,
+        };
+    }
+    const naive = try animation_encode.encodeAnimationFromBuffers(gpa, &naive_sources, .{
+        .canvas = try image.Dimensions.init(w, h),
+        .quality = 75,
+    });
+    defer gpa.free(naive);
+
+    // Mean per-frame luma PSNR of each encode vs the SOURCE frames.
+    var min_dec = try animation_decode.decodeAnimationAlloc(gpa, minimized, .{});
+    defer min_dec.deinit();
+    var naive_dec = try animation_decode.decodeAnimationAlloc(gpa, naive, .{});
+    defer naive_dec.deinit();
+    try testing.expectEqual(@as(usize, frame_count), min_dec.frames.len);
+    try testing.expectEqual(@as(usize, frame_count), naive_dec.frames.len);
+
+    var min_sum: f64 = 0;
+    var naive_sum: f64 = 0;
+    for (buffers, 0..) |src, idx| {
+        min_sum += metrics.psnrLuma(src, min_dec.frames[idx].buffer.pixels, channels);
+        naive_sum += metrics.psnrLuma(src, naive_dec.frames[idx].buffer.pixels, channels);
+    }
+    const min_mean = min_sum / @as(f64, frame_count);
+    const naive_mean = naive_sum / @as(f64, frame_count);
+
+    // Tolerance: optimized mean luma PSNR must be at most 0.5 dB below naive.
+    // Inherited (non-rect) regions carry the previous frame's lossy values
+    // rather than this frame's, so a small drop is expected and bounded.
+    try testing.expect(min_mean >= naive_mean - 0.5);
+
+    // The optimized stream must actually be smaller (the win).
+    try testing.expect(minimized.len < naive.len);
 }
