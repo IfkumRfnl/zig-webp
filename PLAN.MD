@@ -498,7 +498,7 @@ then pixels, then quality):
    does not duplicate it.
 
 **Browser-render check (step-9 completion gate):** set up, not closed. 9c
-generates two minimized sample animations under `samples/`
+generates two minimized sample animations under `testdata/animation/`
 (`anim_minimized_lossless.webp`, `anim_minimized_lossy.webp` — a textured
 background with a moving sub-region) for manual inspection. Both pass `anim_dump`
 parity and `webpinfo` cleanly. The full "renders in ≥2 major browsers" gate is

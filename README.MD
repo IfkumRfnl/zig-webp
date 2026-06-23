@@ -55,7 +55,7 @@ exactly the input canvases — byte-exact for lossless input — tracking the
 decoder's reconstructed canvas so lossy error never accumulates. The still pixel
 encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). The only open
 step-9 item is the manual ≥2-browser render confirmation (two sample animations
-under `samples/`). The installed `zig-webp-encode` tool re-encodes a still WebP as
+under `testdata/animation/`). The installed `zig-webp-encode` tool re-encodes a still WebP as
 lossy `VP8 `.
 
 ## Goals
