@@ -279,9 +279,12 @@ pub fn encodeAnimationFromBuffers(
 /// `ANMF` layout — sub-rectangles, blend/dispose methods, and keyframes — that
 /// composites back to exactly the input canvases, then reuses the per-frame
 /// encoder behind `encodeAnimationFromBuffers` and `encodeAnimation`. For
-/// all-lossless input the round-trip through `decodeAnimation` is byte-exact;
-/// lossy frames are tracked against the decoder's reconstructed canvas so error
-/// never accumulates. The output is accepted by `webpinfo`/`webpmux`/`anim_dump`.
+/// all-lossless input the round-trip through `decodeAnimation` is byte-exact
+/// after transparent-RGB canonicalization: fully-transparent pixels are
+/// normalized to `0,0,0,0` (matching libwebp `anim_dump` composition), so RGB
+/// hidden behind alpha=0 is not preserved. Lossy frames are tracked against the
+/// decoder's reconstructed canvas so error never accumulates. The output is
+/// accepted by `webpinfo`/`webpmux`/`anim_dump`.
 /// Unlike `encodeAnimationFromBuffers` (the explicit-rect API), the caller does
 /// not pick per-frame rectangles or compositing. Returns caller-owned bytes.
 pub fn encodeAnimationMinimized(

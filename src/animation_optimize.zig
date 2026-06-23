@@ -59,7 +59,10 @@ pub const FrameInput = struct {
     /// Display duration in milliseconds; stored as a 24-bit field.
     duration_ms: u32 = 0,
     /// Per-frame codec: `.lossy` or `.lossless`. Lossless input is byte-exact on
-    /// round-trip; lossy input round-trips within the codec's tolerance.
+    /// round-trip *after transparent-RGB canonicalization*: fully-transparent
+    /// pixels are normalized to `0,0,0,0` (matching libwebp `anim_dump`
+    /// composition), so RGB hidden behind alpha=0 is not preserved. Lossy input
+    /// round-trips within the codec's tolerance.
     format: features.FormatKind,
 };
 
@@ -98,8 +101,10 @@ const channels = 4;
 /// optimizer derives sub-rectangles, blend/dispose methods, and keyframes that
 /// composite back to exactly the input canvases, then reuses the slice-9b
 /// per-frame encoder and `mux.encodeAnimation`. The output round-trips through
-/// `decodeAnimation` (byte-exact for all-lossless input) and is accepted by
-/// `webpinfo`/`webpmux`/`anim_dump`.
+/// `decodeAnimation` (byte-exact for all-lossless input, after transparent-RGB
+/// canonicalization: fully-transparent pixels are normalized to `0,0,0,0` to
+/// match libwebp `anim_dump`, so RGB hidden behind alpha=0 is not preserved) and
+/// is accepted by `webpinfo`/`webpmux`/`anim_dump`.
 ///
 /// Returns caller-owned bytes (free with `gpa`).
 pub fn encodeAnimationMinimized(
@@ -281,6 +286,10 @@ const Optimizer = struct {
         var blend: animation.BlendMethod = undefined;
         var dispose: animation.DisposeMethod = .none;
         var make_transparent = false;
+        // Codec for this frame. Defaults to the caller's choice, but the
+        // unchanged-frame no-op below forces lossless so the synthetic 1x1
+        // composites back to the exact previous pixel (see that branch).
+        var frame_format = input.format;
 
         if (is_keyframe) {
             // Full-canvas verbatim replace: the decoder clears then copies, so
@@ -290,8 +299,13 @@ const Optimizer = struct {
         } else if (diff.isEmpty()) {
             // Degenerate: this frame equals the previous canvas. Emit a tiny 1x1
             // verbatim copy (a no-op the decoder composites to the same canvas).
+            // Force lossless: a `.lossy` 1x1 would quantize the pixel, so the
+            // decoder would copy a *changed* pixel onto an otherwise-unchanged
+            // canvas (one-pixel flicker that also seeds later diffs). Lossless
+            // 1x1 reproduces the exact pixel, keeping this a true no-op.
             rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
             blend = .replace;
+            frame_format = .lossless;
         } else {
             // A sub-rectangle frame. Snap to even offsets (the container stores
             // them in 2-pixel units), then decide blend vs replace.
@@ -321,7 +335,7 @@ const Optimizer = struct {
             .duration_ms = input.duration_ms,
             .blend_method = blend,
             .dispose_method = dispose,
-            .format = input.format,
+            .format = frame_format,
         };
 
         const frame_image = try animation_encode.encodeFrameForOptimizer(
@@ -812,6 +826,46 @@ test "a frame identical to the previous degenerates to a tiny rect and round-tri
 
     try expectByteExactRoundTrip(gpa, encoded, &.{ &f0, &f1 });
 
+    var parsed = try demux.parse(gpa, encoded, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.width);
+    try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.height);
+}
+
+test "an unchanged lossy frame stays a byte-exact no-op (no 1px drift)" {
+    const gpa = testing.allocator;
+    const w = 8;
+    const h = 8;
+    // Frame 0 is a lossless keyframe, so the decoder's reconstructed canvas
+    // equals the source exactly. Frame 1 is identical content but declared
+    // `.lossy`, so the optimizer's diff is empty and it emits a synthetic 1x1
+    // no-op rect. That rect MUST be forced lossless: a `.lossy` 1x1 would
+    // quantize the pixel, and the decoder would copy a *changed* pixel onto the
+    // otherwise-unchanged canvas — flickering one pixel. With the fix the 1x1 is
+    // lossless, so frame 1 decodes byte-identical to frame 0 (no drift).
+    var f0: [w * h * 4]u8 = undefined;
+    fillConstant(&f0, .{ 37, 211, 83, 255 });
+    var f1 = f0; // identical content, but encoded as `.lossy`
+
+    const frames = [_]FrameInput{
+        .{ .buffer = try rgbaBuffer(&f0, w, h), .duration_ms = 40, .format = .lossless },
+        .{ .buffer = try rgbaBuffer(&f1, w, h), .duration_ms = 40, .format = .lossy },
+    };
+    const encoded = try encodeAnimationMinimized(gpa, &frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+    });
+    defer gpa.free(encoded);
+
+    // Both decoded frames must equal the source byte-for-byte; in particular
+    // frame 1 must match frame 0 (no single-pixel quantization drift).
+    var animated = try animation_decode.decodeAnimationAlloc(gpa, encoded, .{});
+    defer animated.deinit();
+    try testing.expectEqual(@as(usize, 2), animated.frames.len);
+    try testing.expectEqualSlices(u8, &f0, animated.frames[0].buffer.pixels);
+    try testing.expectEqualSlices(u8, &f1, animated.frames[1].buffer.pixels);
+    try testing.expectEqualSlices(u8, animated.frames[0].buffer.pixels, animated.frames[1].buffer.pixels);
+
+    // The no-op frame still degenerates to a 1x1 rect.
     var parsed = try demux.parse(gpa, encoded, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.width);
