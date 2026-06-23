@@ -141,6 +141,21 @@ pub fn encodeAnimationFromBuffers(
     return file;
 }
 
+/// Encodes one derived frame for the slice-9c optimizer
+/// (`animation_optimize.encodeAnimationMinimized`). The optimizer derives each
+/// frame's rectangle, blend, and dispose; this reuses the exact same per-frame
+/// pixel→bitstream path as `encodeAnimationFromBuffers` so the two encode APIs
+/// share one codec. The returned image owns its `bitstream` (and `alpha`, when
+/// present); the caller frees them. Kept narrow on purpose — it is the only
+/// hook the optimizer needs into this module.
+pub fn encodeFrameForOptimizer(
+    gpa: std.mem.Allocator,
+    source: FrameSource,
+    encode_options: Options,
+) errors.Error!mux.FrameImage {
+    return encodeFrame(gpa, source, encode_options);
+}
+
 /// Frees the encoded bitstream and optional ALPH payload of every frame image
 /// in `frames`. Used on the error path and after a successful mux (the mux
 /// copies each payload into the output file, so the scratch is no longer
