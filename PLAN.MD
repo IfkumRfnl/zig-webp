@@ -465,7 +465,19 @@ then pixels, then quality):
 3. **9c (planned).** Frame optimization: sub-rectangle detection, inter-frame
    differencing, blend/dispose strategy, and keyframe insertion (libwebp
    `WebPAnimEncoder`-style), preserving the 9b gate.
-4. **9d (planned).** Metadata-from-pixels and chunk-order preservation for both
-   still and animation encode, plus the browser-render check. The mux layer
-   already writes `ICCP`/`EXIF`/`XMP ` in spec order; this closes the
-   pixel-encode public-API gap.
+4. **9d (delivered, still encode).** Metadata-from-pixels for **still** encode:
+   `EncoderOptions.metadata` (a `metadata.RawPayloads`) threads raw
+   `ICCP`/`EXIF`/`XMP ` into the `encodeLossless`/`encodeLossy` mux calls, so the
+   still encoders now emit an extended (`VP8X`) container with those chunks in
+   spec-canonical order (and coexisting with a lossy `ALPH`). They round-trip
+   byte-exactly through `demux`; with empty metadata the output is byte-identical
+   to the pre-9d path (asserted by test). Chunk-order honesty: the from-pixels
+   path emits spec-canonical order (there is no caller order to preserve there);
+   the `mux.encodeStaticFromDemux` remux path is what preserves unknown-chunk
+   order. Animation-level metadata is already handled by 9a's
+   `AnimationImage.metadata` (and 9b's `AnimationEncodeOptions.metadata`), so 9d
+   does not duplicate it. **Browser-render check (step-9 completion gate):** set
+   up, not closed — 9d generates metadata-bearing still samples (validated by
+   `webpinfo`, no errors) for manual inspection; the full "renders in ≥2 major
+   browsers" gate is best run once 9b/9c land real pixel animations, and is not a
+   hard gate for this slice nor wired into CI.

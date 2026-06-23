@@ -15,6 +15,7 @@ const errors = @import("errors.zig");
 const features = @import("features.zig");
 const image = @import("image.zig");
 const limits = @import("limits.zig");
+const metadata = @import("metadata.zig");
 const metrics = @import("testing/metrics.zig");
 const mux = @import("mux.zig");
 const options = @import("options.zig");
@@ -28,7 +29,11 @@ const vp8l_pixel = @import("vp8l/pixel.zig");
 /// `argb`) or `rgb` (treated as fully opaque); pixels are read row-major using
 /// the buffer's `stride`. The returned bytes are caller-owned (free with `gpa`).
 ///
-/// `encode_options.format` must be `.lossless`; lossy encode is a later step.
+/// When `encode_options.metadata` carries any raw ICCP/EXIF/XMP payload, the
+/// file is emitted as an extended (`VP8X`) container with those chunks written
+/// verbatim in spec-canonical order (`VP8X` → `ICCP` → `VP8L` → `EXIF` →
+/// `XMP `); with no metadata the output is the canonical simple `VP8L` file,
+/// byte-for-byte as before. `encode_options.format` must be `.lossless`.
 pub fn encodeStaticLossless(
     gpa: std.mem.Allocator,
     buffer: image.Buffer,
@@ -52,6 +57,7 @@ pub fn encodeStaticLossless(
         .canvas = dimensions,
         .format = .lossless,
         .bitstream = bitstream,
+        .metadata = encode_options.metadata,
     }, .{ .limits = encode_options.limits });
 }
 
@@ -87,8 +93,17 @@ pub fn encodeStaticLossless(
 ///
 /// `encode_options.alpha_quality` (0..100) selects the alpha compression effort
 /// (0 = uncompressed ALPH, 1..100 = lossless VP8L, smaller kept). Alpha is
-/// always lossless. `encode_options.format` must be `.lossy`. The returned bytes
-/// are caller-owned (free with `gpa`).
+/// always lossless.
+///
+/// When `encode_options.metadata` carries any raw ICCP/EXIF/XMP payload, the
+/// file is emitted as an extended (`VP8X`) container with those chunks written
+/// verbatim in spec-canonical order (`VP8X` → `ICCP` → `ALPH` → `VP8 ` → `EXIF`
+/// → `XMP `); metadata and a lossy `ALPH` chunk coexist without conflict. With
+/// no metadata and no alpha the output is the plain `VP8 ` file, byte-for-byte
+/// as before. The same metadata is attached to every probe of the
+/// target-size/PSNR searches, so the search compares like-for-like file sizes.
+/// `encode_options.format` must be `.lossy`. The returned bytes are caller-owned
+/// (free with `gpa`).
 pub fn encodeStaticLossy(
     gpa: std.mem.Allocator,
     buffer: image.Buffer,
@@ -268,15 +283,21 @@ fn encodeLossyPass(
 
     // The reconstruction-RGB scratch the PSNR measurement allocates is live
     // alongside the mux peak, so reserve it too when this pass measures PSNR.
-    // The borrowed alpha payload is also live across the mux, so charge it.
+    // The borrowed alpha payload and metadata payloads are also live across the
+    // mux, so charge them.
     const psnr_scratch_bytes: u64 = if (source_rgb != null) pixel_count * 3 else 0;
     const alpha_bytes: u64 = if (alpha_payload) |payload| payload.len else 0;
+    const metadata_bytes: u64 = metadataByteCount(encode_options.metadata);
+    const side_bytes = try addByteCounts(
+        psnr_scratch_bytes,
+        try addByteCounts(alpha_bytes, metadata_bytes),
+    );
     try validateLossyMuxAllocationBudget(
         dimensions,
         pixel_count,
         result.bitstream.len,
         encode_options.limits,
-        try addByteCounts(extra_reserved_bytes, try addByteCounts(psnr_scratch_bytes, alpha_bytes)),
+        try addByteCounts(extra_reserved_bytes, side_bytes),
     );
 
     const luma_psnr = if (source_rgb) |rgb|
@@ -290,6 +311,7 @@ fn encodeLossyPass(
         .bitstream = result.bitstream,
         .alpha = alpha_payload,
         .has_alpha = has_alpha,
+        .metadata = encode_options.metadata,
     }, .{ .limits = encode_options.limits });
 
     return .{ .file = file, .luma_psnr = luma_psnr, .base_quant_index = base_quant_index };
@@ -640,6 +662,19 @@ fn elementByteCount(comptime T: type, count: u64) errors.Error!u64 {
 
 fn addByteCounts(a: u64, b: u64) errors.Error!u64 {
     return std.math.add(u64, a, b) catch error.AllocationLimitExceeded;
+}
+
+/// Combined length of the present ICCP/EXIF/XMP payloads. These slices are
+/// borrowed by the mux and stay live across the mux peak, so the lossy pass
+/// charges them against the allocation budget alongside the alpha payload. The
+/// mux's own `validateAllocationBytes(file_size)` remains the authoritative
+/// gate; this just keeps the pre-check honest.
+fn metadataByteCount(raw_metadata: metadata.RawPayloads) u64 {
+    var bytes: u64 = 0;
+    if (raw_metadata.color_profile) |payload| bytes += payload.len;
+    if (raw_metadata.exif) |payload| bytes += payload.len;
+    if (raw_metadata.xmp) |payload| bytes += payload.len;
+    return bytes;
 }
 
 /// Reads the caller buffer's pixels (any supported format, honoring stride)
@@ -1325,4 +1360,216 @@ test "lossy target-mode searches survive allocation failure at every site" {
 
     try testing.checkAllAllocationFailures(testing.allocator, encodeTargetSizeAllocationProbe, .{buffer});
     try testing.checkAllAllocationFailures(testing.allocator, encodeTargetPsnrAllocationProbe, .{buffer});
+}
+
+// --- Still-encode metadata (step 9d) ----------------------------------------
+
+const md_iccp = "icc-profile-bytes";
+const md_exif = "EXIF\x00\x00ranged-exif-payload";
+const md_xmp = "<x:xmpmeta>some xmp</x:xmpmeta>";
+
+/// Asserts `encoded` is a valid extended (VP8X) container whose top-level chunks
+/// appear in exactly `expected_tags` order, and that demux recovers the supplied
+/// ICCP/EXIF/XMP payloads byte-for-byte. Shared by the lossless/lossy metadata
+/// round-trip tests so the chunk-order check lives in one place.
+fn expectMetadataRoundTrip(
+    encoded: []const u8,
+    expected_tags: []const []const u8,
+) !void {
+    var parsed = try demux.parse(testing.allocator, encoded, .{});
+    defer parsed.deinit();
+
+    // Metadata forces the extended container.
+    try testing.expectEqual(features.FileKind.extended, parsed.features.file_kind);
+
+    // Top-level chunks must be in spec-canonical order.
+    try testing.expectEqual(expected_tags.len, parsed.chunks.len);
+    for (parsed.chunks, expected_tags) |chunk, tag| {
+        try testing.expect(chunk.tag.eql(tag));
+    }
+
+    // Each payload round-trips byte-exactly.
+    const payloads = parsed.metadataPayloads(encoded);
+    try testing.expectEqualSlices(u8, md_iccp, payloads.color_profile.?);
+    try testing.expectEqualSlices(u8, md_exif, payloads.exif.?);
+    try testing.expectEqualSlices(u8, md_xmp, payloads.xmp.?);
+}
+
+test "encodeStaticLossless attaches ICCP/EXIF/XMP in spec order and round-trips" {
+    const decode = @import("decode.zig");
+
+    const width = 6;
+    const height = 5;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const base = (y * width + x) * 4;
+            pixels[base + 0] = @intCast((x * 40) % 256);
+            pixels[base + 1] = @intCast((y * 50) % 256);
+            pixels[base + 2] = @intCast(((x + y) * 9) % 256);
+            pixels[base + 3] = 255;
+        }
+    }
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{
+        .metadata = .{ .color_profile = md_iccp, .exif = md_exif, .xmp = md_xmp },
+    });
+    defer testing.allocator.free(encoded);
+
+    // VP8X -> ICCP -> VP8L -> EXIF -> XMP (no ALPH: opaque lossless).
+    try expectMetadataRoundTrip(encoded, &.{ "VP8X", "ICCP", "VP8L", "EXIF", "XMP " });
+
+    // The pixels still decode losslessly with the metadata attached.
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .rgba });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
+test "encodeStaticLossy attaches ICCP/EXIF/XMP in spec order and round-trips" {
+    const width = 18;
+    const height = 10;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const base = (y * width + x) * 4;
+            pixels[base + 0] = @intCast((x * 14) % 256);
+            pixels[base + 1] = @intCast((y * 25) % 256);
+            pixels[base + 2] = @intCast(((x + y) * 8) % 256);
+            pixels[base + 3] = 255; // opaque: no ALPH chunk
+        }
+    }
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    const encoded = try encodeStaticLossy(testing.allocator, buffer, .{
+        .format = .lossy,
+        .metadata = .{ .color_profile = md_iccp, .exif = md_exif, .xmp = md_xmp },
+    });
+    defer testing.allocator.free(encoded);
+
+    // VP8X -> ICCP -> VP8 -> EXIF -> XMP (no ALPH: opaque lossy).
+    try expectMetadataRoundTrip(encoded, &.{ "VP8X", "ICCP", "VP8 ", "EXIF", "XMP " });
+}
+
+test "encodeStaticLossy attaches metadata alongside an ALPH chunk in spec order" {
+    const decode = @import("decode.zig");
+
+    // An alpha source: ALPH and metadata must coexist, ALPH before VP8 and the
+    // metadata chunks in their canonical slots around the image data.
+    const source = synth.Source{
+        .name = "alpha_gradient_40x24_rgba",
+        .width = 40,
+        .height = 24,
+        .format = .rgba,
+        .content = .alpha_gradient,
+    };
+    const rendered = try synth.render(testing.allocator, source);
+    defer rendered.deinit();
+
+    const encoded = try encodeStaticLossy(testing.allocator, rendered.buffer, .{
+        .format = .lossy,
+        .metadata = .{ .color_profile = md_iccp, .exif = md_exif, .xmp = md_xmp },
+    });
+    defer testing.allocator.free(encoded);
+
+    // VP8X -> ICCP -> ALPH -> VP8 -> EXIF -> XMP.
+    try expectMetadataRoundTrip(encoded, &.{ "VP8X", "ICCP", "ALPH", "VP8 ", "EXIF", "XMP " });
+
+    // The alpha plane must still round-trip exactly (lossy alpha is lossless).
+    var parsed = try demux.parse(testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.features.has_alpha);
+
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .rgba });
+    defer decoded.deinit();
+    const out_stride: usize = decoded.buffer.stride;
+    for (0..source.height) |y| {
+        for (0..source.width) |x| {
+            const src_alpha = rendered.pixels[(y * source.width + x) * 4 + 3];
+            const out_alpha = decoded.buffer.pixels[y * out_stride + x * 4 + 3];
+            try testing.expectEqual(src_alpha, out_alpha);
+        }
+    }
+}
+
+test "encodeStaticLossless default path stays byte-identical to a direct mux" {
+    const width = 6;
+    const height = 5;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @intCast(i % 256);
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    // Empty metadata (the default) must reproduce exactly what a direct simple
+    // VP8L mux produces — i.e. adding the metadata field changed nothing on the
+    // no-metadata path.
+    const with_default = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(with_default);
+
+    const argb = try gatherArgbAlloc(testing.allocator, buffer);
+    defer testing.allocator.free(argb);
+    const bitstream = try vp8l_encoder.encodeAlloc(testing.allocator, dims, argb);
+    defer testing.allocator.free(bitstream);
+    const reference = try mux.encodeStatic(testing.allocator, .{
+        .canvas = dims,
+        .format = .lossless,
+        .bitstream = bitstream,
+    }, .{});
+    defer testing.allocator.free(reference);
+
+    try testing.expectEqualSlices(u8, reference, with_default);
+
+    // And it is still a plain simple VP8L file.
+    var parsed = try demux.parse(testing.allocator, with_default, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(features.FileKind.simple, parsed.features.file_kind);
+}
+
+fn encodeLosslessMetadataProbe(gpa: std.mem.Allocator, buffer: image.Buffer) !void {
+    const encoded = try encodeStaticLossless(gpa, buffer, .{
+        .metadata = .{ .color_profile = md_iccp, .exif = md_exif, .xmp = md_xmp },
+    });
+    gpa.free(encoded);
+}
+
+fn encodeLossyMetadataProbe(gpa: std.mem.Allocator, buffer: image.Buffer) !void {
+    const encoded = try encodeStaticLossy(gpa, buffer, .{
+        .format = .lossy,
+        .metadata = .{ .color_profile = md_iccp, .exif = md_exif, .xmp = md_xmp },
+    });
+    gpa.free(encoded);
+}
+
+test "metadata still encode survives allocation failure at every site" {
+    const width = 17; // partial macroblock + alpha cycling via `i % 256`
+    const height = 9;
+    const dims = try image.Dimensions.init(width, height);
+    var pixels: [width * height * 4]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @intCast(i % 256);
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    try testing.checkAllAllocationFailures(testing.allocator, encodeLosslessMetadataProbe, .{buffer});
+    try testing.checkAllAllocationFailures(testing.allocator, encodeLossyMetadataProbe, .{buffer});
 }
