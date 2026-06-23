@@ -27,8 +27,12 @@ jobs:
       - name: Zig version
         run: zig version
 
+      # Advisory only: zig fmt's rules drift between releases, so code
+      # formatted for 0.16.0 is routinely flagged by master's formatter.
+      # That drift is expected and not a defect, so emit a warning instead
+      # of failing the step (the gating fmt check lives in ci.yml on 0.16.0).
       - name: Check formatting
-        run: zig fmt --check .
+        run: zig fmt --check . || echo "::warning::master formatter differs from 0.16.0 (expected drift)"
 
       - name: Run tests
         run: zig build test
