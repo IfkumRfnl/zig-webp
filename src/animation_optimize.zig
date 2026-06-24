@@ -28,26 +28,38 @@
 //!
 //! THE correctness invariant: the optimized output, decoded via
 //! `animation_decode.decodeAnimationAlloc`, reproduces the input canvases. For
-//! all-lossless input this is byte-exact (the CI gate). The optimizer never
-//! diffs against the *source* canvas — it tracks the decoder's *reconstructed*
-//! canvas (re-decoding each frame it encodes and compositing with the exact
-//! `animation_decode` rules), so lossy reconstruction error never accumulates.
+//! all-lossless input this is byte-exact (the CI gate). The optimizer always
+//! tracks the decoder's *reconstructed* canvas (`prev_canvas`, re-decoding each
+//! frame it encodes and compositing with the exact `animation_decode` rules), so
+//! lossy reconstruction error never accumulates and every frame composites onto
+//! exactly what the decoder holds.
 //!
-//! **Lossy frames (slice 9c-2):** a lossy frame is never byte-exact, so an exact
-//! diff against the reconstructed previous canvas would flag almost every pixel
-//! as "changed" (VP8 noise differs everywhere) and the rect would be the whole
-//! canvas every frame — that is why 9c punted on lossy shrink. 9c-2 fixes it by
-//! diffing with a *content-change tolerance* `T` instead of exact equality: a
-//! pixel counts as unchanged when its alpha matches and every RGB channel
-//! differs by at most `T` (weighted by destination alpha, mirroring libwebp's
-//! `PixelsAreSimilar`). Pixels within tolerance are inherited from the previous
-//! decoded frame — visually close, not exact. `T` defaults to a quality-derived
-//! value (`qualityToMaxDiff`, libwebp's `QualityToMaxDiff`); a caller may
-//! override it via `Options.tolerance`. Lossless frames always use `T = 0`
-//! (exact), so the lossless byte-exact gate is unchanged. The blend/transparent
-//! path still uses exact equality even for lossy (only the rect *detection* uses
-//! tolerance), and bounded drift from inherited regions is capped by the
-//! existing `keyframe_interval`.
+//! **Lossy frames (slice 9c-2):** a lossy frame is never byte-exact, so diffing
+//! it against the reconstructed previous canvas would flag almost every pixel as
+//! "changed" (VP8 noise differs everywhere) and the rect would be the whole
+//! canvas every frame — that is why 9c punted on lossy shrink. 9c-2 fixes it with
+//! two coordinated mechanisms:
+//!  - A *source-quality* carryover canvas: a **lossy** frame detects its rect by
+//!    diffing the carryover (original source pixels) against the current source,
+//!    so VP8 noise never inflates it. A **lossless** frame must reproduce its
+//!    source exactly, so it diffs against `prev_canvas` (the reconstruction the
+//!    decoder holds) and re-emits any pixel where a prior lossy frame's artifacts
+//!    drifted from the lossless source. For all-lossless input the two references
+//!    coincide, so the byte-exact gate is unchanged.
+//!  - A *content-change tolerance* `T` for the lossy diff: a pixel counts as
+//!    unchanged when its alpha matches and every RGB channel differs by at most
+//!    `T` (weighted by destination alpha, mirroring libwebp's `PixelsAreSimilar`).
+//!    Pixels within tolerance are inherited from the previous decoded frame —
+//!    visually close, not exact. `T` defaults to a quality-derived value
+//!    (`qualityToMaxDiff`, libwebp's `QualityToMaxDiff`); a caller may override it
+//!    via `Options.tolerance`. Lossless frames always use `T = 0` (exact).
+//!
+//! The blend/transparent path still uses exact equality even for lossy (only the
+//! rect *detection* uses tolerance). A frame that matches the previous canvas
+//! (exactly, or within tolerance for lossy) emits a synthetic 1x1 no-op that
+//! copies the held pixel from `prev_canvas` — a true canvas-preserving no-op, not
+//! a near-equal `target` pixel that would flicker at (0,0). Bounded drift from
+//! inherited regions is capped by the existing `keyframe_interval`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -234,14 +246,17 @@ const Optimizer = struct {
     /// with fully-transparent pixels' RGB zeroed (matching the decoder). Used for
     /// the blend-exactness check and the reconstructed-canvas correctness model.
     prev_canvas: []u8,
-    /// The change-rect reference canvas: the *original source* pixels carried
-    /// over frame to frame — the rect region updated to each emitted frame's
-    /// source, inherited regions keeping the earlier source, dispose clears
-    /// applied. The diff is `carryover` vs the current source `target`, so VP8
-    /// reconstruction noise never inflates the rect (it lives only in
-    /// `prev_canvas`). For lossless frames `carryover == prev_canvas` exactly
-    /// (the source round-trips bit-for-bit), so the byte-exact gate is unchanged.
-    /// Mirrors libwebp's `canvas_carryover`.
+    /// The lossy change-rect reference canvas: the *original source* pixels
+    /// carried over frame to frame — the rect region updated to each emitted
+    /// frame's source, inherited regions keeping the earlier source, dispose
+    /// clears applied. A *lossy* frame diffs `carryover` vs the current source
+    /// `target`, so VP8 reconstruction noise (which lives only in `prev_canvas`)
+    /// never inflates the rect. A *lossless* frame instead diffs against
+    /// `prev_canvas`, so it re-emits every pixel where the reconstruction drifted
+    /// from its exact source. For all-lossless input `carryover == prev_canvas`
+    /// exactly (the source round-trips bit-for-bit), so the two references
+    /// coincide and the byte-exact gate is unchanged. Mirrors libwebp's
+    /// `canvas_carryover`.
     carryover: []u8,
     /// Canvas-sized scratch reused to gather each frame's desired RGBA canvas.
     target: []u8,
@@ -323,13 +338,25 @@ const Optimizer = struct {
 
         // The content-change tolerance is 0 (exact) for lossless frames and the
         // configured / quality-derived value for lossy frames. It drives the
-        // sub-rect detection and dispose lookahead. The diff is against the
-        // *source-quality* carryover, not the reconstructed canvas, so VP8 noise
-        // never inflates the rect.
+        // sub-rect detection and dispose lookahead.
         const tolerance = self.toleranceFor(input.format);
         const lossy = input.format == .lossy;
 
-        const diff = self.changeRect(self.carryover, target, tolerance);
+        // The change-rect reference canvas depends on the codec:
+        //  - A *lossy* frame diffs against the *source-quality* `carryover` (not
+        //    the reconstruction), so VP8 noise — which differs on essentially
+        //    every pixel — never inflates the rect to the whole canvas.
+        //  - A *lossless* frame must reproduce its source EXACTLY, so it diffs
+        //    against `prev_canvas`, the reconstruction the decoder actually
+        //    holds. After a lossy frame `carryover` (original source) and
+        //    `prev_canvas` (the approximate VP8 reconstruction) disagree;
+        //    diffing a lossless frame against `carryover` would miss the pixels
+        //    where the reconstruction drifted from the lossless source and leave
+        //    the previous frame's lossy artifacts visible everywhere outside the
+        //    rect. For all-lossless input `carryover == prev_canvas`, so this is
+        //    identical there and the byte-exact lossless gate is unchanged.
+        const diff_base = if (lossy) self.carryover else self.prev_canvas;
+        const diff = self.changeRect(diff_base, target, tolerance);
         const interval = std.math.clamp(self.encode_options.keyframe_interval, 1, keyframe_interval_max);
         const force_interval = self.frames_since_keyframe + 1 >= interval;
         const full_change = !diff.isEmpty() and diff.isFullCanvas(self.canvas);
@@ -343,6 +370,11 @@ const Optimizer = struct {
         // unchanged-frame no-op below forces lossless so the synthetic 1x1
         // composites back to the exact previous pixel (see that branch).
         var frame_format = input.format;
+        // When set, the emitted frame must leave the canvas untouched: its 1x1
+        // sub-frame copies the pixel the decoder ALREADY holds (`prev_canvas`),
+        // not this frame's source — so the carryover bookkeeping inherits from
+        // `prev_canvas` too (see `buildSubFrame`/`commit`).
+        var no_op = false;
 
         if (is_keyframe) {
             // Full-canvas verbatim replace: the decoder clears then copies, so
@@ -350,15 +382,21 @@ const Optimizer = struct {
             rect = .{ .x = 0, .y = 0, .width = self.canvas.width, .height = self.canvas.height };
             blend = .replace;
         } else if (diff.isEmpty()) {
-            // Degenerate: this frame equals the previous canvas. Emit a tiny 1x1
-            // verbatim copy (a no-op the decoder composites to the same canvas).
-            // Force lossless: a `.lossy` 1x1 would quantize the pixel, so the
-            // decoder would copy a *changed* pixel onto an otherwise-unchanged
-            // canvas (one-pixel flicker that also seeds later diffs). Lossless
-            // 1x1 reproduces the exact pixel, keeping this a true no-op.
+            // Degenerate: this frame matches the previous canvas (exactly for a
+            // lossless frame; within tolerance for a lossy one). Emit a tiny 1x1
+            // no-op that the decoder composites back to the unchanged canvas.
+            //
+            // Force lossless AND copy `prev_canvas` (not `target`): a `.lossy`
+            // 1x1 would quantize the pixel, and even a lossless 1x1 of `target`
+            // would copy a *changed* pixel when the lossy source only matched
+            // within tolerance — either way one pixel at (0,0) would flicker and
+            // seed later diffs. A lossless 1x1 of the pixel the decoder already
+            // holds reproduces it exactly, keeping this a true no-op for both
+            // exact-lossless and tolerance-matched-lossy frames.
             rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
             blend = .replace;
             frame_format = .lossless;
+            no_op = true;
         } else {
             // A sub-rectangle frame. Snap to even offsets (the container stores
             // them in 2-pixel units), then decide blend vs replace. The
@@ -375,8 +413,11 @@ const Optimizer = struct {
             dispose = self.chooseDispose(next, rect, tolerance);
         }
 
-        // Build the cropped sub-frame the per-frame encoder will compress.
-        const sub_pixels = try self.buildSubFrame(target, rect, make_transparent);
+        // Build the cropped sub-frame the per-frame encoder will compress. A
+        // no-op copies what the decoder already holds (`prev_canvas`) so it
+        // reproduces the unchanged canvas; every other case copies `target`.
+        const sub_source = if (no_op) self.prev_canvas else target;
+        const sub_pixels = try self.buildSubFrame(sub_source, rect, make_transparent);
         defer self.gpa.free(sub_pixels);
 
         const source = animation_encode.FrameSource{
@@ -404,7 +445,7 @@ const Optimizer = struct {
         // Update prev_canvas to exactly what the decoder will hold after this
         // frame: re-decode the bitstream we just produced and composite with the
         // same rules (the lossy-correctness step), then apply this dispose.
-        try self.commit(frame_image, rect, blend, dispose, is_keyframe);
+        try self.commit(frame_image, rect, blend, dispose, is_keyframe, no_op);
 
         if (is_keyframe) {
             self.frames_since_keyframe = 0;
@@ -442,7 +483,9 @@ const Optimizer = struct {
     /// (the decoder's reconstruction), and in parallel updates `carryover` (the
     /// source-quality reference) with this frame's `target` content over the same
     /// rect, then applies this frame's dispose to both — leaving each equal to
-    /// its respective canvas before the next frame.
+    /// its respective canvas before the next frame. `no_op` marks the degenerate
+    /// 1x1 inherit-the-canvas frame: it composites the held pixel back unchanged
+    /// and must NOT overwrite the carryover with this frame's near-equal source.
     fn commit(
         self: *Optimizer,
         frame_image: mux.FrameImage,
@@ -450,6 +493,7 @@ const Optimizer = struct {
         blend: animation.BlendMethod,
         dispose: animation.DisposeMethod,
         is_keyframe: bool,
+        no_op: bool,
     ) errors.Error!void {
         var decoded = try decode.decodeImage(self.gpa, .{
             .format = frame_image.format,
@@ -473,7 +517,13 @@ const Optimizer = struct {
         // the content the decoder shows there (exactly for replace/keyframe;
         // within tolerance for a lossy rect; equal to prev for a lossless blend).
         // Inherited regions keep their earlier source pixels untouched.
-        self.copyTargetIntoCarryover(rect);
+        //
+        // A no-op frame leaves the canvas untouched and its synthetic 1x1 copies
+        // the held pixel, not `target`; overwriting the carryover with `target`
+        // (which differs within tolerance for a lossy no-op) would silently drift
+        // the source-quality reference at (0,0). Skip it so the carryover keeps
+        // exactly the previous frame's content, matching the unchanged canvas.
+        if (!no_op) self.copyTargetIntoCarryover(rect);
 
         // The previous frame's dispose was applied at its own commit (mirroring
         // the decoder applying it before this frame). Apply this dispose now,
@@ -1004,6 +1054,103 @@ test "an unchanged lossy frame stays a byte-exact no-op (no 1px drift)" {
     try testing.expectEqualSlices(u8, animated.frames[0].buffer.pixels, animated.frames[1].buffer.pixels);
 
     // The no-op frame still degenerates to a 1x1 rect.
+    var parsed = try demux.parse(gpa, encoded, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.width);
+    try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.height);
+}
+
+test "a lossless frame after a lossy frame diffs the reconstructed canvas (byte-exact)" {
+    // Finding 1 regression: frame 0 is `.lossy`, so the decoder's reconstructed
+    // canvas (`prev_canvas`) drifts from the source (VP8 is approximate) while
+    // the source-quality `carryover` still holds the exact frame-0 source. Frame
+    // 1 is `.lossless` with the SAME source content as frame 0. Diffing frame 1
+    // against `carryover` (the old bug) sees no change and emits a 1x1 no-op,
+    // leaving frame 0's lossy artifacts visible across the rest of the canvas, so
+    // frame 1 decodes to the lossy reconstruction — NOT its exact source. The fix
+    // diffs a lossless frame against `prev_canvas`, re-emitting every pixel where
+    // the reconstruction drifted, so frame 1 is byte-exact to its source.
+    const gpa = testing.allocator;
+    const w = 16;
+    const h = 16;
+
+    // A textured frame so VP8 lossy actually introduces per-pixel error.
+    var f0: [w * h * 4]u8 = undefined;
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const base = (y * w + x) * 4;
+            f0[base + 0] = @intCast((x * 11 + y * 5) % 256);
+            f0[base + 1] = @intCast((y * 9 + x * 3) % 256);
+            f0[base + 2] = @intCast((x * 7 + y * 13 + 20) % 256);
+            f0[base + 3] = 255;
+        }
+    }
+    var f1 = f0; // identical source content, but emitted as `.lossless`
+
+    const frames = [_]FrameInput{
+        .{ .buffer = try rgbaBuffer(&f0, w, h), .duration_ms = 60, .format = .lossy },
+        .{ .buffer = try rgbaBuffer(&f1, w, h), .duration_ms = 60, .format = .lossless },
+    };
+    const encoded = try encodeAnimationMinimized(gpa, &frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+        .quality = 75,
+    });
+    defer gpa.free(encoded);
+
+    var animated = try animation_decode.decodeAnimationAlloc(gpa, encoded, .{});
+    defer animated.deinit();
+    try testing.expectEqual(@as(usize, 2), animated.frames.len);
+    // The lossless frame must reproduce its source EXACTLY, regardless of the
+    // lossy artifacts left on the reconstructed canvas by frame 0.
+    try testing.expectEqualSlices(u8, &f1, animated.frames[1].buffer.pixels);
+}
+
+test "a tolerance-matched lossy no-op preserves the inherited canvas (no 0,0 drift)" {
+    // Finding 2 regression: frame 0 is a lossless keyframe (exact reconstruction).
+    // Frame 1 is `.lossy` with content that differs from frame 0 by less than the
+    // q=75 tolerance (~5) on every pixel, so the tolerance diff against the
+    // carryover is EMPTY and frame 1 enters the degenerate 1x1 no-op branch. The
+    // old behavior copied frame 1's own source pixel at (0,0); since that pixel
+    // differs from the inherited canvas (frame 0) by a few levels, the decoder
+    // composited a *changed* pixel at (0,0) — a one-pixel drift. The fix copies
+    // the pixel the decoder already holds (`prev_canvas`), so the no-op leaves the
+    // canvas byte-identical to frame 0, including (0,0).
+    const gpa = testing.allocator;
+    const w = 8;
+    const h = 8;
+    var f0: [w * h * 4]u8 = undefined;
+    fillConstant(&f0, .{ 120, 130, 140, 255 });
+    var f1 = f0;
+    // Shift every channel by +3 (<= the q=75 tolerance of 5): within tolerance,
+    // so the rect diff is empty, but NOT byte-equal, so a naive 1x1-of-target
+    // would drift (0,0).
+    var i: usize = 0;
+    while (i < f1.len) : (i += 4) {
+        f1[i + 0] +%= 3;
+        f1[i + 1] +%= 3;
+        f1[i + 2] +%= 3;
+    }
+
+    const frames = [_]FrameInput{
+        .{ .buffer = try rgbaBuffer(&f0, w, h), .duration_ms = 40, .format = .lossless },
+        .{ .buffer = try rgbaBuffer(&f1, w, h), .duration_ms = 40, .format = .lossy },
+    };
+    const encoded = try encodeAnimationMinimized(gpa, &frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+        .quality = 75,
+    });
+    defer gpa.free(encoded);
+
+    var animated = try animation_decode.decodeAnimationAlloc(gpa, encoded, .{});
+    defer animated.deinit();
+    try testing.expectEqual(@as(usize, 2), animated.frames.len);
+    // The tolerance-matched no-op must inherit frame 0 exactly, with no drift at
+    // (0,0): decoded frame 1 == decoded frame 0 == frame 0 source, byte-for-byte.
+    try testing.expectEqualSlices(u8, &f0, animated.frames[0].buffer.pixels);
+    try testing.expectEqualSlices(u8, &f0, animated.frames[1].buffer.pixels);
+    try testing.expectEqualSlices(u8, animated.frames[0].buffer.pixels, animated.frames[1].buffer.pixels);
+
+    // It still degenerates to a 1x1 rect (the no-op stayed tiny).
     var parsed = try demux.parse(gpa, encoded, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(u32, 1), parsed.frames[1].rect.width);
