@@ -24,6 +24,7 @@ pub const alpha = @import("alpha.zig");
 pub const animation = @import("animation.zig");
 pub const animation_decode = @import("animation_decode.zig");
 pub const animation_encode = @import("animation_encode.zig");
+pub const animation_optimize = @import("animation_optimize.zig");
 pub const bit_reader = @import("bit_reader.zig");
 pub const bit_writer = @import("bit_writer.zig");
 pub const color = @import("color.zig");
@@ -99,6 +100,14 @@ pub const AnimationFrameSource = animation_encode.FrameSource;
 /// metadata, resource limits, and the shared per-frame quality/method/alpha
 /// knobs.
 pub const AnimationEncodeOptions = animation_encode.Options;
+/// One full-canvas source frame for `encodeAnimationMinimized`: the desired
+/// canvas at this timestamp plus duration and codec. The optimizer derives the
+/// rectangle/blend/dispose, so (unlike `AnimationFrameSource`) the caller does
+/// not supply them.
+pub const AnimationFrameInput = animation_optimize.FrameInput;
+/// Options for `encodeAnimationMinimized`: the `AnimationEncodeOptions` knobs
+/// plus the keyframe interval. The per-frame compositing is derived.
+pub const AnimationMinimizeOptions = animation_optimize.Options;
 pub const BitReader = bit_reader.BitReader;
 pub const BitWriter = bit_writer.BitWriter;
 pub const ByteReader = bit_reader.ByteReader;
@@ -263,6 +272,27 @@ pub fn encodeAnimationFromBuffers(
     encode_options: AnimationEncodeOptions,
 ) Error![]u8 {
     return animation_encode.encodeAnimationFromBuffers(gpa, frame_sources, encode_options);
+}
+
+/// Encodes a sequence of full-canvas frames (`AnimationFrameInput`) into a
+/// minimized animated WebP. The optimizer automatically derives a minimal
+/// `ANMF` layout — sub-rectangles, blend/dispose methods, and keyframes — that
+/// composites back to exactly the input canvases, then reuses the per-frame
+/// encoder behind `encodeAnimationFromBuffers` and `encodeAnimation`. For
+/// all-lossless input the round-trip through `decodeAnimation` is byte-exact
+/// after transparent-RGB canonicalization: fully-transparent pixels are
+/// normalized to `0,0,0,0` (matching libwebp `anim_dump` composition), so RGB
+/// hidden behind alpha=0 is not preserved. Lossy frames are tracked against the
+/// decoder's reconstructed canvas so error never accumulates. The output is
+/// accepted by `webpinfo`/`webpmux`/`anim_dump`.
+/// Unlike `encodeAnimationFromBuffers` (the explicit-rect API), the caller does
+/// not pick per-frame rectangles or compositing. Returns caller-owned bytes.
+pub fn encodeAnimationMinimized(
+    gpa: std.mem.Allocator,
+    frames: []const AnimationFrameInput,
+    encode_options: AnimationMinimizeOptions,
+) Error![]u8 {
+    return animation_optimize.encodeAnimationMinimized(gpa, frames, encode_options);
 }
 
 /// Encodes a caller-supplied pixel buffer into a complete lossless (VP8L)

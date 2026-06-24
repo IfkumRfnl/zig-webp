@@ -22,7 +22,7 @@ pub const default_hash_row_count = 149;
 
 pub const default_animation_root_path = "testdata/animation";
 pub const animation_hash_manifest_file_name = "hashes.tsv";
-pub const default_animation_file_count = 8;
+pub const default_animation_file_count = 10;
 
 pub const PlaneHashKind = enum {
     rgba,

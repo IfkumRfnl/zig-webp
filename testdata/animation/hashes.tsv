@@ -2,6 +2,8 @@
 # tab-separated row (file, frame count, hash) per animation.
 # Regenerate with `zig build anim-hashes` only after a corpus-wide
 # `compare-anim` oracle run confirms the composited frames.
+anim_minimized_lossless.webp	6	c74b95eb70e5221b1e97eea2b577cce8fee0bcc91f8c05d5a18bb469bb467af6
+anim_minimized_lossy.webp	6	7e8174e0a1c1b255841161e2bdb44b646f605793f15ea991656e8751c84fa598
 blend_bg_dispose.webp	3	a28a2e214ea125bf20d7a628352e682f05cbb62bf409035e2e4e1ce1402d142a
 blend_disjoint_dispose.webp	4	bb962f49e8d58d4399fe628cf94e6e94be60477e2340bfe2e522321f20a84077
 dispose_none_matrix.webp	4	2ffd08eeb24e6bf64a695d8d863b2ad7bc4a5085a2de1c0bdb758cfb117e4ec9

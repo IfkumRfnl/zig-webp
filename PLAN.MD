@@ -437,11 +437,13 @@ auditable:
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
 
-With step 8c delivered, the VP8 lossy encoder is feature-complete. The remaining
-roadmap is step 9 (animation and metadata encode), step 10 (performance), step
-11 (robustness hardening), and step 12 (public API and release criteria); the
-near-term focus moves to step 9 unless performance or hardening is prioritized
-first.
+With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
+delivered, **step 9 (animation and metadata encode) is now feature-complete**
+(9a container mux, 9b pixel-buffer encode, 9c frame optimization, 9d still
+metadata). The remaining roadmap is step 10 (performance), step 11 (robustness
+hardening), and step 12 (public API and release criteria); the only open step-9
+item is the manual ≥2-browser render confirmation, which is set up (see below)
+but intentionally not in CI.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
@@ -462,9 +464,26 @@ then pixels, then quality):
    gate that `anim_dump` of the output matches this library's own
    `decodeAnimation` composition byte-for-byte (see `PROGRESS.MD` and the
    2026-06-23 9b oracle row).
-3. **9c (planned).** Frame optimization: sub-rectangle detection, inter-frame
-   differencing, blend/dispose strategy, and keyframe insertion (libwebp
-   `WebPAnimEncoder`-style), preserving the 9b gate.
+3. **9c (delivered).** Frame optimization: public `encodeAnimationMinimized`
+   (in `src/animation_optimize.zig`) takes full-canvas frames + timing and
+   automatically derives a minimal `ANMF` layout — sub-rectangle detection
+   (minimal bounding box vs the decoder's reconstructed previous canvas),
+   inter-frame differencing with a blend-vs-replace strategy (equal-to-prev
+   pixels made transparent under `alpha_blend` when the result provably
+   reconstructs exactly, else verbatim `replace`), a one-frame-lookahead
+   dispose-to-background choice, and keyframe insertion (frame 0, full-canvas
+   changes, and a bounded interval) — then reuses the 9b per-frame encoder and
+   the 9a mux. The optimizer tracks the decoder's *reconstructed* canvas
+   (re-decoding each frame it emits and compositing with the exact
+   `animation_decode` rules), so lossy error never accumulates and the 9b gate
+   is preserved. Hard gate (CI): all-lossless minimized round-trips are
+   byte-exact vs the input canvases; local `anim_dump` parity holds for lossless
+   and lossy minimized samples; `webpinfo` clean. Lossless reduction vs the
+   naive full-canvas encode is reported (≈8% on the moving-sub-region sample;
+   see the 2026-06-23 9c oracle row). Lossy frames diff exactly against the
+   reconstructed canvas, so they stay full-canvas keyframes (no shrink) — a
+   correctness-first choice; libwebp's quality-tolerance shrink is future work.
+   Step 9 is now feature-complete.
 4. **9d (delivered, still encode).** Metadata-from-pixels for **still** encode:
    `EncoderOptions.metadata` (a `metadata.RawPayloads`) threads raw
    `ICCP`/`EXIF`/`XMP ` into the `encodeLossless`/`encodeLossy` mux calls, so the
@@ -476,8 +495,14 @@ then pixels, then quality):
    the `mux.encodeStaticFromDemux` remux path is what preserves unknown-chunk
    order. Animation-level metadata is already handled by 9a's
    `AnimationImage.metadata` (and 9b's `AnimationEncodeOptions.metadata`), so 9d
-   does not duplicate it. **Browser-render check (step-9 completion gate):** set
-   up, not closed — 9d generates metadata-bearing still samples (validated by
-   `webpinfo`, no errors) for manual inspection; the full "renders in ≥2 major
-   browsers" gate is best run once 9b/9c land real pixel animations, and is not a
-   hard gate for this slice nor wired into CI.
+   does not duplicate it.
+
+**Browser-render check (step-9 completion gate):** set up, not closed. 9c
+generates two minimized sample animations under `testdata/animation/`
+(`anim_minimized_lossless.webp`, `anim_minimized_lossy.webp` — a textured
+background with a moving sub-region) for manual inspection. Both pass `anim_dump`
+parity and `webpinfo` cleanly. The full "renders in ≥2 major browsers" gate is
+manual and intentionally **not** wired into CI: open the two samples in two
+browsers and confirm the moving region animates correctly. Everything that can
+be automated (byte-exact lossless round-trip, `anim_dump` parity, `webpinfo`) is
+gated; the cross-browser confirmation is the only remaining manual step.

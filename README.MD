@@ -39,17 +39,24 @@ size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact
 knob that scales the rate-distortion search, lossy+alpha via the `ALPH` chunk
 (lossless, byte-exact alpha), target-size and target-PSNR encode modes, and
 optional sharp (iterative) RGB→YUV chroma. Animation and metadata encode (step 9)
-is now underway: `encodeAnimation` muxes already-encoded frame bitstreams into a
-valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame `ALPH` and
-`ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of `encodeStatic` —
-accepted by `webpinfo`/`webpmux`/`anim_dump`. `encodeAnimationFromBuffers` builds
-on it to encode an ordered list of pixel-buffer frames (each full-canvas or
-sub-rect, lossy or lossless, with alpha) straight into an animated WebP, reusing
-the still encoders per frame; its output composites back through this library's
-`decodeAnimation` and matches libwebp's `anim_dump` byte-for-byte. The still pixel
-encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). Automatic
-inter-frame sub-rectangle/differencing optimization is the remaining step-9 slice.
-The installed `zig-webp-encode` tool re-encodes a still WebP as lossy `VP8 `.
+is now feature-complete: `encodeAnimation` muxes already-encoded frame bitstreams
+into a valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame
+`ALPH` and `ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of
+`encodeStatic` — accepted by `webpinfo`/`webpmux`/`anim_dump`.
+`encodeAnimationFromBuffers` builds on it to encode an ordered list of
+pixel-buffer frames (each full-canvas or sub-rect, lossy or lossless, with alpha)
+straight into an animated WebP, reusing the still encoders per frame; its output
+composites back through this library's `decodeAnimation` and matches libwebp's
+`anim_dump` byte-for-byte. `encodeAnimationMinimized` adds automatic frame
+optimization: it takes full-canvas frames and derives a minimal `ANMF` layout
+(sub-rectangle detection, inter-frame differencing with a blend-vs-replace
+strategy, dispose selection, and keyframe insertion) that composites back to
+exactly the input canvases — byte-exact for lossless input — tracking the
+decoder's reconstructed canvas so lossy error never accumulates. The still pixel
+encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). The only open
+step-9 item is the manual ≥2-browser render confirmation (two sample animations
+under `testdata/animation/`). The installed `zig-webp-encode` tool re-encodes a still WebP as
+lossy `VP8 `.
 
 ## Goals
 
