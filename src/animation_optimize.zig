@@ -19,9 +19,12 @@
 //!    is a verbatim `replace`. A blend candidate is only chosen when it
 //!    provably reconstructs exactly (`blendCandidateExact`).
 //!  - **dispose strategy:** a frame uses dispose-to-background when clearing its
-//!    rectangle shrinks the next frame's diff rect (one-frame lookahead). The
-//!    optimizer tracks the canvas exactly as the decoder will — including the
-//!    dispose it chose — so any dispose choice stays byte-exact.
+//!    rectangle shrinks the next frame's diff rect (one-frame lookahead). This
+//!    applies to keyframes / full-canvas frames too: a keyframe followed by a
+//!    mostly-transparent or small-object frame can clear the whole canvas so the
+//!    next frame's rect is tiny. The optimizer tracks the canvas exactly as the
+//!    decoder will — including the dispose it chose — so any dispose choice stays
+//!    byte-exact.
 //!  - **keyframe insertion:** frame 0 is a full-canvas `replace` keyframe;
 //!    further keyframes are forced when the diff rect is the whole canvas or a
 //!    bounded interval elapses, keeping frames independent enough to seek.
@@ -378,9 +381,16 @@ const Optimizer = struct {
 
         if (is_keyframe) {
             // Full-canvas verbatim replace: the decoder clears then copies, so
-            // the reconstruction equals `target` (within the codec's tolerance).
+            // the reconstruction equals `target` (exactly for lossless, within
+            // the codec's tolerance for lossy). Run the same one-frame dispose
+            // lookahead as a sub-rect frame: clearing the full canvas to
+            // background can shrink the next frame's diff rect when the keyframe
+            // is followed by a mostly-transparent or small-object frame (a
+            // scene-cut / flash). `commit` re-tracks the canvas with whatever
+            // dispose we pick, so the choice stays byte-exact.
             rect = .{ .x = 0, .y = 0, .width = self.canvas.width, .height = self.canvas.height };
             blend = .replace;
+            dispose = self.chooseDispose(next, rect, tolerance);
         } else if (diff.isEmpty()) {
             // Degenerate: this frame matches the previous canvas (exactly for a
             // lossless frame; within tolerance for a lossy one). Emit a tiny 1x1
@@ -1277,6 +1287,53 @@ test "a multi-frame sequence exercising blend and dispose round-trips" {
     defer gpa.free(encoded);
 
     try expectByteExactRoundTrip(gpa, encoded, &.{ &bg, &f1, &f2, &f3 });
+}
+
+test "a keyframe followed by a sparse frame disposes to background and shrinks the next rect" {
+    const gpa = testing.allocator;
+    const w = 16;
+    const h = 16;
+
+    // Frame 0 is a full-canvas opaque keyframe (a scene). Frame 1 is a scene cut
+    // to a mostly-transparent canvas with a single small opaque square. Without
+    // dispose lookahead on the keyframe, frame 1's diff against the opaque
+    // frame-0 canvas covers everywhere the opaque pixels turned transparent — the
+    // whole canvas — so frame 1 becomes another full-canvas keyframe. With the
+    // lookahead, the keyframe disposes to background (clears the canvas), so
+    // frame 1's diff against the transparent canvas is just the small square.
+    var f0: [w * h * 4]u8 = undefined;
+    fillConstant(&f0, .{ 180, 60, 220, 255 });
+    var f1: [w * h * 4]u8 = undefined;
+    fillConstant(&f1, .{ 0, 0, 0, 0 }); // fully transparent
+    paintSquare(&f1, w, 2, 2, 4, 4, .{ 255, 255, 255, 255 }); // one small opaque object
+
+    const frames = [_]FrameInput{
+        .{ .buffer = try rgbaBuffer(&f0, w, h), .duration_ms = 100, .format = .lossless },
+        .{ .buffer = try rgbaBuffer(&f1, w, h), .duration_ms = 100, .format = .lossless },
+    };
+    const encoded = try encodeAnimationMinimized(gpa, &frames, .{
+        .canvas = try image.Dimensions.init(w, h),
+    });
+    defer gpa.free(encoded);
+
+    // (a) Correctness: still composites back byte-exactly. `f1`'s transparent
+    // pixels canonicalize to 0,0,0,0, which is exactly how it was authored.
+    try expectByteExactRoundTrip(gpa, encoded, &.{ &f0, &f1 });
+
+    var parsed = try demux.parse(gpa, encoded, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.frames.len);
+
+    // (b1) The keyframe now selects `.background` dispose so the next frame can
+    // diff against a cleared canvas.
+    try testing.expectEqual(@as(u32, w), parsed.frames[0].rect.width);
+    try testing.expectEqual(@as(u32, h), parsed.frames[0].rect.height);
+    try testing.expectEqual(animation.DisposeMethod.background, parsed.frames[0].dispose_method);
+
+    // (b2) Frame 1's rect is the small object, far smaller than the canvas —
+    // without the lookahead it would span the whole canvas.
+    try testing.expect(parsed.frames[1].rect.width < w);
+    try testing.expect(parsed.frames[1].rect.height < h);
 }
 
 test "the keyframe interval forces periodic full-canvas frames" {
