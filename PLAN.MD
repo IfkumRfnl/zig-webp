@@ -467,23 +467,32 @@ then pixels, then quality):
 3. **9c (delivered).** Frame optimization: public `encodeAnimationMinimized`
    (in `src/animation_optimize.zig`) takes full-canvas frames + timing and
    automatically derives a minimal `ANMF` layout — sub-rectangle detection
-   (minimal bounding box vs the decoder's reconstructed previous canvas),
-   inter-frame differencing with a blend-vs-replace strategy (equal-to-prev
-   pixels made transparent under `alpha_blend` when the result provably
-   reconstructs exactly, else verbatim `replace`), a one-frame-lookahead
+   (minimal bounding box of the changed region), inter-frame differencing with a
+   blend-vs-replace strategy (lossless: equal-to-prev pixels made transparent
+   under `alpha_blend` when the result provably reconstructs exactly, else
+   verbatim `replace`; lossy: always verbatim `replace`), a one-frame-lookahead
    dispose-to-background choice, and keyframe insertion (frame 0, full-canvas
    changes, and a bounded interval) — then reuses the 9b per-frame encoder and
    the 9a mux. The optimizer tracks the decoder's *reconstructed* canvas
    (re-decoding each frame it emits and compositing with the exact
    `animation_decode` rules), so lossy error never accumulates and the 9b gate
-   is preserved. Hard gate (CI): all-lossless minimized round-trips are
-   byte-exact vs the input canvases; local `anim_dump` parity holds for lossless
-   and lossy minimized samples; `webpinfo` clean. Lossless reduction vs the
-   naive full-canvas encode is reported (≈8% on the moving-sub-region sample;
-   see the 2026-06-23 9c oracle row). Lossy frames diff exactly against the
-   reconstructed canvas, so they stay full-canvas keyframes (no shrink) — a
-   correctness-first choice; libwebp's quality-tolerance shrink is future work.
-   Step 9 is now feature-complete.
+   is preserved. **Slice 9c-2 extended this to lossy frames:** the change rect is
+   detected against a *source-quality carryover* canvas (not the noisy
+   reconstruction) using a per-channel content-change tolerance `T`
+   (`Options.tolerance`, defaulting to a quality-derived value — libwebp's
+   `QualityToMaxDiff`, ~5 at q=75), so lossy frames now shrink to a sub-rect
+   instead of staying full-canvas keyframes; bounded drift is capped by the
+   keyframe interval. Lossless frames use `T = 0` (exact) and an
+   identical-to-reconstruction carryover, so the byte-exact lossless gate is
+   unchanged. Gate (CI): all-lossless minimized round-trips are byte-exact;
+   a lossy moving-region animation shrinks ≥1 ANMF rect and decodes valid; the
+   optimized lossy mean luma PSNR stays within 0.5 dB of the naive full-canvas
+   encode; `anim_dump` parity holds for lossless and lossy samples; `webpinfo`
+   clean. Measured lossy result: ≈48% smaller than the naive full-canvas lossy
+   encode on the moving-sub-region sample, PSNR +0.14 dB (not a loss; the
+   inherited gradient is quantized once at the keyframe rather than re-noised
+   each frame) — see the 2026-06-23 9c-2 oracle row. Step 9 is now
+   feature-complete.
 4. **9d (delivered, still encode).** Metadata-from-pixels for **still** encode:
    `EncoderOptions.metadata` (a `metadata.RawPayloads`) threads raw
    `ICCP`/`EXIF`/`XMP ` into the `encodeLossless`/`encodeLossy` mux calls, so the
