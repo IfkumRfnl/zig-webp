@@ -165,6 +165,22 @@ frame). See "Step 9 — Animation and Metadata Encode (slice 9c)" and the third 
 the 9c-2 2026-06-23 oracle rows. The ≥2-browser render check is set up via two
 `testdata/animation/` animations and remains the only open (manual, non-CI) step-9 item.
 
+**Step 10 (performance work) is now underway, starting with its baseline slice
+10a.** A new in-memory benchmark tool (`tools/zig-webp-bench.zig`, `zig build
+bench`) times the public decode and encode entry points per asset class — codec
+time only, no file I/O — reporting the median of repeated timed runs. It
+establishes the scalar baseline that the optimization slices (10b cache-aware
+scalar, 10c `@Vector` SIMD) measure against; an optional `tools/webp-bench.sh`
+times libwebp's `dwebp`/`cwebp` over the same files for a same-machine ratio. The
+dated 2026-06-26 baseline (see "Step 10 — Performance Work (slice 10a)" and the
+2026-06-26 oracle row) shows lossy decode at ≈2.0–2.5× single-threaded `dwebp`
+(inside the ≤3× scalar target) but small/medium VP8L lossless decode at
+≈2.8–5.6× (outside it) — so the optimization slices target the lossless decode
+path (prefix decode, inverse predictor/color transforms) and the lossy
+color-conversion / IDCT loops first. Timing is environment-dependent and stays a
+local report, not a CI gate. Threading is **not** in scope here (it remains
+future work; the targets are single-threaded).
+
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
@@ -209,6 +225,46 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 10 — Performance Work (slice 10a: baseline harness)
+
+Slice 10a is the **measurement foundation** for the performance step: it adds a
+benchmark harness and records the scalar baseline, with no codec changes (the
+hot loops are optimized in 10b/10c). New `tools/zig-webp-bench.zig` (`zig build
+bench`) times the public entry points — `decodeStatic`, `decodeAnimation`,
+`encodeLossless`, `encodeLossy` — entirely **in memory** (no PAM/file writes, so
+the numbers are codec time, not disk I/O). For each input it runs untimed warmup
+iterations then repeated timed iterations and reports the **median** wall-clock
+time (via the `std.Io` monotonic clock), with a per-measurement time budget so a
+single multi-second image cannot blow up the run. It enumerates `testdata/`
+into asset classes (icon / photo / large / alpha / animation for decode; the
+synthetic matrix + photos for encode) and emits a TSV with throughput in
+megapixels/second. Correctness is **not** re-checked here — that stays with `zig
+build test` (the committed-hash corpus regression and the encoder
+self-consistency gates); the harness only measures the speed of a build that
+already passes them. An optional `tools/webp-bench.sh` times libwebp's
+`dwebp`/`cwebp` over the same files (skipping gracefully when absent, never a
+build dependency) for a same-machine ratio.
+
+**Baseline (2026-06-26, ReleaseFast, 13th Gen Intel Core i5-13450HX, single
+thread; libwebp 1.5.0):**
+
+- *Decode* (pixel-weighted aggregate MP/s): lossy ≈39, lossless ≈28. Per class:
+  large ≈40, alpha ≈34, photo ≈28, with icon/animation dominated by per-decode
+  overhead rather than throughput (tiny canvases), so MP/s understates them.
+- *Decode vs single-threaded `dwebp`* (our min ÷ `dwebp` min; `dwebp` also
+  formats PAM output, so the ratio mildly favors us and is indicative, not
+  exact): lossy `bryce` 11158×2156 **2.5×**, `lossy_extreme` 800×534 **2.0×**;
+  lossless `lossless_big_random_alpha` 2048² **1.8×**, `lossless_color_transform`
+  512² **2.8×**, `photo_foliage` 512×342 (lossless) **5.6×**. Lossy decode and
+  large lossless are inside the ≤3× scalar target; small/medium lossless decode
+  is the clear miss.
+- *Encode* (MP/s): lossless ≈1.3 (photos), lossy q75 ≈8.8 (photos). vs `cwebp`
+  on `photo_foliage`: lossless 125 ms vs 88 ms (**1.4×**), lossy 22 ms vs 12 ms
+  (**1.8×**) — already competitive, so decode is the optimization priority.
+
+`zig build test` unchanged (all gates pass); `zig build check` compiles the new
+tool. See the 2026-06-26 oracle row.
 
 ### Step 9 — Animation and Metadata Encode (slice 9c: frame optimization)
 
@@ -883,6 +939,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-23 | Pixel-level animation encode (slice 9b) `anim_dump` matches our composition | New `animation_encode.encodeAnimationFromBuffers` (public `encodeAnimationFromBuffers`) encodes a caller-supplied ordered list of pixel-buffer frames into an animated WebP — the animated analogue of `encodeLossy`/`encodeLossless`. Each `FrameSource` (an `image.Buffer` + even canvas offset + duration + blend/dispose + lossy/lossless codec) is encoded by reusing the still machinery (`encode.gatherArgbAlloc`, then `vp8l_encoder.encodeAlloc` for lossless, or `color.rgbaToYuv420Alloc` + `vp8_encoder.encodeAlloc` + `alpha.encodePlaneAlloc` for lossy+alpha) and muxed via slice 9a; the caller dictates each frame's rectangle/blend/dispose (inter-frame optimization is 9c). Round-trip (**CI gate, `zig build test`, 378/378 pass, +13 new**): an all-lossless full-canvas-keyframe animation composites back **byte-for-byte** to its source frames via `decodeAnimationAlloc`; further tests cover a lossy frame (right dims), a lossless sub-rect over a keyframe, a lossless and a lossy+alpha frame (alpha recovered exactly), per-frame blend/dispose (background-dispose clears a sub-rect for the next frame), loop count + background + metadata round-trip, the input errors (empty list, odd offset, rect outside canvas) and the frame-count limit, and survive allocation failure at every site over a mixed lossless + lossy-alpha animation. **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim` — `anim_dump` of four generated animations (lossless full-canvas, lossless sub-rect with background-dispose, lossy full-canvas, mixed lossless + lossy-alpha with alpha-blend) matches this library's own composition byte-for-byte across all 8 frames (compared=4, failed=0), and `webpinfo` reports "No error detected" for all four.** This carries the step-9 pixel-path gate; sub-rectangle/differencing optimization (9c) remains. |
 | 2026-06-23 | Animation frame optimization (slice 9c) byte-exact lossless round-trip + `anim_dump` parity; ≈8% lossless reduction vs naive | New `animation_optimize.encodeAnimationMinimized` (public `encodeAnimationMinimized`, module `src/animation_optimize.zig`) takes full-canvas frames + timing + per-frame codec and auto-derives a minimal `ANMF` layout that composites back to exactly those frames: **sub-rectangle detection** (minimal bounding box vs the decoder's reconstructed previous canvas, even-snapped), **inter-frame differencing + blend strategy** (equal-to-prev pixels made transparent under `alpha_blend` when it provably reconstructs exactly — every changed pixel fully opaque — else verbatim `replace`), **dispose** (one-frame lookahead picks background when it shrinks the next diff rect), and **keyframe insertion** (frame 0, any full-canvas change, bounded `keyframe_interval`). Reuses the 9b per-frame encoder via one narrow hook (`encodeFrameForOptimizer`) and the 9a mux. Correctness key: the optimizer tracks the decoder's **reconstructed** canvas — re-decoding each frame it emits and compositing with the exact `animation_decode` rules (transparent-RGB zeroing, source-over non-premultiplied blend, previous background-disposed-rect skip) — so lossy error never accumulates. **CI hard gate (byte-exact lossless round-trip), `zig build test`, 394/394 pass, +11 new:** all-lossless minimized animations decode byte-for-byte back to the input canvases across a static-background-with-moving-sub-region (asserted via `demux` to actually shrink at least one `ANMF` rect below the canvas), a degenerate identical frame (1×1 rect), a full-canvas change (forced keyframe), a transparency-reveal (replace fallback), a blend+dispose multi-frame sequence, and a forced keyframe interval (frames 0/2/4 full-canvas at interval 2); a lossy minimized animation decodes at the right dims; allocation failure survived at every site. **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim`** on two minimized 96×64 6-frame samples (`testdata/animation/anim_minimized_lossless.webp`, `testdata/animation/anim_minimized_lossy.webp`) — `anim_dump` matches this library's composition byte-for-byte across all 6 frames each (compared=2, failed=0), and `webpinfo` reports "No error detected" for both. **Compression (reported, not gated):** minimized lossless 3840 B vs naive `encodeAnimationFromBuffers` 4174 B (8.0% smaller, sub-rect frames 28×28/28×40); minimized lossy byte-identical to naive (7942 B, 0%) — VP8 reconstruction differs almost everywhere so the exact diff rect is full-canvas every frame, a deliberate correctness-first choice (libwebp's quality-tolerance lossy shrink is future work). Step 9 is now feature-complete; the ≥2-browser render check is set up (the two `testdata/animation/`) but manual and not in CI. |
 | 2026-06-23 | Lossy animation frame optimization (slice 9c-2) shrinks lossy sub-rects, PSNR within tolerance of naive, ≈48% smaller | Extends `animation_optimize.encodeAnimationMinimized` so **lossy** frames are inter-frame optimized instead of emitted as full-canvas keyframes. The change rect is now detected against a **source-quality carryover** canvas (the original input pixels carried frame to frame, dispose clears applied — mirroring libwebp's `canvas_carryover`), not the noisy reconstruction, so VP8 noise (which 9c's exact diff flagged almost everywhere → full-canvas every frame) no longer inflates the rect. A pixel counts as unchanged via a per-channel content-change tolerance `T` (libwebp's `PixelsAreSimilar`: alpha must match, each RGB channel diff alpha-weighted ≤ `T·255`). New `AnimationMinimizeOptions.tolerance: ?u8 = null` defaults to a quality-derived value (`qualityToMaxDiff`, libwebp's `QualityToMaxDiff`: 31 at q=0, ≈5 at q=75, 1 at q=100); lossless frames force `T = 0` (exact) with a carryover equal to the reconstruction, so the byte-exact lossless path is **unchanged**. The blend/transparent path stays lossless-only (lossy sub-rects are always verbatim `replace`); inherited regions come from the previous decoded frame and drift is bounded by `keyframe_interval`. **CI gates, `zig build test`, 398/398 pass, +4 new:** the 9c all-lossless byte-exact round-trips still pass unchanged (hard lossless gate); a lossy 64×48 5-frame moving-region animation shrinks ≥1 `ANMF` rect below the canvas (asserted via `demux`) and decodes valid; the optimized lossy mean luma PSNR (`src/testing/metrics.zig`, vs the source) stays within **0.5 dB** of the naive `encodeAnimationFromBuffers` full-canvas encode and the optimized stream is strictly smaller; `qualityToMaxDiff`/`pixelsSimilar` unit-checked at reference points; allocation failure survived at every site (now three carryover buffers). **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim`** on a generated 96×64 8-frame lossy minimized sample — `anim_dump` matches this library's composition byte-for-byte across all 8 frames (compared=1, failed=0), and `webpinfo` reports "No error detected" (frame 0 a full-canvas keyframe, frames 1–7 shrunk to 22×22 sub-rects). **Compression (reported):** lossy minimized **1390 B vs naive 2680 B (48.1% smaller)** at q=75, mean luma PSNR **45.96 vs 45.82 dB (+0.14 dB, not a loss** — the inherited gradient is quantized once at the keyframe rather than re-noised each frame). Tolerance chosen: ≤0.5 dB below naive, justified because the only quality difference is inherited (non-rect) regions carrying the previous frame's lossy values; the measured delta is comfortably positive. Closes 9c's "lossy = full-canvas keyframes, future work" caveat. |
+| 2026-06-26 | Performance baseline (slice 10a) via new `zig build bench`; scalar decode/encode throughput + same-machine libwebp ratio | New `tools/zig-webp-bench.zig` (`zig build bench`) times the public `decodeStatic`/`decodeAnimation`/`encodeLossless`/`encodeLossy` entry points **in memory** (no file I/O), reporting the median of repeated timed runs (via the `std.Io` monotonic clock) with a per-measurement time budget, over `testdata/` asset classes (decode: icon/photo/large/alpha/animation; encode: synthetic matrix + 4 CC0 photos). No codec change — pure measurement; correctness stays with `zig build test` (committed-hash regression + encoder self-consistency), which the harness assumes. An optional `tools/webp-bench.sh` times `dwebp`/`cwebp` over the same files (graceful SKIP when absent, never a build dependency). **Baseline (ReleaseFast, 13th Gen Intel Core i5-13450HX, single thread, libwebp 1.5.0; 213 rows):** decode pixel-weighted aggregate ≈39 MP/s lossy, ≈28 MP/s lossless. Same-machine vs single-threaded `dwebp` (our min ÷ `dwebp` min; `dwebp` also formats PAM output, so indicative not exact): lossy `bryce` 11158×2156 **2.5×**, `lossy_extreme` 800×534 **2.0×**; lossless `lossless_big_random_alpha` 2048² **1.8×**, `lossless_color_transform` 512² **2.8×**, `photo_foliage` 512×342 (lossless) **5.6×**. Encode vs `cwebp` on `photo_foliage`: lossless 125 ms vs 88 ms (**1.4×**), lossy q75 22 ms vs 12 ms (**1.8×**). Read honestly: lossy decode and large lossless are inside the ≤3× single-threaded scalar target; small/medium VP8L lossless decode (2.8–5.6×) is the miss and the priority for 10b/10c; the encoder is already competitive. Timing is environment-dependent and **not** a CI gate. `zig build test` unchanged; `zig build check` compiles the tool. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

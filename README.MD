@@ -89,9 +89,17 @@ tools/webp-oracle.sh compare-vp8l-corpus .zig-cache/vp8l-diff references/libwebp
 tools/webp-oracle.sh compare-alpha-corpus .zig-cache/alpha-diff references/libwebp-test-data
 zig build encode-lossy-report
 tools/webp-oracle.sh compare-encode-lossy
+zig build bench
+tools/webp-bench.sh
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
+
+`zig build bench` times the decode/encode entry points in memory per asset
+class and prints a TSV (the PLAN.MD step-10 performance baseline); the optional
+`tools/webp-bench.sh` times libwebp's `dwebp`/`cwebp` over the same files for a
+same-machine ratio. Both are local reports — timing is environment-dependent and
+is not a CI gate.
 
 `zig build test` includes a hash-based corpus regression: decoded RGBA and
 alpha planes of the committed corpus in `testdata/libwebp-test-data`, and the
