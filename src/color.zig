@@ -17,10 +17,13 @@
 //! opaque here — composing decoded alpha over lossy color is a later stage.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const errors = @import("errors.zig");
 const image = @import("image.zig");
+
+const native_endian = builtin.cpu.arch.endian();
 
 // Fixed-point precision for the YUV->RGB conversion (`YUV_FIX2` in libwebp).
 const yuv_fix2 = 6;
@@ -174,44 +177,44 @@ fn upsampleLinePair(comptime format: image.PixelFormat, len: usize, lines: LineP
     assert(len >= 1);
 
     const last_pixel_pair = (len - 1) >> 1;
-    var top_left = loadUV(lines.top_u[0], lines.top_v[0]);
-    var left = loadUV(lines.cur_u[0], lines.cur_v[0]);
 
+    // First output pixel mirrors column 0 (no left neighbour).
     {
-        const uv = (3 * top_left + left + 0x0002_0002) >> 2;
-        storePixel(format, lines.top_dst[0..channels], lines.top_y[0], uv);
-    }
-    if (lines.bottom_y) |bottom_y| {
-        const uv = (3 * left + top_left + 0x0002_0002) >> 2;
-        storePixel(format, lines.bottom_dst.?[0..channels], bottom_y[0], uv);
-    }
-
-    var x: usize = 1;
-    while (x <= last_pixel_pair) : (x += 1) {
-        const top = loadUV(lines.top_u[x], lines.top_v[x]);
-        const cur = loadUV(lines.cur_u[x], lines.cur_v[x]);
-        // Invariants shared by the two diagonals of this output quad.
-        const avg = top_left + top + left + cur + 0x0008_0008;
-        const diag_12 = (avg + 2 * (top + left)) >> 3;
-        const diag_03 = (avg + 2 * (top_left + cur)) >> 3;
+        const top_left = loadUV(lines.top_u[0], lines.top_v[0]);
+        const left = loadUV(lines.cur_u[0], lines.cur_v[0]);
         {
-            const uv0 = (diag_12 + top_left) >> 1;
-            const uv1 = (diag_03 + top) >> 1;
-            storePixel(format, sub(lines.top_dst, 2 * x - 1, channels), lines.top_y[2 * x - 1], uv0);
-            storePixel(format, sub(lines.top_dst, 2 * x, channels), lines.top_y[2 * x], uv1);
+            const uv = (3 * top_left + left + 0x0002_0002) >> 2;
+            storePixel(format, lines.top_dst[0..channels], lines.top_y[0], uv);
         }
         if (lines.bottom_y) |bottom_y| {
-            const uv0 = (diag_03 + left) >> 1;
-            const uv1 = (diag_12 + cur) >> 1;
-            storePixel(format, sub(lines.bottom_dst.?, 2 * x - 1, channels), bottom_y[2 * x - 1], uv0);
-            storePixel(format, sub(lines.bottom_dst.?, 2 * x, channels), bottom_y[2 * x], uv1);
+            const uv = (3 * left + top_left + 0x0002_0002) >> 2;
+            storePixel(format, lines.bottom_dst.?[0..channels], bottom_y[0], uv);
         }
-        top_left = top;
-        left = cur;
     }
 
-    // An even width leaves a final right-edge pixel; mirror the last column.
+    // Interior pairs. Each output pair at columns (2x-1, 2x) is a pure stencil
+    // over chroma columns (x-1, x) — it never reads previously produced output
+    // — so it vectorizes. The SIMD path consumes whole chunks of the 4-channel
+    // formats and returns the first column it did not cover; the scalar loop
+    // (bit-identical, the authoritative reference) finishes the remainder and
+    // is the only path for 3-channel `rgb`.
+    var x: usize = 1;
+    // The SIMD store reinterprets a u32-per-pixel vector as bytes, which is
+    // little-endian specific; big-endian (untested per PLAN.MD) takes the
+    // scalar path, which is byte-for-byte the same.
+    if (comptime channels == 4 and native_endian == .little) {
+        x = upsampleInteriorSimd(format, lines, last_pixel_pair);
+    }
+    while (x <= last_pixel_pair) : (x += 1) {
+        upsampleInteriorPair(format, lines, x);
+    }
+
+    // An even width leaves a final right-edge pixel; mirror the last column
+    // (chroma column `last_pixel_pair`, the last one the loop touched).
     if (len & 1 == 0) {
+        const last = last_pixel_pair;
+        const top_left = loadUV(lines.top_u[last], lines.top_v[last]);
+        const left = loadUV(lines.cur_u[last], lines.cur_v[last]);
         {
             const uv = (3 * top_left + left + 0x0002_0002) >> 2;
             storePixel(format, sub(lines.top_dst, len - 1, channels), lines.top_y[len - 1], uv);
@@ -221,6 +224,175 @@ fn upsampleLinePair(comptime format: image.PixelFormat, len: usize, lines: LineP
             storePixel(format, sub(lines.bottom_dst.?, len - 1, channels), bottom_y[len - 1], uv);
         }
     }
+}
+
+// One interior output pair (scalar reference): columns (2x-1, 2x) from the 2x2
+// chroma neighbourhood at (x-1, x). Stateless — reads chroma[x-1] directly —
+// so it can resume after the SIMD path without carried state.
+inline fn upsampleInteriorPair(comptime format: image.PixelFormat, lines: LinePair, x: usize) void {
+    const channels: usize = comptime format.channelCount();
+    const top_left = loadUV(lines.top_u[x - 1], lines.top_v[x - 1]);
+    const left = loadUV(lines.cur_u[x - 1], lines.cur_v[x - 1]);
+    const top = loadUV(lines.top_u[x], lines.top_v[x]);
+    const cur = loadUV(lines.cur_u[x], lines.cur_v[x]);
+    const avg = top_left + top + left + cur + 0x0008_0008;
+    const diag_12 = (avg + 2 * (top + left)) >> 3;
+    const diag_03 = (avg + 2 * (top_left + cur)) >> 3;
+    {
+        const uv0 = (diag_12 + top_left) >> 1;
+        const uv1 = (diag_03 + top) >> 1;
+        storePixel(format, sub(lines.top_dst, 2 * x - 1, channels), lines.top_y[2 * x - 1], uv0);
+        storePixel(format, sub(lines.top_dst, 2 * x, channels), lines.top_y[2 * x], uv1);
+    }
+    if (lines.bottom_y) |bottom_y| {
+        const uv0 = (diag_03 + left) >> 1;
+        const uv1 = (diag_12 + cur) >> 1;
+        storePixel(format, sub(lines.bottom_dst.?, 2 * x - 1, channels), bottom_y[2 * x - 1], uv0);
+        storePixel(format, sub(lines.bottom_dst.?, 2 * x, channels), bottom_y[2 * x], uv1);
+    }
+}
+
+// --- SIMD interior upsampling (4-channel, little-endian) -------------------
+//
+// Every lane reproduces `upsampleInteriorPair` exactly: the chroma diamond is
+// integer add/shift, and the BT.601 matrix uses the same fixed-point `mulHi`
+// (>>8) and `clip8` (== clamp(value >> 6, 0, 255), since `yuv_fix2 == 6`) as
+// the scalar path. The output is therefore byte-identical to scalar — asserted
+// by the byte-exact corpus-hash gate and a fixed-input equivalence unit test.
+// Chroma `u`/`v` are kept in separate i32 lanes rather than the scalar packed
+// u32 trick (which only existed to do both channels at once on a scalar ALU).
+
+// Chroma columns processed per chunk; each yields twice as many output pixels.
+const simd_chroma_cols = 8;
+const simd_out_pixels = 2 * simd_chroma_cols;
+const ChromaVec = @Vector(simd_chroma_cols, i32);
+const PixelVec = @Vector(simd_out_pixels, i32);
+
+/// Processes whole `simd_chroma_cols`-column chunks of the interior pairs and
+/// returns the first chroma column the scalar loop must still cover.
+fn upsampleInteriorSimd(
+    comptime format: image.PixelFormat,
+    lines: LinePair,
+    last_pixel_pair: usize,
+) usize {
+    var x: usize = 1;
+    while (x + simd_chroma_cols - 1 <= last_pixel_pair) : (x += simd_chroma_cols) {
+        upsampleChunk(format, lines, x);
+    }
+    return x;
+}
+
+const Diagonals = struct { d12: ChromaVec, d03: ChromaVec };
+
+/// The two shared diagonals of the diamond filter for one chroma channel:
+/// `diag_12 = (avg + 2(t+l)) >> 3`, `diag_03 = (avg + 2(tl+c)) >> 3`, where
+/// `avg = tl + t + l + c + 8`.
+fn diamond(tl: ChromaVec, t: ChromaVec, l: ChromaVec, c: ChromaVec) Diagonals {
+    const one: @Vector(simd_chroma_cols, u5) = @splat(1);
+    const three: @Vector(simd_chroma_cols, u5) = @splat(3);
+    const avg = tl + t + l + c + @as(ChromaVec, @splat(8));
+    return .{
+        .d12 = (avg + ((t + l) << one)) >> three,
+        .d03 = (avg + ((tl + c) << one)) >> three,
+    };
+}
+
+fn upsampleChunk(comptime format: image.PixelFormat, lines: LinePair, x: usize) void {
+    const one: @Vector(simd_chroma_cols, u5) = @splat(1);
+
+    const tlu = loadChroma(lines.top_u, x - 1);
+    const tu = loadChroma(lines.top_u, x);
+    const lu = loadChroma(lines.cur_u, x - 1);
+    const cu = loadChroma(lines.cur_u, x);
+    const tlv = loadChroma(lines.top_v, x - 1);
+    const tv = loadChroma(lines.top_v, x);
+    const lv = loadChroma(lines.cur_v, x - 1);
+    const cv = loadChroma(lines.cur_v, x);
+
+    const du = diamond(tlu, tu, lu, cu);
+    const dv = diamond(tlv, tv, lv, cv);
+
+    // Top row: out (2x-1) = (diag_12 + top_left), out (2x) = (diag_03 + top).
+    {
+        const u = interleave((du.d12 + tlu) >> one, (du.d03 + tu) >> one);
+        const v = interleave((dv.d12 + tlv) >> one, (dv.d03 + tv) >> one);
+        convertAndStore(format, lines.top_dst, lines.top_y, 2 * x - 1, u, v);
+    }
+    // Bottom row: out (2x-1) = (diag_03 + left), out (2x) = (diag_12 + cur).
+    if (lines.bottom_y) |bottom_y| {
+        const u = interleave((du.d03 + lu) >> one, (du.d12 + cu) >> one);
+        const v = interleave((dv.d03 + lv) >> one, (dv.d12 + cv) >> one);
+        convertAndStore(format, lines.bottom_dst.?, bottom_y, 2 * x - 1, u, v);
+    }
+}
+
+/// Loads `simd_chroma_cols` bytes from `plane[off..]` widened to i32 lanes.
+fn loadChroma(plane: []const u8, off: usize) ChromaVec {
+    const bytes: @Vector(simd_chroma_cols, u8) = plane[off..][0..simd_chroma_cols].*;
+    return @intCast(bytes);
+}
+
+/// Interleaves two per-column vectors into output order [a0, b0, a1, b1, ...].
+fn interleave(a: ChromaVec, b: ChromaVec) PixelVec {
+    const mask = comptime blk: {
+        var m: [simd_out_pixels]i32 = undefined;
+        for (0..simd_chroma_cols) |k| {
+            m[2 * k] = @intCast(k);
+            m[2 * k + 1] = ~@as(i32, @intCast(k));
+        }
+        break :blk @as(@Vector(simd_out_pixels, i32), m);
+    };
+    return @shuffle(i32, a, b, mask);
+}
+
+/// `(value * coeff) >> 8`, the `mulHi` of the scalar path, per lane.
+fn mulHiVec(a: PixelVec, comptime coeff: i32) PixelVec {
+    return (a * @as(PixelVec, @splat(coeff))) >> @as(@Vector(simd_out_pixels, u5), @splat(8));
+}
+
+/// `clip8` per lane: descale by `yuv_fix2` (6) and clamp to [0, 255].
+fn clip8Vec(value: PixelVec) PixelVec {
+    const descaled = value >> @as(@Vector(simd_out_pixels, u5), @splat(yuv_fix2));
+    return @max(@min(descaled, @as(PixelVec, @splat(255))), @as(PixelVec, @splat(0)));
+}
+
+/// Converts `simd_out_pixels` (y, u, v) lanes to packed RGBA and stores them at
+/// `dst[start..]` (four bytes per pixel). `u`/`v` are upsampled chroma in
+/// [0,255]; `y_row[start..]` supplies luma.
+fn convertAndStore(
+    comptime format: image.PixelFormat,
+    dst: []u8,
+    y_row: []const u8,
+    start: usize,
+    u: PixelVec,
+    v: PixelVec,
+) void {
+    const y: PixelVec = blk: {
+        const bytes: @Vector(simd_out_pixels, u8) = y_row[start..][0..simd_out_pixels].*;
+        break :blk @intCast(bytes);
+    };
+
+    const r = clip8Vec(mulHiVec(y, 19077) + mulHiVec(v, 26149) - @as(PixelVec, @splat(14234)));
+    const g = clip8Vec(mulHiVec(y, 19077) - mulHiVec(u, 6419) - mulHiVec(v, 13320) + @as(PixelVec, @splat(8708)));
+    const b = clip8Vec(mulHiVec(y, 19077) + mulHiVec(u, 33050) - @as(PixelVec, @splat(17685)));
+
+    const ru: @Vector(simd_out_pixels, u32) = @intCast(r);
+    const gu: @Vector(simd_out_pixels, u32) = @intCast(g);
+    const bu: @Vector(simd_out_pixels, u32) = @intCast(b);
+    const opaque_alpha: @Vector(simd_out_pixels, u32) = @splat(255);
+    const eight: @Vector(simd_out_pixels, u5) = @splat(8);
+    const sixteen: @Vector(simd_out_pixels, u5) = @splat(16);
+    const twentyfour: @Vector(simd_out_pixels, u5) = @splat(24);
+
+    // Little-endian: a u32 `c0 | c1<<8 | c2<<16 | c3<<24` stores as bytes
+    // [c0, c1, c2, c3], matching `storePixel`'s channel order per format.
+    const packed_pixels = switch (format) {
+        .rgba => ru | (gu << eight) | (bu << sixteen) | (opaque_alpha << twentyfour),
+        .bgra => bu | (gu << eight) | (ru << sixteen) | (opaque_alpha << twentyfour),
+        .argb => opaque_alpha | (ru << eight) | (gu << sixteen) | (bu << twentyfour),
+        .rgb => comptime unreachable,
+    };
+    @memcpy(dst[start * 4 ..][0 .. simd_out_pixels * 4], std.mem.asBytes(&packed_pixels));
 }
 
 // Packs u into the low 16 bits and v into the high 16 bits of a u32.
@@ -757,6 +929,53 @@ test "pixel format selects channel order and opaque alpha" {
 // mirrors, the interior pair loop, and both odd dimensions. Strides are wider
 // than the visible region with the padding poisoned, so any stray read of the
 // macroblock padding would corrupt the result.
+test "SIMD rgba upsampling matches the scalar path byte-for-byte" {
+    // A width past the SIMD chunk threshold ((w-1)>>1 >= 8 ⇒ w >= 17), odd so
+    // the even-width tail is also exercised, and several rows so both the top
+    // and bottom diamond branches run. The `.rgb` format takes the scalar path
+    // (SIMD is 4-channel only), so its R/G/B must equal the `.rgba` SIMD path's
+    // — a non-circular check of the SIMD diamond, interleave, and store.
+    const width = 37;
+    const height = 5;
+    const chroma_width = (width + 1) / 2;
+    const chroma_height = (height + 1) / 2;
+    const luma_stride = width + 3;
+    const chroma_stride = chroma_width + 2;
+
+    var luma: [luma_stride * height]u8 = @splat(0);
+    var chroma_u: [chroma_stride * chroma_height]u8 = @splat(0);
+    var chroma_v: [chroma_stride * chroma_height]u8 = @splat(0);
+    for (0..height) |y| {
+        for (0..width) |x| luma[y * luma_stride + x] = @intCast((x * 7 + y * 29) & 0xff);
+    }
+    for (0..chroma_height) |y| {
+        for (0..chroma_width) |x| {
+            chroma_u[y * chroma_stride + x] = @intCast((x * 17 + y * 5) & 0xff);
+            chroma_v[y * chroma_stride + x] = @intCast((200 -% (x * 11 + y * 23)) & 0xff);
+        }
+    }
+
+    const planes = Planes{
+        .luma = &luma,
+        .chroma_u = &chroma_u,
+        .chroma_v = &chroma_v,
+        .luma_stride = luma_stride,
+        .chroma_stride = chroma_stride,
+        .width = width,
+        .height = height,
+    };
+
+    var rgba: [width * height * 4]u8 = undefined;
+    var rgb: [width * height * 3]u8 = undefined;
+    upsampleFancy(.rgba, planes, &rgba, width * 4);
+    upsampleFancy(.rgb, planes, &rgb, width * 3);
+
+    for (0..width * height) |i| {
+        try std.testing.expectEqualSlices(u8, rgb[i * 3 ..][0..3], rgba[i * 4 ..][0..3]);
+        try std.testing.expectEqual(@as(u8, 255), rgba[i * 4 + 3]);
+    }
+}
+
 test "a constant YUV field upsamples to a constant RGBA field" {
     const width = 5;
     const height = 3;

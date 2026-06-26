@@ -175,11 +175,33 @@ times libwebp's `dwebp`/`cwebp` over the same files for a same-machine ratio. Th
 dated 2026-06-26 baseline (see "Step 10 — Performance Work (slice 10a)" and the
 2026-06-26 oracle row) shows lossy decode at ≈2.0–2.5× single-threaded `dwebp`
 (inside the ≤3× scalar target) but small/medium VP8L lossless decode at
-≈2.8–5.6× (outside it) — so the optimization slices target the lossless decode
-path (prefix decode, inverse predictor/color transforms) and the lossy
-color-conversion / IDCT loops first. Timing is environment-dependent and stays a
-local report, not a CI gate. Threading is **not** in scope here (it remains
-future work; the targets are single-threaded).
+≈2.8–5.6× (outside it). Timing is environment-dependent and stays a local
+report, not a CI gate. Threading is **not** in scope here (it remains future
+work; the targets are single-threaded).
+
+**Slice 10b vectorizes the YUV→RGB color conversion** — the largest genuinely
+data-parallel hot loop in the lossy decode path. `color.upsampleLinePair`'s
+interior is a stencil over the chroma rows (no dependency on previously produced
+output), so the diamond upsample *and* the BT.601 matrix vectorize cleanly; an
+`@Vector` path (8 chroma columns → 16 pixels/chunk) now handles the 4-channel
+formats on little-endian, with the scalar path unchanged as the reference
+(boundaries, odd-width tail, 3-channel `rgb`, and big-endian). It is byte-exact
+(the corpus-hash gate plus a non-circular `.rgb`-scalar vs `.rgba`-SIMD
+equivalence test) and lifts aggregate lossy decode **1.11×** (763.6→690.2 ms on
+the corpus; up to 1.31× on conversion-heavy files), lossless unchanged (VP8L
+never calls it). See "Step 10 — Performance Work (slice 10b)" and the 2026-06-26
+oracle row.
+
+Honest scope note: scalar *micro-restructuring* of the inverse transforms (VP8L
+predictor/color, the IDCT DC-only fast path) was prototyped and **rejected** —
+under thermal-controlled A/B it only produced code-layout noise (≤±5%), because
+those stages are not the bottleneck (VP8L decode is entropy-bound and the
+Huffman path is already a fast multi-level table; lossy decode work is spread
+across boolean decode, reconstruction, the loop filter, and conversion). The
+SIMD conversion win above is real because it targets a loop that is both hot and
+parallel. The remaining lossless-decode gap vs `dwebp` is the serial entropy
+decoder, where libwebp's lead is SIMD/maturity that scalar Zig cannot match
+cleanly; that is documented as future work, not forced.
 
 ## Cross-Cutting Practices
 
@@ -225,6 +247,38 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 10 — Performance Work (slice 10b: SIMD color conversion)
+
+Slice 10b is the first optimization slice: an `@Vector` implementation of the
+YUV→RGB **fancy upsampling + BT.601 conversion** (`src/color.zig`), the largest
+data-parallel hot loop in lossy decode. The key enabler: `upsampleLinePair`'s
+interior output pair at columns `(2x-1, 2x)` is a pure stencil over chroma
+columns `(x-1, x)` and never reads previously produced output, so it has no
+serial dependency. The interior was first made stateless (`upsampleInteriorPair`
+reads `chroma[x-1]` directly instead of carrying it), then a SIMD path
+(`upsampleInteriorSimd`/`upsampleChunk`, 8 chroma columns → 16 output pixels per
+chunk) computes the diamond filter and the conversion in `@Vector(16, i32)`
+lanes and stores a packed-`u32`-per-pixel vector. It runs for the 4-channel
+formats on little-endian; the scalar path (unchanged, the reference) handles the
+first/last/odd-width-tail pixels, `rgb`, and big-endian.
+
+Bit-exactness: the BT.601 lanes use the same fixed-point `mulHi` (`>>8`) and the
+identity `clip8(v) == clamp(v >> 6, 0, 255)` (since `yuv_fix2 == 6`), and the
+diamond keeps `u`/`v` in separate i32 lanes (the scalar packed-`u32` trick was
+only a scalar-ALU convenience). Verified by the committed corpus-hash gate (88
+lossy stills decode byte-for-byte vs the libwebp-correct hashes, most at
+SIMD-triggering widths) plus a new non-circular unit test: a wide image's `.rgb`
+output (forced scalar — SIMD is 4-channel only) equals the `.rgba` SIMD path's
+R/G/B, catching any diamond/interleave/store-layout bug independent of the
+formula.
+
+Measured (ReleaseFast, i5-13450HX, single thread, thermal-controlled interleaved
+A/B vs `main`): **aggregate lossy decode 1.11×** (763.6→690.2 ms over the lossy
+corpus), up to **1.31×** on conversion-heavy files (`vp80-00-comprehensive-008`)
+and **1.2×** on lossy+alpha; lossless decode unchanged (1.02×, noise — VP8L emits
+ARGB directly and never calls this path). `zig build test` green; `zig fmt`
+clean. See the 2026-06-26 (slice 10b) oracle row.
 
 ### Step 10 — Performance Work (slice 10a: baseline harness)
 
@@ -940,6 +994,8 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-23 | Animation frame optimization (slice 9c) byte-exact lossless round-trip + `anim_dump` parity; ≈8% lossless reduction vs naive | New `animation_optimize.encodeAnimationMinimized` (public `encodeAnimationMinimized`, module `src/animation_optimize.zig`) takes full-canvas frames + timing + per-frame codec and auto-derives a minimal `ANMF` layout that composites back to exactly those frames: **sub-rectangle detection** (minimal bounding box vs the decoder's reconstructed previous canvas, even-snapped), **inter-frame differencing + blend strategy** (equal-to-prev pixels made transparent under `alpha_blend` when it provably reconstructs exactly — every changed pixel fully opaque — else verbatim `replace`), **dispose** (one-frame lookahead picks background when it shrinks the next diff rect), and **keyframe insertion** (frame 0, any full-canvas change, bounded `keyframe_interval`). Reuses the 9b per-frame encoder via one narrow hook (`encodeFrameForOptimizer`) and the 9a mux. Correctness key: the optimizer tracks the decoder's **reconstructed** canvas — re-decoding each frame it emits and compositing with the exact `animation_decode` rules (transparent-RGB zeroing, source-over non-premultiplied blend, previous background-disposed-rect skip) — so lossy error never accumulates. **CI hard gate (byte-exact lossless round-trip), `zig build test`, 394/394 pass, +11 new:** all-lossless minimized animations decode byte-for-byte back to the input canvases across a static-background-with-moving-sub-region (asserted via `demux` to actually shrink at least one `ANMF` rect below the canvas), a degenerate identical frame (1×1 rect), a full-canvas change (forced keyframe), a transparency-reveal (replace fallback), a blend+dispose multi-frame sequence, and a forced keyframe interval (frames 0/2/4 full-canvas at interval 2); a lossy minimized animation decodes at the right dims; allocation failure survived at every site. **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim`** on two minimized 96×64 6-frame samples (`testdata/animation/anim_minimized_lossless.webp`, `testdata/animation/anim_minimized_lossy.webp`) — `anim_dump` matches this library's composition byte-for-byte across all 6 frames each (compared=2, failed=0), and `webpinfo` reports "No error detected" for both. **Compression (reported, not gated):** minimized lossless 3840 B vs naive `encodeAnimationFromBuffers` 4174 B (8.0% smaller, sub-rect frames 28×28/28×40); minimized lossy byte-identical to naive (7942 B, 0%) — VP8 reconstruction differs almost everywhere so the exact diff rect is full-canvas every frame, a deliberate correctness-first choice (libwebp's quality-tolerance lossy shrink is future work). Step 9 is now feature-complete; the ≥2-browser render check is set up (the two `testdata/animation/`) but manual and not in CI. |
 | 2026-06-23 | Lossy animation frame optimization (slice 9c-2) shrinks lossy sub-rects, PSNR within tolerance of naive, ≈48% smaller | Extends `animation_optimize.encodeAnimationMinimized` so **lossy** frames are inter-frame optimized instead of emitted as full-canvas keyframes. The change rect is now detected against a **source-quality carryover** canvas (the original input pixels carried frame to frame, dispose clears applied — mirroring libwebp's `canvas_carryover`), not the noisy reconstruction, so VP8 noise (which 9c's exact diff flagged almost everywhere → full-canvas every frame) no longer inflates the rect. A pixel counts as unchanged via a per-channel content-change tolerance `T` (libwebp's `PixelsAreSimilar`: alpha must match, each RGB channel diff alpha-weighted ≤ `T·255`). New `AnimationMinimizeOptions.tolerance: ?u8 = null` defaults to a quality-derived value (`qualityToMaxDiff`, libwebp's `QualityToMaxDiff`: 31 at q=0, ≈5 at q=75, 1 at q=100); lossless frames force `T = 0` (exact) with a carryover equal to the reconstruction, so the byte-exact lossless path is **unchanged**. The blend/transparent path stays lossless-only (lossy sub-rects are always verbatim `replace`); inherited regions come from the previous decoded frame and drift is bounded by `keyframe_interval`. **CI gates, `zig build test`, 398/398 pass, +4 new:** the 9c all-lossless byte-exact round-trips still pass unchanged (hard lossless gate); a lossy 64×48 5-frame moving-region animation shrinks ≥1 `ANMF` rect below the canvas (asserted via `demux`) and decodes valid; the optimized lossy mean luma PSNR (`src/testing/metrics.zig`, vs the source) stays within **0.5 dB** of the naive `encodeAnimationFromBuffers` full-canvas encode and the optimized stream is strictly smaller; `qualityToMaxDiff`/`pixelsSimilar` unit-checked at reference points; allocation failure survived at every site (now three carryover buffers). **Gate (local, libwebp 1.5.0): `tools/webp-oracle.sh compare-anim`** on a generated 96×64 8-frame lossy minimized sample — `anim_dump` matches this library's composition byte-for-byte across all 8 frames (compared=1, failed=0), and `webpinfo` reports "No error detected" (frame 0 a full-canvas keyframe, frames 1–7 shrunk to 22×22 sub-rects). **Compression (reported):** lossy minimized **1390 B vs naive 2680 B (48.1% smaller)** at q=75, mean luma PSNR **45.96 vs 45.82 dB (+0.14 dB, not a loss** — the inherited gradient is quantized once at the keyframe rather than re-noised each frame). Tolerance chosen: ≤0.5 dB below naive, justified because the only quality difference is inherited (non-rect) regions carrying the previous frame's lossy values; the measured delta is comfortably positive. Closes 9c's "lossy = full-canvas keyframes, future work" caveat. |
 | 2026-06-26 | Performance baseline (slice 10a) via new `zig build bench`; scalar decode/encode throughput + same-machine libwebp ratio | New `tools/zig-webp-bench.zig` (`zig build bench`) times the public `decodeStatic`/`decodeAnimation`/`encodeLossless`/`encodeLossy` entry points **in memory** (no file I/O), reporting the median of repeated timed runs (via the `std.Io` monotonic clock) with a per-measurement time budget, over `testdata/` asset classes (decode: icon/photo/large/alpha/animation; encode: synthetic matrix + 4 CC0 photos). No codec change — pure measurement; correctness stays with `zig build test` (committed-hash regression + encoder self-consistency), which the harness assumes. An optional `tools/webp-bench.sh` times `dwebp`/`cwebp` over the same files (graceful SKIP when absent, never a build dependency). **Baseline (ReleaseFast, 13th Gen Intel Core i5-13450HX, single thread, libwebp 1.5.0; 213 rows):** decode pixel-weighted aggregate ≈39 MP/s lossy, ≈28 MP/s lossless. Same-machine vs single-threaded `dwebp` (our min ÷ `dwebp` min; `dwebp` also formats PAM output, so indicative not exact): lossy `bryce` 11158×2156 **2.5×**, `lossy_extreme` 800×534 **2.0×**; lossless `lossless_big_random_alpha` 2048² **1.8×**, `lossless_color_transform` 512² **2.8×**, `photo_foliage` 512×342 (lossless) **5.6×**. Encode vs `cwebp` on `photo_foliage`: lossless 125 ms vs 88 ms (**1.4×**), lossy q75 22 ms vs 12 ms (**1.8×**). Read honestly: lossy decode and large lossless are inside the ≤3× single-threaded scalar target; small/medium VP8L lossless decode (2.8–5.6×) is the miss and the priority for 10b/10c; the encoder is already competitive. Timing is environment-dependent and **not** a CI gate. `zig build test` unchanged; `zig build check` compiles the tool. |
+
+| 2026-06-26 | SIMD YUV→RGB color conversion (slice 10b): 1.11× lossy decode, byte-exact | `@Vector` rewrite of `color.upsampleLinePair`'s interior (fancy chroma upsample + BT.601 conversion), the largest data-parallel hot loop in lossy decode. Each output pair is a stencil over chroma columns `(x-1, x)` with no dependency on prior output, so it vectorizes; an 8-chroma-column (16-pixel) chunk computes the diamond and conversion in `@Vector(16, i32)` lanes and stores a packed-`u32`-per-pixel vector, for the 4-channel formats on little-endian. The scalar path is unchanged and remains the reference for boundaries, odd-width tail, `rgb`, and big-endian. **Bit-exact (CI gate, `zig build test`):** the committed corpus-hash regression (88 lossy stills → byte-for-byte vs libwebp-correct hashes, most at SIMD widths) still passes, plus a new non-circular equivalence test (wide-image `.rgb` scalar output == `.rgba` SIMD output for R/G/B). **Speed (local, thermal-controlled interleaved A/B vs `main`, ReleaseFast, i5-13450HX, single thread):** aggregate lossy decode **1.11×** (763.6→690.2 ms over the lossy corpus), up to **1.31×** on conversion-heavy files and ~1.2× on lossy+alpha; lossless decode unchanged (1.02×, noise — VP8L never calls this path). Reduces the `bryce` lossy-decode ratio vs single-threaded `dwebp` from ≈2.5× to ≈2.3×. Honest note: scalar micro-restructuring of the inverse transforms / IDCT DC fast-path was prototyped and rejected as code-layout noise (those stages aren't the bottleneck); the remaining lossless gap is the serial entropy decoder (already a fast multi-level Huffman table), documented as future work. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
