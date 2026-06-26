@@ -1,14 +1,16 @@
 .{
     .name = .zig_webp,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x5614d508c6f31e1d,
     .dependencies = .{},
     .paths = .{
         "AGENTS.MD",
+        "CHANGELOG.MD",
         "PLAN.MD",
         "PROGRESS.MD",
         "README.MD",
+        "RELEASING.MD",
         "build.zig",
         "build.zig.zon",
         "references/README.MD",

@@ -3,6 +3,10 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
+Version `0.1.0` (preview; the public API is not yet frozen). See
+[`CHANGELOG.MD`](CHANGELOG.MD) for the release scope and
+[`RELEASING.MD`](RELEASING.MD) for the release gates and how each is checked.
+
 Status: static decode is complete for lossless (VP8L), lossy (VP8), and ALPH
 alpha, all matching `dwebp` byte-for-byte on the local `libwebp-test-data`
 corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
