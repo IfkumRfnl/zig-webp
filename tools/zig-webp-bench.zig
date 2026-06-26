@@ -41,6 +41,7 @@
 //! stderr either way.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const webp = @import("webp");
 const cli = @import("cli_common");
 
@@ -367,6 +368,10 @@ fn benchEncodeBuffer(
     const width = buffer.dimensions.width;
     const height = buffer.dimensions.height;
     const pixels = @as(u64, width) * height;
+    // The encoders only emit an ALPH chunk (and run the alpha path) when the
+    // source actually carries transparency, so label the row by that, not by
+    // whether the format merely has an alpha channel.
+    const alpha = bufferHasTransparency(buffer);
 
     // Encoded size is informative for an encode benchmark, so re-encode once
     // (untimed) to capture it.
@@ -376,7 +381,7 @@ fn benchEncodeBuffer(
         break :blk out.len;
     };
     const lossless = try timeMedian(ctx.io, config, EncodeLosslessCtx{ .gpa = ctx.gpa, .buffer = buffer });
-    try writeRow(writer, stats, asset_class, name, "encode-lossless", "lossless", false, width, height, pixels, lossless, lossless_bytes);
+    try writeRow(writer, stats, asset_class, name, "encode-lossless", "lossless", alpha, width, height, pixels, lossless, lossless_bytes);
 
     const lossy_bytes = blk: {
         const out = try webp.encodeLossy(ctx.gpa, buffer, .{ .format = .lossy, .quality = lossy_quality, .limits = bench_limits });
@@ -384,7 +389,30 @@ fn benchEncodeBuffer(
         break :blk out.len;
     };
     const lossy = try timeMedian(ctx.io, config, EncodeLossyCtx{ .gpa = ctx.gpa, .buffer = buffer });
-    try writeRow(writer, stats, asset_class, name, "encode-lossy", "lossy", false, width, height, pixels, lossy, lossy_bytes);
+    try writeRow(writer, stats, asset_class, name, "encode-lossy", "lossy", alpha, width, height, pixels, lossy, lossy_bytes);
+}
+
+/// True when `buffer` has an alpha channel and at least one pixel is not fully
+/// opaque — the condition under which the encoders run the alpha path.
+fn bufferHasTransparency(buffer: webp.ImageBuffer) bool {
+    const channels: usize = buffer.format.channelCount();
+    const alpha_offset: usize = switch (buffer.format) {
+        .rgb => return false,
+        .rgba, .bgra => 3,
+        .argb => 0,
+    };
+    const width: usize = buffer.dimensions.width;
+    const height: usize = buffer.dimensions.height;
+    const stride: usize = buffer.stride;
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const row = buffer.pixels[y * stride ..][0 .. width * channels];
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            if (row[x * channels + alpha_offset] != 255) return true;
+        }
+    }
+    return false;
 }
 
 // --- Argument parsing + main ----------------------------------------------
@@ -401,6 +429,12 @@ const usage =
 
 pub fn main(init: std.process.Init) !void {
     const ctx = try cli.Cli.init(init);
+
+    // Debug builds are instrumented and several times slower; their timings are
+    // not comparable to the committed ReleaseFast baseline, so warn loudly.
+    if (builtin.mode == .Debug) {
+        try ctx.writeStderr("bench: warning: built in Debug; rebuild with `-Doptimize=ReleaseFast` for meaningful timings.\n");
+    }
 
     var config = Config{};
     var output_path: ?[]const u8 = null;
