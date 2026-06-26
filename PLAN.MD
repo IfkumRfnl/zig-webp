@@ -171,7 +171,8 @@ src/vp8l/prefix_groups.zig
 src/testing.zig
 src/testing/corpus.zig
 src/testing/fuzz.zig
-src/testing/metrics.zig    (planned: step 10)
+src/testing/metrics.zig
+tools/zig-webp-bench.zig   (step 10 benchmark harness)
 ```
 
 Fuzz targets live alongside the tests of the module they exercise, using
@@ -321,18 +322,33 @@ library's own composition, and render in at least two major browsers.
 - Benchmark decode and encode separately for small icons, photos, alpha-heavy
   UI assets, large images, and animations.
 - Working targets, revised only with recorded data: scalar decode within 3x
-  single-threaded `libwebp` on the benchmark set, within 1.5x after Zig
-  vector work. Encode targets are set once 8b lands and quality/speed
-  tradeoffs are measurable.
+  single-threaded `libwebp` on the benchmark set. The original "within 1.5x
+  after Zig vector work" target is **revised** with recorded data (see
+  `PROGRESS.MD`): it holds as a direction for the conversion-dominated lossy
+  path with further SIMD, but not for the lossless path, whose cost is the
+  serial entropy decoder (an already-optimized multi-level Huffman/LZ77 table)
+  where the remaining gap is a SIMD/maturity difference vs `libwebp` rather than
+  a missing scalar optimization; it is a direction, not a release gate. Encode
+  targets are set once 8b lands and quality/speed tradeoffs are measurable.
 - Add cache-aware hot loops for transforms, prediction, color conversion, and
   filters.
 - Add optional Zig vectorized implementations behind clean module boundaries.
 - Consider row or tile parallelism only after deterministic scalar behavior
   is locked down.
 
-Deliverable: dated performance reports against `libwebp`, `image-webp`, and
-selected pure-Go references, following the honest-benchmarking rules in
-`AGENTS.md`.
+Deliverable: dated performance reports following the honest-benchmarking rules
+in `AGENTS.md`. The gating comparison is against `libwebp` (the conformance
+oracle and the same-lineage SIMD baseline this library is measured against),
+recorded same-machine via `tools/webp-bench.sh`. Comparisons against
+`image-webp` (Rust) and the pure-Go references are **optional supplementary
+reports**, deferred: they are independent-implementation references, not the
+authoritative baseline, and timing them needs external Rust/Go toolchains that
+are not part of this project's environment; they can be run later without
+reopening the step.
+
+Step 10 is delivered. The dated baseline, the vectorized color-conversion result
+and its measured speedup, the rejected experiments, and the future levers are
+recorded in `PROGRESS.MD` (this section stays forward-looking per `AGENTS.md`).
 
 ### 11. Robustness Hardening
 
@@ -440,10 +456,13 @@ one large codec file that is difficult to audit or optimize.
 With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
 delivered, **step 9 (animation and metadata encode) is now feature-complete**
 (9a container mux, 9b pixel-buffer encode, 9c frame optimization, 9d still
-metadata). The remaining roadmap is step 10 (performance), step 11 (robustness
-hardening), and step 12 (public API and release criteria); the only open step-9
-item is the manual ≥2-browser render confirmation, which is set up (see below)
-but intentionally not in CI.
+metadata), and **step 10 (performance) is now delivered**: a benchmark harness +
+scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
+lossy decode, byte-exact); the dated results, the revised target, and the honest
+findings are recorded in `PROGRESS.MD`. The remaining roadmap is step
+11 (robustness hardening) and step 12 (public API and release criteria); the
+only open step-9 item is the manual ≥2-browser render confirmation, which is set
+up (see below) but intentionally not in CI.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
