@@ -94,10 +94,13 @@ for f in "${files[@]}"; do
 
   d="-"; cl="-"; cq="-"
   if is_animation "$f"; then
-    # Animation: time the libwebp animation decoder; re-encode is not an
-    # apples-to-apples single-image comparison, so leave the cwebp columns n/a.
+    # Animation: time the libwebp animation decoder. Pass -pam so it writes raw
+    # PAM frames; without it anim_dump defaults to PNG output, whose compression
+    # cost would inflate decode_ms vs the still path's `dwebp -pam` and the Zig
+    # benchmark's in-memory decode. Re-encode is not an apples-to-apples
+    # single-image comparison, so leave the cwebp columns n/a.
     if has_tool anim_dump; then
-      d=$(min_ms anim_dump -folder "$tmp_dir" "$f")
+      d=$(min_ms anim_dump -pam -folder "$tmp_dir" "$f")
     fi
   else
     if has_tool dwebp; then
