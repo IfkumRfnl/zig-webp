@@ -117,6 +117,14 @@ pub fn build(b: *std.Build) void {
             .description = "Re-encode a still WebP as a lossy (VP8) WebP",
             .install = true,
         },
+        .{
+            .name = "zig-webp-bench",
+            .source = "tools/zig-webp-bench.zig",
+            .step = "bench",
+            .description = "Benchmark decode/encode throughput over the testdata asset classes",
+            .install = false,
+            .cwd_repo_root = true,
+        },
     };
 
     const check_step = b.step("check", "Compile the library and tools");
