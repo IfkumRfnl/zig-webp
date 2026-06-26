@@ -171,7 +171,8 @@ src/vp8l/prefix_groups.zig
 src/testing.zig
 src/testing/corpus.zig
 src/testing/fuzz.zig
-src/testing/metrics.zig    (planned: step 10)
+src/testing/metrics.zig
+tools/zig-webp-bench.zig   (step 10 benchmark harness)
 ```
 
 Fuzz targets live alongside the tests of the module they exercise, using
@@ -334,6 +335,29 @@ Deliverable: dated performance reports against `libwebp`, `image-webp`, and
 selected pure-Go references, following the honest-benchmarking rules in
 `AGENTS.md`.
 
+Status (delivered; see `PROGRESS.MD` for the dated rows). The benchmark harness
+(`zig build bench` + `tools/webp-bench.sh`) and a scalar baseline are in place,
+and the one large data-parallel decode hot loop — YUV→RGB fancy upsampling +
+conversion — is vectorized (`@Vector`), lifting aggregate lossy decode ≈1.11×
+byte-exactly. Recorded outcome against the working targets: scalar lossy decode
+is **within ≈2.0–2.5× single-threaded `dwebp`** (and ≈2.3× after the SIMD win),
+inside the ≤3× target; **lossless decode is the part outside it** (≈1.8× large,
+up to ≈5.6× small), and is entropy-bound — its serial Huffman/LZ77 core is
+already a fast multi-level table, so closing the gap is fundamentally a
+SIMD/maturity difference vs `libwebp` rather than a missing scalar optimization.
+The ≤1.5× "after vector work" target is therefore **revised**: it is realistic
+for the conversion-dominated lossy path with further SIMD, not for the
+serial-entropy lossless path, and is not a release gate. Honest negative results
+worth keeping: scalar micro-restructuring of the inverse transforms and an IDCT
+DC-only fast path were measured (thermal-controlled A/B) and **rejected** as
+code-layout noise; SIMD subtract-green is likewise below the noise floor (small
+post-pass vs entropy). Remaining levers, deferred as future work: SIMD loop
+filter (the next-largest lossy lever, a high-effort `libwebp`-parity DSP item),
+SIMD/restructured entropy decode, row/tile threading (the targets above are
+single-threaded), and `image-webp`/pure-Go comparison runs. The `image.zig`
+`metrics`/bench tooling and the byte-exact corpus gate make any future
+optimization measurable and safe.
+
 ### 11. Robustness Hardening
 
 Fuzzing and limits checks run continuously (see Cross-Cutting Practices);
@@ -440,10 +464,13 @@ one large codec file that is difficult to audit or optimize.
 With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
 delivered, **step 9 (animation and metadata encode) is now feature-complete**
 (9a container mux, 9b pixel-buffer encode, 9c frame optimization, 9d still
-metadata). The remaining roadmap is step 10 (performance), step 11 (robustness
-hardening), and step 12 (public API and release criteria); the only open step-9
-item is the manual ≥2-browser render confirmation, which is set up (see below)
-but intentionally not in CI.
+metadata), and **step 10 (performance) is now delivered**: a benchmark harness +
+scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
+lossy decode, byte-exact), with the honest findings and revised targets recorded
+in the step-10 status above and in `PROGRESS.MD`. The remaining roadmap is step
+11 (robustness hardening) and step 12 (public API and release criteria); the
+only open step-9 item is the manual ≥2-browser render confirmation, which is set
+up (see below) but intentionally not in CI.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
