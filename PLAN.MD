@@ -325,11 +325,12 @@ library's own composition, and render in at least two major browsers.
   single-threaded `libwebp` on the benchmark set. The original "within 1.5x
   after Zig vector work" target is **revised** with recorded data (see
   `PROGRESS.MD`): it holds as a direction for the conversion-dominated lossy
-  path with further SIMD, but not for the lossless path, whose cost is the
-  serial entropy decoder (an already-optimized multi-level Huffman/LZ77 table)
-  where the remaining gap is a SIMD/maturity difference vs `libwebp` rather than
-  a missing scalar optimization; it is a direction, not a release gate. Encode
-  targets are set once 8b lands and quality/speed tradeoffs are measurable.
+  path with further SIMD/cache-aware work, but not for the lossless path, whose
+  cost is the serial entropy decoder (an already-optimized multi-level
+  Huffman/LZ77 table) where the remaining gap is a SIMD/maturity difference vs
+  `libwebp` rather than a missing scalar optimization; it is a direction, not a
+  release gate. Encode targets are set once 8b lands and quality/speed tradeoffs
+  are measurable.
 - Add cache-aware hot loops for transforms, prediction, color conversion, and
   filters.
 - Add optional Zig vectorized implementations behind clean module boundaries.
@@ -346,9 +347,10 @@ authoritative baseline, and timing them needs external Rust/Go toolchains that
 are not part of this project's environment; they can be run later without
 reopening the step.
 
-Step 10 is delivered. The dated baseline, the vectorized color-conversion result
-and its measured speedup, the rejected experiments, and the future levers are
-recorded in `PROGRESS.MD` (this section stays forward-looking per `AGENTS.md`).
+Step 10 is delivered. The dated baseline, the vectorized color-conversion
+result, the VP8 boolean-reader renormalization result, the rejected experiments,
+and the future levers are recorded in `PROGRESS.MD` (this section stays
+forward-looking per `AGENTS.md`).
 
 ### 11. Robustness Hardening
 

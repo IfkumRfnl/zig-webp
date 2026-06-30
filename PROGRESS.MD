@@ -166,19 +166,21 @@ the 9c-2 2026-06-23 oracle rows. The ≥2-browser render check is set up via two
 `testdata/animation/` animations and remains the only open (manual, non-CI) step-9 item.
 
 **Step 10 (performance work) is delivered.** It comprises the benchmark harness
-+ scalar baseline (slice 10a) and one vectorized hot loop — the YUV→RGB color
-conversion (slice 10b, ≈1.11× lossy decode, byte-exact). The honest summary:
-scalar lossy decode is within the ≤3× single-threaded `dwebp` target (≈2.3×
-after the SIMD win); lossless decode is the part outside it and is entropy-bound
-(a serial, already-table-optimized Huffman/LZ77 core), so the gap is a
-SIMD/maturity difference vs `libwebp` rather than a missing scalar optimization,
-and the ≤1.5× "after vector work" target is revised accordingly (realistic for
-the conversion-dominated lossy path with more SIMD, not for serial-entropy
-lossless; not a gate). Measured-and-rejected as code-layout noise (thermal-
-controlled A/B): scalar micro-restructuring of the inverse transforms, an IDCT
-DC-only fast path, and SIMD subtract-green — all small/serial relative to the
-bottleneck. Future levers (deferred): SIMD loop filter (the next-largest lossy
-lever), SIMD/restructured entropy decode, row/tile threading, and
+and scalar baseline (slice 10a), vectorized YUV→RGB color conversion (slice 10b,
+≈1.11× lossy decode, byte-exact), and table-driven VP8 boolean-reader
+renormalization (slice 10c, ≈1.20× lossy decode on the local corpus). The honest
+summary: scalar lossy decode is within the ≤3× single-threaded `dwebp` target
+and is now much closer to the original 1.5× direction on large VP8 stills
+(`bryce` measured ≈1.65× vs local `dwebp -pam`, down from ≈1.96× on this
+machine); lossless decode is still the part outside it and is entropy-bound (a
+serial, already-table-optimized Huffman/LZ77 core), so the lossless gap remains
+a SIMD/maturity difference vs `libwebp` rather than a missing scalar
+optimization. The ≤1.5× "after vector work" target remains a direction, not a
+release gate. Measured-and-rejected as code-layout noise or regression:
+scalar micro-restructuring of the inverse transforms, an IDCT DC-only fast path,
+SIMD subtract-green, scalar loop-filter index reshaping, and a dedicated
+even-probability `readBit` path. Future levers (deferred): SIMD/lookup-table
+loop filter, further entropy specialization, row/tile threading, and
 `image-webp`/pure-Go comparison runs. The harness + byte-exact corpus gate keep
 all of it measurable and safe. Detail follows.
 
@@ -208,16 +210,29 @@ the corpus; up to 1.31× on conversion-heavy files), lossless unchanged (VP8L
 never calls it). See "Step 10 — Performance Work (slice 10b)" and the 2026-06-26
 oracle row.
 
+**Slice 10c speeds VP8 boolean-reader renormalization** — the entropy hot path
+shared by VP8 mode parsing and coefficient token decode. The old reader
+renormalized one shift at a time after each bool; the new path uses a
+compile-time 128-entry shift-count table and performs the full shift/load in one
+bounded step. Bitstream semantics are unchanged (same split, same lazy
+truncation behavior), and the committed corpus-hash gate stays byte-exact.
+Measured locally (ReleaseFast, single thread, same harness as 10a/10b): aggregate
+lossy decode **1.20×** (699.5→583.3 ms over 88 lossy stills on this machine);
+`bryce` **563.1→475.5 ms**, `vp80-00-comprehensive-008` **10.03→8.84 ms**, and
+`lossy_extreme_probabilities` **15.6→9.8 ms**. Lossless decode is effectively
+unchanged because VP8L uses its own Huffman reader. Rejected during the same
+investigation: scalar loop-filter index reshaping (byte-exact but no measurable
+gain) and a dedicated probability-128 `readBit` path (slightly slower).
+
 Honest scope note: scalar *micro-restructuring* of the inverse transforms (VP8L
 predictor/color, the IDCT DC-only fast path) was prototyped and **rejected** —
 under thermal-controlled A/B it only produced code-layout noise (≤±5%), because
-those stages are not the bottleneck (VP8L decode is entropy-bound and the
-Huffman path is already a fast multi-level table; lossy decode work is spread
-across boolean decode, reconstruction, the loop filter, and conversion). The
-SIMD conversion win above is real because it targets a loop that is both hot and
-parallel. The remaining lossless-decode gap vs `dwebp` is the serial entropy
-decoder, where libwebp's lead is SIMD/maturity that scalar Zig cannot match
-cleanly; that is documented as future work, not forced.
+those stages are not the bottleneck. The SIMD conversion and boolean-reader
+wins above are real because they target loops that are hot across the lossy
+corpus. The remaining large lossy levers are the scalar loop filter and row
+pipeline/cache locality; the remaining lossless-decode gap vs `dwebp` is the
+serial VP8L entropy decoder, where libwebp's lead is SIMD/maturity that scalar
+Zig cannot match cleanly; that is documented as future work, not forced.
 
 ## Cross-Cutting Practices
 
@@ -1012,6 +1027,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-26 | Performance baseline (slice 10a) via new `zig build bench`; scalar decode/encode throughput + same-machine libwebp ratio | New `tools/zig-webp-bench.zig` (`zig build bench`) times the public `decodeStatic`/`decodeAnimation`/`encodeLossless`/`encodeLossy` entry points **in memory** (no file I/O), reporting the median of repeated timed runs (via the `std.Io` monotonic clock) with a per-measurement time budget, over `testdata/` asset classes (decode: icon/photo/large/alpha/animation; encode: synthetic matrix + 4 CC0 photos). No codec change — pure measurement; correctness stays with `zig build test` (committed-hash regression + encoder self-consistency), which the harness assumes. An optional `tools/webp-bench.sh` times `dwebp`/`cwebp` over the same files (graceful SKIP when absent, never a build dependency). **Baseline (ReleaseFast, 13th Gen Intel Core i5-13450HX, single thread, libwebp 1.5.0; 213 rows):** decode pixel-weighted aggregate ≈39 MP/s lossy, ≈28 MP/s lossless. Same-machine vs single-threaded `dwebp` (our min ÷ `dwebp` min; `dwebp` also formats PAM output, so indicative not exact): lossy `bryce` 11158×2156 **2.5×**, `lossy_extreme` 800×534 **2.0×**; lossless `lossless_big_random_alpha` 2048² **1.8×**, `lossless_color_transform` 512² **2.8×**, `photo_foliage` 512×342 (lossless) **5.6×**. Encode vs `cwebp` on `photo_foliage`: lossless 125 ms vs 88 ms (**1.4×**), lossy q75 22 ms vs 12 ms (**1.8×**). Read honestly: lossy decode and large lossless are inside the ≤3× single-threaded scalar target; small/medium VP8L lossless decode (2.8–5.6×) is the miss and the priority for 10b/10c; the encoder is already competitive. Timing is environment-dependent and **not** a CI gate. `zig build test` unchanged; `zig build check` compiles the tool. |
 
 | 2026-06-26 | SIMD YUV→RGB color conversion (slice 10b): 1.11× lossy decode, byte-exact | `@Vector` rewrite of `color.upsampleLinePair`'s interior (fancy chroma upsample + BT.601 conversion), the largest data-parallel hot loop in lossy decode. Each output pair is a stencil over chroma columns `(x-1, x)` with no dependency on prior output, so it vectorizes; an 8-chroma-column (16-pixel) chunk computes the diamond and conversion in `@Vector(16, i32)` lanes and stores a packed-`u32`-per-pixel vector, for the 4-channel formats on little-endian. The scalar path is unchanged and remains the reference for boundaries, odd-width tail, `rgb`, and big-endian. **Bit-exact (CI gate, `zig build test`):** the committed corpus-hash regression (88 lossy stills → byte-for-byte vs libwebp-correct hashes, most at SIMD widths) still passes, plus a new non-circular equivalence test (wide-image `.rgb` scalar output == `.rgba` SIMD output for R/G/B). **Speed (local, thermal-controlled interleaved A/B vs `main`, ReleaseFast, i5-13450HX, single thread):** aggregate lossy decode **1.11×** (763.6→690.2 ms over the lossy corpus), up to **1.31×** on conversion-heavy files and ~1.2× on lossy+alpha; lossless decode unchanged (1.02×, noise — VP8L never calls this path). Reduces the `bryce` lossy-decode ratio vs single-threaded `dwebp` from ≈2.5× to ≈2.3×. Honest note: scalar micro-restructuring of the inverse transforms / IDCT DC fast-path was prototyped and rejected as code-layout noise (those stages aren't the bottleneck); the remaining lossless gap is the serial entropy decoder (already a fast multi-level Huffman table), documented as future work. |
+| 2026-06-26 | VP8 boolean-reader renormalization (slice 10c): 1.20× lossy decode, byte-exact | Replaces the VP8 bool reader's one-shift-at-a-time renormalization loop with a compile-time 128-entry shift-count table plus one bulk shift/load step. The arithmetic split and lazy truncation behavior are unchanged; this only removes per-bit loop overhead in the entropy hot path used by mode parsing and coefficient token decode. **Bit-exact (CI gate, `zig build test`):** the full suite and committed corpus-hash regression pass. **Speed (local, ReleaseFast, single thread, same benchmark harness):** aggregate lossy decode **1.20×** (699.5→583.3 ms over 88 lossy stills on this machine), `bryce` **563.1→475.5 ms** (local ratio vs `dwebp -pam` ≈1.96×→≈1.65×), `vp80-00-comprehensive-008` **10.03→8.84 ms**, `lossy_extreme_probabilities` **15.6→9.8 ms**. Lossless decode is unchanged in substance because VP8L does not use this reader. Rejected in the same investigation: scalar loop-filter index reshaping (byte-exact, no measurable win) and a dedicated probability-128 `readBit` path (slightly slower). Remaining lossy levers are loop-filter SIMD/lookup tables, row-pipeline locality, and threading. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
