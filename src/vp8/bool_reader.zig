@@ -76,27 +76,9 @@ pub const BoolReader = struct {
             break :bit 0;
         };
 
-        const shift_count = normalizeShiftCount(range_next);
-        const needs_byte = @as(u5, self.bit_count) + shift_count >= 8;
-        if (needs_byte) {
-            if (self.offset == self.bytes.len) return error.TruncatedBitstream;
-        }
-
         var bit_count_next = self.bit_count;
         var offset_next = self.offset;
-        var shifts_done: u4 = 0;
-        while (shifts_done < shift_count) : (shifts_done += 1) {
-            value_next <<= 1;
-            range_next <<= 1;
-            bit_count_next += 1;
-
-            if (bit_count_next == 8) {
-                assert(offset_next < self.bytes.len);
-                value_next |= self.bytes[offset_next];
-                offset_next += 1;
-                bit_count_next = 0;
-            }
-        }
+        try self.normalizeAfterRead(&range_next, &value_next, &bit_count_next, &offset_next);
 
         assert(range_next >= range_min);
         assert(range_next <= range_max);
@@ -108,6 +90,31 @@ pub const BoolReader = struct {
         self.offset = offset_next;
 
         return bit;
+    }
+
+    inline fn normalizeAfterRead(
+        self: *BoolReader,
+        range_next: *u32,
+        value_next: *u32,
+        bit_count_next: *u4,
+        offset_next: *usize,
+    ) Error!void {
+        const shift_count = normalizeShiftCount(range_next.*);
+        if (shift_count == 0) return;
+
+        range_next.* <<= shift_count;
+        const shifted_bits: u5 = @as(u5, bit_count_next.*) + shift_count;
+        if (shifted_bits >= 8) {
+            if (offset_next.* == self.bytes.len) return error.TruncatedBitstream;
+            const remaining: u4 = @intCast(shifted_bits - 8);
+            value_next.* = (value_next.* << shift_count) |
+                (@as(u32, self.bytes[offset_next.*]) << remaining);
+            offset_next.* += 1;
+            bit_count_next.* = remaining;
+        } else {
+            value_next.* <<= shift_count;
+            bit_count_next.* = @intCast(shifted_bits);
+        }
     }
 
     pub fn readLiteral(self: *BoolReader, bit_count: u6) Error!u32 {
@@ -193,18 +200,26 @@ fn normalizeShiftCount(range: u32) u4 {
     assert(range <= range_max);
     if (range >= range_min) return 0;
 
-    var shifted_range = range;
-    var shift_count: u4 = 0;
-    while (shifted_range < range_min) : (shift_count += 1) {
-        shifted_range <<= 1;
-    }
-
-    assert(shift_count <= 7);
-    assert(shifted_range >= range_min);
-    assert(shifted_range <= range_max);
-
+    const shift_count = normalize_shift_counts[range];
+    assert((range << shift_count) >= range_min);
+    assert((range << shift_count) <= range_max);
     return shift_count;
 }
+
+const normalize_shift_counts = blk: {
+    var table: [range_min]u4 = undefined;
+    table[0] = 0;
+    var range: usize = 1;
+    while (range < range_min) : (range += 1) {
+        var shifted_range = range;
+        var shift_count: u4 = 0;
+        while (shifted_range < range_min) : (shift_count += 1) {
+            shifted_range <<= 1;
+        }
+        table[range] = shift_count;
+    }
+    break :blk table;
+};
 
 comptime {
     assert(range_min == 128);
