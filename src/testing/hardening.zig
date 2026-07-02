@@ -13,8 +13,10 @@
 //! ── Adversarial-input coverage audit (PLAN.MD step 11) ───────────────────
 //! | Adversarial input        | Enforced at                      | Existing test                         | Covered here |
 //! |--------------------------|----------------------------------|---------------------------------------|--------------|
-//! | Huge dimensions (overflow)| limits.pixelCount (DimensionsOverflow) | limits.zig:60, image.zig:95     | matrix (CanvasTooLarge) |
-//! | Oversized / over-count chunks | demux readChunkLocation + validateChunkCount | demux "enforces chunk count" | matrix (TooManyChunks, AllocationLimitExceeded) |
+//! | Huge canvas (pixels > output_pixels_max) | limits.validateCanvas (CanvasTooLarge) | this module | matrix (CanvasTooLarge) |
+//! | Dimension overflow (w*h > u32 max) | limits.pixelCount (DimensionsOverflow), limits.zig:55 | none — defensive only; unreachable from a parsed WebP canvas (VP8X 14-bit and VP8 16-bit dim fields cap w*h <= 16384^2 < 2^32) | not in matrix |
+//! | Over-count chunks (chunk_count_max) | demux validateChunkCount, demux.zig:99 | demux "enforces configured chunk count limits" (:1151) | matrix (TooManyChunks) |
+//! | Oversized/truncated chunk payload | demux readChunkLocation (TruncatedChunkHeader :216, TruncatedChunkPayload :202/:223) | none today — container-level malformation, gap for demux unit tests / 11c fuzz | not in matrix |
 //! | Invalid LZ77 distances   | vp8l/image_data.zig:202          | vp8l/image_data.zig:725               | unit (referenced) |
 //! | Invalid Huffman trees    | vp8l/huffman buildTable          | vp8l/huffman.zig:542                  | unit (referenced) |
 //! | Recursive/duplicate VP8L transforms | vp8l/transform.zig:70, :278 | vp8l/transform.zig:278, inverse_transform.zig:411 | unit (referenced) |
@@ -149,10 +151,16 @@ test "decodeStatic honors allocation_bytes_max" {
     const file = try buildLosslessStill(testing.allocator);
     defer testing.allocator.free(file);
 
+    // Cap above demux's chunk-list bookkeeping for this still (a handful of
+    // 32-byte ChunkLocation entries, well under 1 KiB) but below decodeLossless's
+    // cumulative reservation (argb 256 + transform 1284 = 1540 > 1024), so the
+    // failure comes from the decode stage's `reserveElements`, not a duplicate of
+    // the demux allocation test. If decode stopped enforcing allocation_bytes_max
+    // here, decodeStatic would succeed and this assertion would fail.
     try testing.expectError(error.AllocationLimitExceeded, decode.decodeStatic(
         testing.allocator,
         file,
-        .{ .limits = .{ .allocation_bytes_max = 16 } },
+        .{ .limits = .{ .allocation_bytes_max = 1024 } },
     ));
 }
 
@@ -263,6 +271,45 @@ test "decodeAnimationAlloc honors chunk_count_max" {
         testing.allocator,
         file,
         .{ .limits = .{ .chunk_count_max = 1 } },
+    ));
+}
+
+test "decodeAnimationAlloc honors allocation_bytes_max (owned-frame budget)" {
+    var pixels: [anim_w * anim_h * 4]u8 = undefined;
+    fillGradient(&pixels, anim_w, anim_h);
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = try image.Dimensions.init(anim_w, anim_h),
+        .stride = anim_w * 4,
+        .format = .rgba,
+    };
+    // Lossy frames: per-frame decode checks only its ~256-byte output buffer
+    // (decodeLossy reserves output_len; the VP8 YUV planes are gpa-allocated
+    // without a limit check), keeping the decode stage under the cap so the
+    // failure is the post-parse owned-frame budget check, not per-frame decode.
+    const frame = animation_encode.FrameSource{
+        .buffer = buffer,
+        .duration_ms = 100,
+        .format = .lossy,
+    };
+    const sources = [_]animation_encode.FrameSource{ frame, frame, frame };
+    const file = try animation_encode.encodeAnimationFromBuffers(testing.allocator, &sources, .{
+        .canvas = try image.Dimensions.init(anim_w, anim_h),
+    });
+    defer testing.allocator.free(file);
+
+    // Cap above demux bookkeeping (chunk/frame lists for ~8 chunks, < 1 KiB),
+    // the canvas buffer check (stride*height = 32*8 = 256), and one lossy
+    // frame's output reservation (256), but below the total owned-frame bytes
+    // the API reserves up front (stride*height*frame_count = 256*3 = 768), so
+    // the failure is the owned-frame budget check at animation_decode.zig:317 --
+    // not demux, not the canvas check, and not per-frame decode. Removing that
+    // check would let all three frames decode and duplicate (768 bytes,
+    // unchecked), returning success and failing this assertion.
+    try testing.expectError(error.AllocationLimitExceeded, animation_decode.decodeAnimationAlloc(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .allocation_bytes_max = 640 } },
     ));
 }
 
