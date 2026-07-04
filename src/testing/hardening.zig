@@ -1,20 +1,21 @@
 //! Step 11a — limits & malicious-input contract matrix.
 //!
 //! End-to-end proof that every public entry point honors a caller-supplied
-//! `ResourceLimits`. Each test builds a VALID input in-process via the public
-//! encoders (no corpus-file dependency), then tightens exactly ONE limit knob
-//! and asserts the exact rejection error. Building uses default limits; only
-//! the decode/parse/encode call under test gets the tight limit.
+//! `ResourceLimits`. Most tests build a valid input in-process via the public
+//! encoders (no corpus-file dependency), then tighten exactly one limit knob and
+//! assert the exact rejection error. Targeted malformed RIFF inputs cover
+//! bitstream-reachable overflow paths that the encoders cannot produce.
+//! Building uses default limits; only the decode/parse/encode call under test
+//! gets the tight limit.
 //!
 //! This module is test-only and registered from `root.zig`. It deliberately
-//! changes no enforcement code: a failing test here is a library bug to report,
-//! not to patch (see plans/006).
+//! captures the public hardening contract: a failing test here is a library bug.
 //!
 //! ── Adversarial-input coverage audit (PLAN.MD step 11) ───────────────────
 //! | Adversarial input        | Enforced at                      | Existing test                         | Covered here |
 //! |--------------------------|----------------------------------|---------------------------------------|--------------|
 //! | Huge canvas (pixels > output_pixels_max) | limits.validateCanvas (CanvasTooLarge) | this module | matrix (CanvasTooLarge) |
-//! | Dimension overflow (w*h > u32 max) | limits.pixelCount (DimensionsOverflow), limits.zig:55 | none — defensive only; unreachable from a parsed WebP canvas (VP8X 14-bit and VP8 16-bit dim fields cap w*h <= 16384^2 < 2^32) | not in matrix |
+//! | Dimension overflow (w*h > u32 max) | VP8X parseExtendedHeader -> limits.pixelCount (DimensionsOverflow) | this module | matrix (DimensionsOverflow) |
 //! | Over-count chunks (chunk_count_max) | demux validateChunkCount, demux.zig:99 | demux "enforces configured chunk count limits" (:1151) | matrix (TooManyChunks) |
 //! | Oversized/truncated chunk payload | demux readChunkLocation (TruncatedChunkHeader :216, TruncatedChunkPayload :202/:223) | none today — container-level malformation, gap for demux unit tests / 11c fuzz | not in matrix |
 //! | Invalid LZ77 distances   | vp8l/image_data.zig:202          | vp8l/image_data.zig:725               | unit (referenced) |
@@ -37,11 +38,13 @@
 //! | YUV->RGB upsample             | color.zig               | width * height |
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 const animation = @import("../animation.zig");
 const animation_decode = @import("../animation_decode.zig");
 const animation_encode = @import("../animation_encode.zig");
 const animation_optimize = @import("../animation_optimize.zig");
+const container = @import("../container.zig");
 const decode = @import("../decode.zig");
 const demux = @import("../demux.zig");
 const encode = @import("../encode.zig");
@@ -70,6 +73,38 @@ fn fillGradient(pixels: []u8, w: u32, h: u32) void {
     }
 }
 
+fn writeChunk(out: []u8, offset: *usize, comptime tag: []const u8, payload: []const u8) void {
+    comptime {
+        if (tag.len != container.fourcc_size) @compileError("chunk tag must be four bytes");
+    }
+
+    @memcpy(out[offset.*..][0..container.fourcc_size], tag);
+    container.writeLittleU32(out[offset.* + container.fourcc_size ..][0..4], @intCast(payload.len));
+    offset.* += container.chunk_header_size;
+    @memcpy(out[offset.*..][0..payload.len], payload);
+    offset.* += payload.len;
+    if ((payload.len & 1) != 0) {
+        out[offset.*] = 0;
+        offset.* += 1;
+    }
+}
+
+fn buildVP8XDimensionOverflowFile() [container.riff_header_size + container.chunk_header_size + 10]u8 {
+    const side: u32 = 65_536;
+    var vp8x = [_]u8{0} ** 10;
+    container.writeLittleU24(vp8x[4..7], side - 1);
+    container.writeLittleU24(vp8x[7..10], side - 1);
+
+    var bytes: [container.riff_header_size + container.chunk_header_size + vp8x.len]u8 = undefined;
+    @memcpy(bytes[0..4], "RIFF");
+    container.writeLittleU32(bytes[4..8], @intCast(bytes.len - 8));
+    @memcpy(bytes[8..12], "WEBP");
+    var offset: usize = container.riff_header_size;
+    writeChunk(&bytes, &offset, "VP8X", &vp8x);
+    assert(offset == bytes.len);
+    return bytes;
+}
+
 /// Encodes an 8x8 lossless still through the public encoder with default
 /// limits. Caller frees the returned bytes.
 fn buildLosslessStill(gpa: std.mem.Allocator) ![]u8 {
@@ -92,6 +127,23 @@ fn buildLossyStill(gpa: std.mem.Allocator) ![]u8 {
         .pixels = &pixels,
         .dimensions = try image.Dimensions.init(still_w, still_h),
         .stride = still_w * 4,
+        .format = .rgba,
+    };
+    return encode.encodeStaticLossy(gpa, buffer, .{ .format = .lossy, .quality = 75 });
+}
+
+const lossy_allocation_w: u32 = 16;
+const lossy_allocation_h: u32 = 16;
+
+/// Slightly larger lossy still whose padded VP8 reconstruction buffers exceed
+/// the output-only allocation budget while demux bookkeeping remains below it.
+fn buildLossyAllocationStill(gpa: std.mem.Allocator) ![]u8 {
+    var pixels: [lossy_allocation_w * lossy_allocation_h * 4]u8 = undefined;
+    fillGradient(&pixels, lossy_allocation_w, lossy_allocation_h);
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = try image.Dimensions.init(lossy_allocation_w, lossy_allocation_h),
+        .stride = lossy_allocation_w * 4,
         .format = .rgba,
     };
     return encode.encodeStaticLossy(gpa, buffer, .{ .format = .lossy, .quality = 75 });
@@ -175,6 +227,17 @@ test "decodeStatic honors output_pixels_max for lossy" {
     ));
 }
 
+test "decodeStatic honors allocation_bytes_max for lossy" {
+    const file = try buildLossyAllocationStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.AllocationLimitExceeded, decode.decodeStatic(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .allocation_bytes_max = 1280 } },
+    ));
+}
+
 test "demux.parse honors input_bytes_max" {
     const file = try buildLosslessStill(testing.allocator);
     defer testing.allocator.free(file);
@@ -219,6 +282,16 @@ test "demux.parse honors allocation_bytes_max" {
     ));
 }
 
+test "demux.parse rejects VP8X dimension overflow" {
+    const file = buildVP8XDimensionOverflowFile();
+
+    try testing.expectError(error.DimensionsOverflow, demux.parse(
+        testing.allocator,
+        &file,
+        .{},
+    ));
+}
+
 test "demux.parseFeatures honors input_bytes_max" {
     const file = try buildLosslessStill(testing.allocator);
     defer testing.allocator.free(file);
@@ -227,6 +300,71 @@ test "demux.parseFeatures honors input_bytes_max" {
         testing.allocator,
         file,
         .{ .limits = .{ .input_bytes_max = 8 } },
+    ));
+}
+
+test "demux.parseFeatures honors output_pixels_max" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.CanvasTooLarge, demux.parseFeatures(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .output_pixels_max = still_px - 1 } },
+    ));
+}
+
+test "demux.parseFeatures honors animation_canvas_pixels_max" {
+    const file = try buildAnimationFile(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.CanvasTooLarge, demux.parseFeatures(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .animation_canvas_pixels_max = anim_px - 1 } },
+    ));
+}
+
+test "demux.parseFeatures honors chunk_count_max" {
+    const file = try buildAnimationFile(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.TooManyChunks, demux.parseFeatures(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .chunk_count_max = 1 } },
+    ));
+}
+
+test "demux.parseFeatures honors frame_count_max" {
+    const file = try buildAnimationFile(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.FrameCountTooLarge, demux.parseFeatures(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .frame_count_max = 1 } },
+    ));
+}
+
+test "demux.parseFeatures honors allocation_bytes_max" {
+    const file = try buildAnimationFile(testing.allocator);
+    defer testing.allocator.free(file);
+
+    try testing.expectError(error.AllocationLimitExceeded, demux.parseFeatures(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .allocation_bytes_max = 16 } },
+    ));
+}
+
+test "demux.parseFeatures rejects VP8X dimension overflow" {
+    const file = buildVP8XDimensionOverflowFile();
+
+    try testing.expectError(error.DimensionsOverflow, demux.parseFeatures(
+        testing.allocator,
+        &file,
+        .{},
     ));
 }
 
@@ -283,33 +421,25 @@ test "decodeAnimationAlloc honors allocation_bytes_max (owned-frame budget)" {
         .stride = anim_w * 4,
         .format = .rgba,
     };
-    // Lossy frames: per-frame decode checks only its ~256-byte output buffer
-    // (decodeLossy reserves output_len; the VP8 YUV planes are gpa-allocated
-    // without a limit check), keeping the decode stage under the cap so the
-    // failure is the post-parse owned-frame budget check, not per-frame decode.
     const frame = animation_encode.FrameSource{
         .buffer = buffer,
         .duration_ms = 100,
         .format = .lossy,
     };
-    const sources = [_]animation_encode.FrameSource{ frame, frame, frame };
+    const sources = [_]animation_encode.FrameSource{ frame, frame, frame, frame, frame, frame };
     const file = try animation_encode.encodeAnimationFromBuffers(testing.allocator, &sources, .{
         .canvas = try image.Dimensions.init(anim_w, anim_h),
     });
     defer testing.allocator.free(file);
 
-    // Cap above demux bookkeeping (chunk/frame lists for ~8 chunks, < 1 KiB),
-    // the canvas buffer check (stride*height = 32*8 = 256), and one lossy
-    // frame's output reservation (256), but below the total owned-frame bytes
-    // the API reserves up front (stride*height*frame_count = 256*3 = 768), so
-    // the failure is the owned-frame budget check at animation_decode.zig:317 --
-    // not demux, not the canvas check, and not per-frame decode. Removing that
-    // check would let all three frames decode and duplicate (768 bytes,
-    // unchecked), returning success and failing this assertion.
+    // Cap above demux bookkeeping, the canvas buffer check, and one lossy
+    // frame's charged decode budget, but below the total owned-frame bytes the
+    // API reserves up front (stride*height*frame_count = 256*6 = 1536). The
+    // failure is the owned-frame budget check at animation_decode.zig:317.
     try testing.expectError(error.AllocationLimitExceeded, animation_decode.decodeAnimationAlloc(
         testing.allocator,
         file,
-        .{ .limits = .{ .allocation_bytes_max = 640 } },
+        .{ .limits = .{ .allocation_bytes_max = 1400 } },
     ));
 }
 

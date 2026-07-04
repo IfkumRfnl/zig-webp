@@ -29,6 +29,8 @@ pub const DecodeOptions = struct {
     /// Apply the RFC 6386 section 15 in-loop deblocking filter as a final
     /// pass. Set false for `dwebp -nofilter`-equivalent output.
     apply_loop_filter: bool,
+    /// Optional cap for allocations owned by the VP8 frame reconstruction path.
+    allocation_bytes_max: u64 = std.math.maxInt(u64),
 };
 
 pub const macroblock_size = 16;
@@ -76,6 +78,20 @@ pub fn decodeFrame(
     return decodeFrameParsed(gpa, &parsed, options);
 }
 
+pub fn allocationBytesParsed(
+    parsed: *const frame_header.Parsed,
+    options: DecodeOptions,
+) Error!u64 {
+    const header = &parsed.header;
+    const grid = modes.MacroblockGrid.init(header.picture.dimensions);
+    const filter_type = if (options.apply_loop_filter)
+        loop_filter.filterType(header)
+    else
+        loop_filter.Type.none;
+
+    return (try FrameAllocationPlan.init(grid, filter_type != .none)).total_bytes;
+}
+
 pub fn decodeFrameParsed(
     gpa: std.mem.Allocator,
     parsed: *frame_header.Parsed,
@@ -84,20 +100,24 @@ pub fn decodeFrameParsed(
     const header = &parsed.header;
     const grid = modes.MacroblockGrid.init(header.picture.dimensions);
 
-    const macroblocks = try gpa.alloc(modes.Macroblock, grid.macroblockCount());
-    defer gpa.free(macroblocks);
-    try modes.parseKeyFrameModes(&parsed.macroblock_reader, header, macroblocks);
-
     const filter_type = if (options.apply_loop_filter)
         loop_filter.filterType(header)
     else
         loop_filter.Type.none;
     const will_filter = filter_type != .none;
+    const allocation_plan = try FrameAllocationPlan.init(grid, will_filter);
+    if (allocation_plan.total_bytes > options.allocation_bytes_max) {
+        return error.AllocationLimitExceeded;
+    }
+
+    const macroblocks = try gpa.alloc(modes.Macroblock, allocation_plan.macroblocks);
+    defer gpa.free(macroblocks);
+    try modes.parseKeyFrameModes(&parsed.macroblock_reader, header, macroblocks);
 
     // Residual presence per macroblock feeds the loop filter's interior-edge
     // decision; only allocated when a filter pass will actually run.
     const has_nonzero: []bool = if (will_filter)
-        try gpa.alloc(bool, grid.macroblockCount())
+        try gpa.alloc(bool, allocation_plan.has_nonzero)
     else
         &.{};
     defer if (will_filter) gpa.free(has_nonzero);
@@ -111,22 +131,22 @@ pub fn decodeFrameParsed(
             bool_reader.BoolReader.init(parsed.token_partitions.slices[index]);
     }
 
-    const above_flags = try gpa.alloc(tokens.NonzeroFlags, grid.columns);
+    const above_flags = try gpa.alloc(tokens.NonzeroFlags, allocation_plan.above_flags);
     defer gpa.free(above_flags);
     @memset(above_flags, tokens.NonzeroFlags.zero);
 
     // Unfiltered bottom rows of the previous macroblock row, per column;
     // never read while reconstructing row 0.
-    const top_samples = try gpa.alloc(TopSamples, grid.columns);
+    const top_samples = try gpa.alloc(TopSamples, allocation_plan.top_samples);
     defer gpa.free(top_samples);
 
     const luma_stride = grid.columns * macroblock_size;
     const chroma_stride = grid.columns * chroma_block_size;
-    const luma = try gpa.alloc(u8, @as(usize, luma_stride) * grid.rows * macroblock_size);
+    const luma = try gpa.alloc(u8, allocation_plan.luma);
     errdefer gpa.free(luma);
-    const chroma_u = try gpa.alloc(u8, @as(usize, chroma_stride) * grid.rows * chroma_block_size);
+    const chroma_u = try gpa.alloc(u8, allocation_plan.chroma);
     errdefer gpa.free(chroma_u);
-    const chroma_v = try gpa.alloc(u8, @as(usize, chroma_stride) * grid.rows * chroma_block_size);
+    const chroma_v = try gpa.alloc(u8, allocation_plan.chroma);
     errdefer gpa.free(chroma_v);
 
     var frame = Frame{
@@ -208,6 +228,64 @@ pub fn decodeFrameParsed(
     }
 
     return frame;
+}
+
+const FrameAllocationPlan = struct {
+    macroblocks: usize,
+    has_nonzero: usize,
+    above_flags: usize,
+    top_samples: usize,
+    luma: usize,
+    chroma: usize,
+    total_bytes: u64,
+
+    fn init(grid: modes.MacroblockGrid, will_filter: bool) Error!FrameAllocationPlan {
+        var total_bytes: u64 = 0;
+
+        const macroblock_count: u64 = grid.macroblockCount();
+        const macroblocks = try reservePlanElements(modes.Macroblock, macroblock_count, &total_bytes);
+        const has_nonzero = if (will_filter)
+            try reservePlanElements(bool, macroblock_count, &total_bytes)
+        else
+            0;
+        const above_flags = try reservePlanElements(tokens.NonzeroFlags, grid.columns, &total_bytes);
+        const top_samples = try reservePlanElements(TopSamples, grid.columns, &total_bytes);
+
+        const luma_stride = @as(u64, grid.columns) * macroblock_size;
+        const chroma_stride = @as(u64, grid.columns) * chroma_block_size;
+        const luma_rows = @as(u64, grid.rows) * macroblock_size;
+        const chroma_rows = @as(u64, grid.rows) * chroma_block_size;
+        const luma = try reservePlanElements(u8, luma_stride * luma_rows, &total_bytes);
+        const chroma = try reservePlanElements(u8, chroma_stride * chroma_rows, &total_bytes);
+        _ = try reservePlanElements(u8, chroma_stride * chroma_rows, &total_bytes);
+
+        return .{
+            .macroblocks = macroblocks,
+            .has_nonzero = has_nonzero,
+            .above_flags = above_flags,
+            .top_samples = top_samples,
+            .luma = luma,
+            .chroma = chroma,
+            .total_bytes = total_bytes,
+        };
+    }
+};
+
+fn reservePlanElements(
+    comptime T: type,
+    count: u64,
+    total_bytes: *u64,
+) Error!usize {
+    if (count > std.math.maxInt(usize)) return error.AllocationLimitExceeded;
+    if (count > std.math.maxInt(u64) / @sizeOf(T)) return error.AllocationLimitExceeded;
+
+    const bytes = count * @sizeOf(T);
+    if (bytes > std.math.maxInt(u64) - total_bytes.*) {
+        return error.AllocationLimitExceeded;
+    }
+
+    total_bytes.* += bytes;
+    return @intCast(count);
 }
 
 const TopSamples = struct {

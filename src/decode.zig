@@ -14,6 +14,7 @@ const image = @import("image.zig");
 const mux = @import("mux.zig");
 const options = @import("options.zig");
 const vp8_decoder = @import("vp8/decoder.zig");
+const vp8_frame_header = @import("vp8/frame_header.zig");
 const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
@@ -152,11 +153,19 @@ fn decodeLossy(
     const output_len = try outputByteLength(dimensions, format);
     const output_count = try reserveElements(u8, output_len, &allocation_bytes, decode_options);
 
+    var parsed: vp8_frame_header.Parsed = undefined;
+    try vp8_frame_header.parse(source.bitstream, &parsed);
+    const frame_allocation_bytes = try vp8_decoder.allocationBytesParsed(&parsed, .{
+        .apply_loop_filter = true,
+    });
+    try reserveBytes(frame_allocation_bytes, &allocation_bytes, decode_options);
+
     // Reconstruct the YUV planes (key-frame decode through the in-loop filter,
     // matching plain `dwebp`). The frame's own dimensions equal `dimensions`:
     // the container rejects any canvas/rect that disagrees with the VP8 header.
-    var frame = try vp8_decoder.decodeFrame(gpa, source.bitstream, .{
+    var frame = try vp8_decoder.decodeFrameParsed(gpa, &parsed, .{
         .apply_loop_filter = true,
+        .allocation_bytes_max = frame_allocation_bytes,
     });
     defer frame.deinit();
 
@@ -242,14 +251,22 @@ fn reserveElements(
     if (count > std.math.maxInt(u64) / @sizeOf(T)) return error.AllocationLimitExceeded;
 
     const bytes = count * @sizeOf(T);
+    try reserveBytes(bytes, allocation_bytes, decode_options);
+
+    return @intCast(count);
+}
+
+fn reserveBytes(
+    bytes: u64,
+    allocation_bytes: *u64,
+    decode_options: options.DecoderOptions,
+) errors.Error!void {
     if (bytes > std.math.maxInt(u64) - allocation_bytes.*) {
         return error.AllocationLimitExceeded;
     }
 
     allocation_bytes.* += bytes;
     try decode_options.limits.validateAllocationBytes(allocation_bytes.*);
-
-    return @intCast(count);
 }
 
 fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {

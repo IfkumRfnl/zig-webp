@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-06-23
+Last updated: 2026-07-04
 
 ## Current Position
 
@@ -184,6 +184,17 @@ loop filter, further entropy specialization, row/tile threading, and
 `image-webp`/pure-Go comparison runs. The harness + byte-exact corpus gate keep
 all of it measurable and safe. Detail follows.
 
+Step 11a (limits and malicious-input contract matrix) is underway. The first
+hardening matrix now exercises every public decode/parse/encode entry point
+with caller-tightened `ResourceLimits`, including `parseFeatures` for non-input
+limits, reachable `VP8X` 24-bit canvas dimension overflow
+(`DimensionsOverflow`), and lossy static decode allocation budgeting. A review
+follow-up also closed a real enforcement gap: VP8 lossy frame reconstruction now
+charges its macroblock, context, and padded YUV-plane allocations against
+`DecoderOptions.limits.allocation_bytes_max`, so the public allocation budget
+covers both VP8L and VP8 decode paths. Verified 2026-07-04 with `zig fmt .` and
+`zig build test`.
+
 A new in-memory benchmark tool (`tools/zig-webp-bench.zig`, `zig build
 bench`) times the public decode and encode entry points per asset class — codec
 time only, no file I/O — reporting the median of repeated timed runs. It
@@ -278,6 +289,28 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch).
 Revisit when the toolchain updates.
 
 ## Recently Completed
+
+### Step 11 — Robustness Hardening (slice 11a: limits matrix review follow-up)
+
+Review follow-up for PR #80 closed three hardening gaps in the Step 11a matrix.
+`src/testing/hardening.zig` now includes a crafted `VP8X` container with
+65,536x65,536 canvas fields, proving the bitstream-reachable 24-bit dimension
+overflow path rejects with `DimensionsOverflow`; the audit row no longer marks
+that case unreachable. `demux.parseFeatures` now has explicit non-input limit
+coverage for still canvas pixels, animation canvas pixels, chunk count, frame
+count, allocation bytes, and VP8X dimension overflow, so feature probing keeps
+the same untrusted-input contract as full demux. Static lossy decode now has an
+allocation-limit case that fails only after demux bookkeeping, covering the VP8
+decode stage.
+
+The lossy allocation case required a code fix, not just a test:
+`src/vp8/decoder.zig` now computes and validates a frame reconstruction
+allocation plan before allocating macroblocks, context rows, and padded YUV
+planes; `src/decode.zig` includes that plan in the cumulative
+`decodeStatic` allocation budget before allocating output pixels or optional
+alpha planes. This brings VP8 lossy decode in line with the existing public
+`decodeStatic` allocation-budget contract. Verified 2026-07-04 with
+`zig fmt .` and `zig build test`.
 
 ### Step 10 — Performance Work (slice 10b: SIMD color conversion)
 
