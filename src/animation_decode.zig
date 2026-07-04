@@ -659,3 +659,42 @@ fn fuzzAnimationOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }) catch return;
     animated.deinit();
 }
+
+fn animationAllocationProbe(gpa: std.mem.Allocator, file: []const u8) !void {
+    var animated = try decodeAnimationAlloc(gpa, file, .{});
+    animated.deinit();
+}
+
+test "animated decode survives allocation failure at every site" {
+    const file = try buildAnimation(testing.allocator, 4, 4, &.{
+        .{ .x = 0, .y = 0, .width = 4, .height = 4, .color = .{ 255, 0, 0, 255 }, .blend = .replace },
+        .{ .x = 2, .y = 2, .width = 2, .height = 2, .color = .{ 0, 255, 0, 64 }, .dispose = .background },
+    });
+    defer testing.allocator.free(file);
+
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        animationAllocationProbe,
+        .{file},
+    );
+}
+
+fn animationStreamingAllocationProbe(gpa: std.mem.Allocator, file: []const u8) !void {
+    var decoder = try Decoder.init(gpa, file, .{});
+    defer decoder.deinit();
+    while (try decoder.next()) |_| {}
+}
+
+test "streaming animated decode survives allocation failure at every site" {
+    const file = try buildAnimation(testing.allocator, 4, 4, &.{
+        .{ .x = 0, .y = 0, .width = 4, .height = 4, .color = .{ 255, 0, 0, 255 }, .blend = .replace },
+        .{ .x = 2, .y = 2, .width = 2, .height = 2, .color = .{ 0, 255, 0, 64 }, .dispose = .background },
+    });
+    defer testing.allocator.free(file);
+
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        animationStreamingAllocationProbe,
+        .{file},
+    );
+}
