@@ -189,11 +189,12 @@ hardening matrix now exercises every public decode/parse/encode entry point
 with caller-tightened `ResourceLimits`, including `parseFeatures` for non-input
 limits, reachable `VP8X` 24-bit canvas dimension overflow
 (`DimensionsOverflow`), and lossy static decode allocation budgeting. A review
-follow-up also closed a real enforcement gap: VP8 lossy frame reconstruction now
-charges its macroblock, context, and padded YUV-plane allocations against
-`DecoderOptions.limits.allocation_bytes_max`, so the public allocation budget
-covers both VP8L and VP8 decode paths. Verified 2026-07-04 with `zig fmt .` and
-`zig build test`.
+follow-up also closed real enforcement gaps: VP8 lossy frame reconstruction now
+charges its macroblock, context, and padded YUV-plane allocations, and
+VP8L-compressed `ALPH` decode charges its alpha scratch, against
+`DecoderOptions.limits.allocation_bytes_max`. The public allocation budget now
+covers VP8L stills, VP8 lossy color, and lossy compressed-alpha decode paths.
+Verified 2026-07-04 with `zig fmt .` and `zig build test`.
 
 A new in-memory benchmark tool (`tools/zig-webp-bench.zig`, `zig build
 bench`) times the public decode and encode entry points per asset class — codec
@@ -299,18 +300,21 @@ overflow path rejects with `DimensionsOverflow`; the audit row no longer marks
 that case unreachable. `demux.parseFeatures` now has explicit non-input limit
 coverage for still canvas pixels, animation canvas pixels, chunk count, frame
 count, allocation bytes, and VP8X dimension overflow, so feature probing keeps
-the same untrusted-input contract as full demux. Static lossy decode now has an
-allocation-limit case that fails only after demux bookkeeping, covering the VP8
-decode stage.
+the same untrusted-input contract as full demux. Static lossy decode now has
+allocation-limit cases that fail only after demux bookkeeping, covering the VP8
+decode stage and compressed `ALPH` scratch.
 
 The lossy allocation case required a code fix, not just a test:
 `src/vp8/decoder.zig` now computes and validates a frame reconstruction
 allocation plan before allocating macroblocks, context rows, and padded YUV
 planes; `src/decode.zig` includes that plan in the cumulative
 `decodeStatic` allocation budget before allocating output pixels or optional
-alpha planes. This brings VP8 lossy decode in line with the existing public
-`decodeStatic` allocation-budget contract. Verified 2026-07-04 with
-`zig fmt .` and `zig build test`.
+alpha planes. `src/alpha.zig` now also accepts a remaining allocation cap for
+VP8L-compressed `ALPH` decode, pre-reserves its alpha work buffers, and passes
+the leftover cap to VP8L prefix-group storage. This brings VP8 lossy color and
+lossy compressed-alpha decode in line with the existing public `decodeStatic`
+allocation-budget contract. Verified 2026-07-04 with `zig fmt .` and
+`zig build test`.
 
 ### Step 10 — Performance Work (slice 10b: SIMD color conversion)
 

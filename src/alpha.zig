@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 const bit_writer = @import("bit_writer.zig");
 const errors = @import("errors.zig");
 const image = @import("image.zig");
+const limits = @import("limits.zig");
 const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_encoder = @import("vp8l/encoder.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
@@ -33,6 +34,10 @@ pub const Header = struct {
     compression: Compression,
     filter: Filter,
     preprocessing: Preprocessing,
+};
+
+pub const DecodeAllocOptions = struct {
+    allocation_bytes_max: u64 = (limits.ResourceLimits{}).allocation_bytes_max,
 };
 
 pub fn parseHeader(payload: []const u8) errors.Error!Header {
@@ -86,6 +91,16 @@ pub fn decodePlaneAlloc(
     dimensions: image.Dimensions,
     output: []u8,
 ) errors.Error!Header {
+    return decodePlaneAllocWithOptions(gpa, payload, dimensions, output, .{});
+}
+
+pub fn decodePlaneAllocWithOptions(
+    gpa: std.mem.Allocator,
+    payload: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+    decode_options: DecodeAllocOptions,
+) errors.Error!Header {
     const header = try parseHeader(payload);
 
     switch (header.compression) {
@@ -96,6 +111,7 @@ pub fn decodePlaneAlloc(
             payload[header_size..],
             dimensions,
             output,
+            decode_options,
         ),
     }
 
@@ -111,25 +127,50 @@ fn decodeLossless(
     stream: []const u8,
     dimensions: image.Dimensions,
     output: []u8,
+    decode_options: DecodeAllocOptions,
 ) errors.Error!void {
-    const pixel_count: usize = @intCast(try dimensions.pixelCount());
+    const pixel_count_u64 = try dimensions.pixelCount();
+    const pixel_count: usize = @intCast(pixel_count_u64);
     if (output.len < pixel_count) return error.OutputTooLarge;
 
-    const argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    var allocation_bytes: u64 = 0;
+    const argb_count = try reserveElements(
+        vp8l_pixel.Pixel,
+        pixel_count_u64,
+        &allocation_bytes,
+        decode_options,
+    );
+    const transform_count = try reserveElements(
+        vp8l_pixel.Pixel,
+        try transformPixelCapacity(pixel_count_u64),
+        &allocation_bytes,
+        decode_options,
+    );
+    const entropy_count = try reserveElements(
+        vp8l_pixel.Pixel,
+        pixel_count_u64,
+        &allocation_bytes,
+        decode_options,
+    );
+
+    const argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
     defer gpa.free(argb_pixels);
 
     // Capacity for one color table (256 entries plus rounding) or
     // subsampled predictor/color transform blocks, matching the public
     // static decode composition.
-    const transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, pixel_count + 257);
+    const transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
     defer gpa.free(transform_pixels);
 
-    const entropy_image = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
+    const entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
     defer gpa.free(entropy_image);
 
     var buffers = vp8l_decoder.WorkBuffers{
         .transform_pixels = transform_pixels,
         .entropy_image = entropy_image,
+        .prefix_group_options = .{
+            .allocation_bytes_max = decode_options.allocation_bytes_max - allocation_bytes,
+        },
     };
     _ = try vp8l_decoder.decodeImageStreamAlloc(
         gpa,
@@ -145,6 +186,35 @@ fn decodeLossless(
     }
 
     unfilterPlaneInPlace(header.filter, plane, dimensions);
+}
+
+fn reserveElements(
+    comptime T: type,
+    count: u64,
+    allocation_bytes: *u64,
+    decode_options: DecodeAllocOptions,
+) errors.Error!usize {
+    if (count > std.math.maxInt(usize)) return error.AllocationLimitExceeded;
+    if (count > std.math.maxInt(u64) / @sizeOf(T)) return error.AllocationLimitExceeded;
+
+    const bytes = count * @sizeOf(T);
+    if (bytes > std.math.maxInt(u64) - allocation_bytes.*) {
+        return error.AllocationLimitExceeded;
+    }
+
+    const total_bytes = allocation_bytes.* + bytes;
+    if (total_bytes > decode_options.allocation_bytes_max) {
+        return error.AllocationLimitExceeded;
+    }
+    allocation_bytes.* = total_bytes;
+
+    return @intCast(count);
+}
+
+fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {
+    if (pixel_count > std.math.maxInt(u64) - 257) return error.AllocationLimitExceeded;
+
+    return pixel_count + 257;
 }
 
 fn unfilterPlaneInPlace(
@@ -444,6 +514,13 @@ test "rejects invalid ALPH headers" {
     for (reserved_bits) |byte| {
         try std.testing.expectError(error.InvalidAlphaChunk, parseHeader(&.{byte}));
     }
+}
+
+test "compressed alpha allocation options use the resource default" {
+    try std.testing.expectEqual(
+        (limits.ResourceLimits{}).allocation_bytes_max,
+        (DecodeAllocOptions{}).allocation_bytes_max,
+    );
 }
 
 test "decodes raw alpha with no filter" {

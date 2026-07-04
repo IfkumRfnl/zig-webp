@@ -193,7 +193,15 @@ fn decodeLossy(
             const alpha_count = try reserveElements(u8, pixel_count, &allocation_bytes, decode_options);
             const alpha_plane = try gpa.alloc(u8, alpha_count);
             defer gpa.free(alpha_plane);
-            _ = try alpha.decodePlaneAlloc(gpa, alpha_payload, dimensions, alpha_plane);
+            _ = try alpha.decodePlaneAllocWithOptions(
+                gpa,
+                alpha_payload,
+                dimensions,
+                alpha_plane,
+                .{
+                    .allocation_bytes_max = decode_options.limits.allocation_bytes_max - allocation_bytes,
+                },
+            );
             composeAlpha(out, format, stride, dimensions, alpha_plane);
         }
     }

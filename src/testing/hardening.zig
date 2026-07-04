@@ -40,6 +40,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const alpha = @import("../alpha.zig");
 const animation = @import("../animation.zig");
 const animation_decode = @import("../animation_decode.zig");
 const animation_encode = @import("../animation_encode.zig");
@@ -51,6 +52,8 @@ const encode = @import("../encode.zig");
 const features = @import("../features.zig");
 const image = @import("../image.zig");
 const limits = @import("../limits.zig");
+const vp8_decoder = @import("../vp8/decoder.zig");
+const vp8_frame_header = @import("../vp8/frame_header.zig");
 
 const testing = std.testing;
 
@@ -149,6 +152,55 @@ fn buildLossyAllocationStill(gpa: std.mem.Allocator) ![]u8 {
     return encode.encodeStaticLossy(gpa, buffer, .{ .format = .lossy, .quality = 75 });
 }
 
+/// Lossy still whose constant transparent alpha plane is encoded as compressed
+/// ALPH, exercising VP8L alpha-decode scratch after VP8 reconstruction.
+fn buildLossyAlphaAllocationStill(gpa: std.mem.Allocator) ![]u8 {
+    var pixels: [lossy_allocation_w * lossy_allocation_h * 4]u8 = undefined;
+    fillGradient(&pixels, lossy_allocation_w, lossy_allocation_h);
+    var alpha_index: usize = 3;
+    while (alpha_index < pixels.len) : (alpha_index += 4) {
+        pixels[alpha_index] = 77;
+    }
+
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = try image.Dimensions.init(lossy_allocation_w, lossy_allocation_h),
+        .stride = lossy_allocation_w * 4,
+        .format = .rgba,
+    };
+    return encode.encodeStaticLossy(gpa, buffer, .{ .format = .lossy, .quality = 75 });
+}
+
+fn lossyAlphaDecodeBudgetBeforeAlphaScratch(
+    gpa: std.mem.Allocator,
+    file: []const u8,
+) !u64 {
+    var parsed_webp = try demux.parse(gpa, file, .{});
+    defer parsed_webp.deinit();
+
+    const image_chunk = parsed_webp.features.image_data orelse return error.TestUnexpectedResult;
+    const alpha_chunk = parsed_webp.features.alpha orelse return error.TestUnexpectedResult;
+    const alpha_header = try alpha.parseHeader(alpha_chunk.payload(file));
+    try testing.expectEqual(alpha.Compression.lossless, alpha_header.compression);
+
+    var parsed_frame: vp8_frame_header.Parsed = undefined;
+    try vp8_frame_header.parse(image_chunk.payload(file), &parsed_frame);
+    const frame_allocation_bytes = try vp8_decoder.allocationBytesParsed(&parsed_frame, .{
+        .apply_loop_filter = true,
+    });
+
+    const pixel_count = try parsed_webp.features.canvas.pixelCount();
+    const output_bytes = std.math.mul(u64, pixel_count, 4) catch {
+        return error.AllocationLimitExceeded;
+    };
+    const output_and_frame = try addBudgetBytes(output_bytes, frame_allocation_bytes);
+    return addBudgetBytes(output_and_frame, pixel_count);
+}
+
+fn addBudgetBytes(a: u64, b: u64) !u64 {
+    return std.math.add(u64, a, b) catch error.AllocationLimitExceeded;
+}
+
 const anim_w: u32 = 8;
 const anim_h: u32 = 8;
 const anim_px: u64 = anim_w * anim_h; // 64
@@ -235,6 +287,18 @@ test "decodeStatic honors allocation_bytes_max for lossy" {
         testing.allocator,
         file,
         .{ .limits = .{ .allocation_bytes_max = 1280 } },
+    ));
+}
+
+test "decodeStatic honors allocation_bytes_max for lossy compressed alpha" {
+    const file = try buildLossyAlphaAllocationStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    const budget = try lossyAlphaDecodeBudgetBeforeAlphaScratch(testing.allocator, file);
+    try testing.expectError(error.AllocationLimitExceeded, decode.decodeStatic(
+        testing.allocator,
+        file,
+        .{ .limits = .{ .allocation_bytes_max = budget } },
     ));
 }
 
