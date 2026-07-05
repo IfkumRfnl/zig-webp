@@ -1597,7 +1597,7 @@ fn fuzzEncodeLosslessOne(_: void, smith: *std.testing.Smith) anyerror!void {
         .format = .rgba,
     };
 
-    const encoded = encodeStaticLossless(std.testing.allocator, buffer, .{}) catch return;
+    const encoded = try encodeStaticLossless(std.testing.allocator, buffer, .{});
     defer std.testing.allocator.free(encoded);
 
     const decode = @import("decode.zig");
@@ -1648,10 +1648,10 @@ fn fuzzEncodeLossyOne(_: void, smith: *std.testing.Smith) anyerror!void {
         .format = .rgba,
     };
 
-    const encoded = encodeStaticLossy(std.testing.allocator, buffer, .{
+    const encoded = try encodeStaticLossy(std.testing.allocator, buffer, .{
         .format = .lossy,
         .quality = quality,
-    }) catch return;
+    });
     defer std.testing.allocator.free(encoded);
 
     const decode = @import("decode.zig");

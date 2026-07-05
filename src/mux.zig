@@ -1165,14 +1165,12 @@ test "fuzz static mux from untrusted bitstream" {
 
     const vp8 = makeSimpleVP8(8, 6);
     var seed_payload: [64]u8 = undefined;
-    seed_payload[0] = 8;
-    seed_payload[1] = 6;
+    seed_payload[0] = 7; // decoded as 1 + (7 % 256) = 8, matching VP8 width
+    seed_payload[1] = 5; // decoded as 1 + (5 % 256) = 6, matching VP8 height
     seed_payload[2] = 1; // lossy, no alpha
     @memcpy(seed_payload[3..][0..vp8.len], &vp8);
-
     var seed_buffer: [128]u8 = undefined;
     const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, seed_payload[0 .. 3 + vp8.len]);
-
     try std.testing.fuzz({}, fuzzMuxStaticOne, .{ .corpus = &.{seed} });
 }
 
