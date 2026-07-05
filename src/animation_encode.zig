@@ -784,3 +784,62 @@ test "pixel animation encode survives allocation failure at every site" {
 
     try testing.checkAllAllocationFailures(gpa, encodeAnimationAllocationProbe, .{@as([]const FrameSource, &sources)});
 }
+
+fn fuzzAnimationEncodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [2048]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+    if (input_len < 2) return;
+
+    const dim_byte = input_buffer[0];
+    const width: u32 = 1 + (dim_byte % 16);
+    const height: u32 = 1 + ((dim_byte >> 4) % 16);
+    const format: features.FormatKind = if (input_buffer[1] & 1 != 0) .lossy else .lossless;
+
+    const dims = try image.Dimensions.init(width, height);
+    const pixel_count = @as(usize, width) * height * 4;
+    var pixel_buffer: [16 * 16 * 4]u8 = undefined;
+    @memset(&pixel_buffer, 0);
+    const available = input_len - 2;
+    const copy_len = @min(available, pixel_count);
+    @memcpy(pixel_buffer[0..copy_len], input_buffer[2..][0..copy_len]);
+
+    const buffer = image.Buffer{
+        .pixels = &pixel_buffer,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    const frames = [_]FrameSource{.{
+        .buffer = buffer,
+        .blend_method = .replace,
+        .format = format,
+    }};
+
+    const encoded = encodeAnimationFromBuffers(std.testing.allocator, &frames, .{
+        .canvas = dims,
+    }) catch return;
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try animation_decode.decodeAnimationAlloc(std.testing.allocator, encoded, .{});
+    defer decoded.deinit();
+}
+
+test "fuzz animation encode from pixel buffers" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const seed_payload = [_]u8{ 7 | (7 << 4), 0 } ++ .{
+        0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff,
+        0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff,
+        0xff, 0x00, 0xff, 0x80, 0x00, 0xff, 0xff, 0x80,
+        0x80, 0x80, 0x80, 0xff, 0x10, 0x20, 0x30, 0x40,
+        0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+        0xd0, 0xe0, 0xf0, 0x00, 0x11, 0x22, 0x33, 0x44,
+        0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        0xdd, 0xee, 0xff, 0x12, 0x34, 0x56, 0x78, 0x9a,
+    };
+    var seed_buffer: [128]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, &seed_payload);
+
+    try std.testing.fuzz({}, fuzzAnimationEncodeOne, .{ .corpus = &.{seed} });
+}

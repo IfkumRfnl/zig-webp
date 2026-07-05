@@ -1133,3 +1133,96 @@ test "animation mux survives allocation failure at every site" {
         }},
     );
 }
+
+fn fuzzMuxStaticOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [2048]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+    if (input_len < 3) return;
+
+    const width: u32 = 1 + (@as(u32, input_buffer[0]) % 256);
+    const height: u32 = 1 + (@as(u32, input_buffer[1]) % 256);
+    const flags = input_buffer[2];
+    const format: features.FormatKind = if (flags & 1 != 0) .lossy else .lossless;
+    const has_alpha = flags & 2 != 0;
+
+    const dims = try image.Dimensions.init(width, height);
+    const bitstream = input_buffer[3..input_len];
+
+    const encoded = encodeStatic(std.testing.allocator, .{
+        .canvas = dims,
+        .format = format,
+        .bitstream = bitstream,
+        .has_alpha = has_alpha,
+    }, .{}) catch return;
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try demux.parse(std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+}
+
+test "fuzz static mux from untrusted bitstream" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8 = makeSimpleVP8(8, 6);
+    var seed_payload: [64]u8 = undefined;
+    seed_payload[0] = 8;
+    seed_payload[1] = 6;
+    seed_payload[2] = 1; // lossy, no alpha
+    @memcpy(seed_payload[3..][0..vp8.len], &vp8);
+
+    var seed_buffer: [128]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, seed_payload[0 .. 3 + vp8.len]);
+
+    try std.testing.fuzz({}, fuzzMuxStaticOne, .{ .corpus = &.{seed} });
+}
+
+fn fuzzMuxAnimationOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [4096]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+    if (input_len < 1) return;
+
+    const flags = input_buffer[0];
+    const format0: features.FormatKind = if (flags & 1 != 0) .lossy else .lossless;
+    const format1: features.FormatKind = if (flags & 2 != 0) .lossy else .lossless;
+
+    const rest = input_buffer[1..input_len];
+    const mid = rest.len / 2;
+    const canvas = try image.Dimensions.init(16, 16);
+
+    const frames = [_]FrameImage{
+        .{
+            .rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 },
+            .format = format0,
+            .bitstream = rest[0..mid],
+        },
+        .{
+            .rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 },
+            .format = format1,
+            .bitstream = rest[mid..],
+        },
+    };
+
+    const encoded = encodeAnimation(std.testing.allocator, .{
+        .canvas = canvas,
+        .frames = &frames,
+    }, .{}) catch return;
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try demux.parse(std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+}
+
+test "fuzz animation mux from untrusted bitstreams" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8l = makeSimpleVP8L(16, 16, false);
+    var seed_payload: [64]u8 = undefined;
+    seed_payload[0] = 0; // both frames lossless
+    @memcpy(seed_payload[1..][0..vp8l.len], &vp8l);
+    @memcpy(seed_payload[1 + vp8l.len ..][0..vp8l.len], &vp8l);
+
+    var seed_buffer: [128]u8 = undefined;
+    const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, seed_payload[0 .. 1 + vp8l.len * 2]);
+
+    try std.testing.fuzz({}, fuzzMuxAnimationOne, .{ .corpus = &.{seed} });
+}
