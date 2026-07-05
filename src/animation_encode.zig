@@ -816,9 +816,9 @@ fn fuzzAnimationEncodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         .format = format,
     }};
 
-    const encoded = encodeAnimationFromBuffers(std.testing.allocator, &frames, .{
+    const encoded = try encodeAnimationFromBuffers(std.testing.allocator, &frames, .{
         .canvas = dims,
-    }) catch return;
+    });
     defer std.testing.allocator.free(encoded);
 
     var decoded = try animation_decode.decodeAnimationAlloc(std.testing.allocator, encoded, .{});
