@@ -25,7 +25,7 @@ below and can be turned into plans on request.
 | 007 | Step 11b — allocation-failure injection for animated decode | P1 | S | — | DONE — verified at `87ed625` (branch `deepseek/step-11b-animation-decode-alloc-failure`) |
 | 008 | Step 11c — fuzz smoke targets for the encode entry points | P1 | M | — | DONE — verified on branch `claude/step-11c-encoder-fuzz` |
 | 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | TODO |
-| 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | TODO |
+| 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — implemented on branch `claude/docs-truth-up-8c` (not pushed/merged; `zig build --list-steps` confirms the `ci` step; full `zig build ci`/`zig build test` deferred to orchestrator verification per phase skip rules) |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
