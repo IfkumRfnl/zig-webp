@@ -3,7 +3,7 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
-Version `0.1.0` (preview; the public API is not yet frozen). See
+Version `0.2.0` (preview; the public API is not yet frozen). See
 [`CHANGELOG.MD`](CHANGELOG.MD) for the release scope and
 [`RELEASING.MD`](RELEASING.MD) for the release gates and how each is checked.
 
@@ -67,6 +67,15 @@ encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). The only open
 step-9 item is the manual ≥2-browser render confirmation (two sample animations
 under `testdata/animation/`). The installed `zig-webp-encode` tool re-encodes a still WebP as
 lossy `VP8 `.
+
+Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered:
+lossy decode gained a vectorized YUV→RGB conversion and a table-driven VP8
+boolean reader (≈1.3× aggregate, byte-exact), and every public entry point is
+covered by a limits/malicious-input contract matrix, allocation-failure
+injection (still and animated), encode-side fuzz targets, and deterministic
+bounded mutation exploration of every fuzz seed. Untrusted input fails with
+documented errors under caller-set `ResourceLimits`, never with panics or
+unbounded allocation. Details and dated results live in `PROGRESS.MD`.
 
 ## Goals
 

@@ -34,6 +34,20 @@ measurements** that require `libwebp`'s `cwebp`/`dwebp`/`anim_dump` on `PATH`;
 their latest results are recorded with dates in `PROGRESS.MD`. Re-run them
 locally before tagging.
 
+### 0.2.0 gate status
+
+Verified at the `0.2.0` release commit (2026-07-07):
+
+- `zig build ci` — exit 0 (`zig fmt --check .`, `zig build check`,
+  `zig build test`; 452/452 tests, corpus regression / step-5 decode gate).
+- `zig build encode-report` — 77 sources, **0 round-trip mismatches** (step-7
+  validity).
+- `compare-encode-corpus` — **median ratio 1.0368×**, aggregate 1.0460×
+  (step-7 size gate, ≤ 1.10×; unchanged from `0.1.0`).
+- `compare-anim-corpus` — 10/10 committed animations byte-exact against
+  `anim_dump` (animation parity, re-run because decode hot paths changed in
+  step 10).
+
 ### 0.1.0 gate status
 
 Verified at the `0.1.0` commit:
