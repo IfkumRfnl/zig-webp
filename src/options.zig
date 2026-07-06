@@ -31,15 +31,21 @@ pub const EncoderOptions = struct {
     /// 5–6 currently clamp to 4 (no extra search above the 8b baseline yet).
     method: u8 = 4,
     /// Target output size in bytes. When set, the encoder runs a bounded
-    /// quantizer-index search (up to 8 passes, step 8c-3) to land within
-    /// tolerance of this size. Mutually exclusive with `target_psnr`; both
-    /// set ⇒ `error.InvalidEncodeOptions`. Unset → `quality` picks the
-    /// quantizer in a single pass.
+    /// quantizer-index search (up to 8 passes, step 8c-3) and returns the probe
+    /// whose byte size is closest to `target_size`. No error is raised if the
+    /// target is unattainable or unbracketed by the quantizer grid, so callers
+    /// should treat the result as the nearest candidate, not a guaranteed hit.
+    /// Mutually exclusive with `target_psnr`; both set ⇒
+    /// `error.InvalidEncodeOptions`. Unset → `quality` picks the quantizer in a
+    /// single pass.
     target_size: ?u32 = null,
     /// Target reconstructed luma PSNR in dB. When set, the encoder runs a
     /// bounded quantizer-index search (step 8c-3) for the coarsest quantizer
-    /// whose BT.601 luma PSNR still meets the request. Mutually exclusive
-    /// with `target_size`; both set ⇒ `error.InvalidEncodeOptions`.
+    /// whose BT.601 luma PSNR still meets the request; if no quantizer in the
+    /// search grid meets the target, the finest (highest-PSNR) probe reached is
+    /// returned, so callers should verify the achieved PSNR rather than assume
+    /// the request was met. Mutually exclusive with `target_size`; both set ⇒
+    /// `error.InvalidEncodeOptions`.
     target_psnr: ?f32 = null,
     /// Alpha-plane compression effort (0..100) for lossy+alpha (`ALPH`) output
     /// (step 8c-2). 0 emits an uncompressed `ALPH` chunk; 1..100 also tries the
