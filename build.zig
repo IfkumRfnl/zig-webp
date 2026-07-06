@@ -167,4 +167,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const fmt_check = b.addFmt(.{ .paths = &.{"."}, .check = true });
+    const ci_step = b.step("ci", "Run the full CI gate set: fmt check, compile, tests");
+    ci_step.dependOn(&fmt_check.step);
+    ci_step.dependOn(check_step);
+    ci_step.dependOn(&run_unit_tests.step);
 }
