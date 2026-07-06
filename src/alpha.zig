@@ -724,6 +724,15 @@ test "fuzz alpha plane decode" {
     try std.testing.fuzz({}, fuzzDecodePlaneOne, .{ .corpus = &.{seed} });
 }
 
+test "bounded mutation exploration of alpha plane decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    // A valid seed: uncompressed, unfiltered header byte plus an 8x8 plane.
+    const plane_payload = [_]u8{0} ++ [_]u8{0x80} ** 64;
+
+    try testing_fuzz.runMutations(fuzzDecodePlaneOne, &plane_payload, .{ .prng_seed = 0x11d_0003 });
+}
+
 fn fuzzDecodePlaneOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [1024]u8 = undefined;
     const input_len = smith.slice(&input_buffer);

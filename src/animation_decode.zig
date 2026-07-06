@@ -646,6 +646,18 @@ test "fuzz animation decode" {
     try std.testing.fuzz({}, fuzzAnimationOne, .{ .corpus = &.{seed} });
 }
 
+test "bounded mutation exploration of animation decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const file = try buildAnimation(testing.allocator, 4, 4, &.{
+        .{ .x = 0, .y = 0, .width = 4, .height = 4, .color = .{ 255, 0, 0, 255 }, .blend = .replace },
+        .{ .x = 2, .y = 2, .width = 2, .height = 2, .color = .{ 0, 255, 0, 64 }, .dispose = .background },
+    });
+    defer testing.allocator.free(file);
+
+    try testing_fuzz.runMutations(fuzzAnimationOne, file, .{ .prng_seed = 0x11d_0004 });
+}
+
 fn fuzzAnimationOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [4096]u8 = undefined;
     const input_len = smith.slice(&input_buffer);

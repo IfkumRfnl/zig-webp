@@ -79,6 +79,23 @@ Scope boundaries (no streaming decode, no inter-frame VP8, no ICC
 application, no C ABI yet) and the full roadmap with acceptance gates live
 in `PLAN.MD`; current status and dated oracle results live in `PROGRESS.MD`.
 
+## Install
+
+```sh
+zig fetch --save git+https://github.com/IfkumRfnl/zig-webp
+```
+
+```zig
+const webp_dep = b.dependency("zig_webp", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("webp", webp_dep.module("webp"));
+```
+
+Then in your code:
+
+```zig
+const webp = @import("webp");
+```
+
 ## Use
 
 ```sh
@@ -108,8 +125,10 @@ environment-dependent and is not a CI gate.
 alpha planes of the committed corpus in `testdata/libwebp-test-data`, and the
 composited frames of the committed animations in `testdata/animation`, are
 compared against SHA-256 hashes in `testdata/corpus-hashes.tsv` and
-`testdata/animation/hashes.tsv`, so the check needs no `dwebp`/`anim_dump`. CI
-runs `zig fmt --check .` and `zig build test` on every pull request. Regenerate
+`testdata/animation/hashes.tsv`, so the check needs no `dwebp`/`anim_dump`. The
+local `zig build ci` gate bundles the same three steps CI runs on every pull
+request — `zig fmt --check .`, `zig build check`, and `zig build test` — into a
+single command. Regenerate
 the manifests with `zig build corpus-hashes` / `zig build anim-hashes` only
 after a corpus-wide oracle run confirms the decoded planes and composited
 frames (`tools/webp-oracle.sh compare-anim`).

@@ -1174,6 +1174,21 @@ test "fuzz static mux from untrusted bitstream" {
     try std.testing.fuzz({}, fuzzMuxStaticOne, .{ .corpus = &.{seed} });
 }
 
+test "bounded mutation exploration of static mux" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8 = makeSimpleVP8(8, 6);
+    var seed_payload: [64]u8 = undefined;
+    seed_payload[0] = 7; // decoded as 1 + (7 % 256) = 8, matching VP8 width
+    seed_payload[1] = 5; // decoded as 1 + (5 % 256) = 6, matching VP8 height
+    seed_payload[2] = 1; // lossy, no alpha
+    @memcpy(seed_payload[3..][0..vp8.len], &vp8);
+
+    try testing_fuzz.runMutations(fuzzMuxStaticOne, seed_payload[0 .. 3 + vp8.len], .{
+        .prng_seed = 0x11d_0007,
+    });
+}
+
 fn fuzzMuxAnimationOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [4096]u8 = undefined;
     const input_len = smith.slice(&input_buffer);
@@ -1223,4 +1238,18 @@ test "fuzz animation mux from untrusted bitstreams" {
     const seed = testing_fuzz.sliceCorpusEntry(&seed_buffer, seed_payload[0 .. 1 + vp8l.len * 2]);
 
     try std.testing.fuzz({}, fuzzMuxAnimationOne, .{ .corpus = &.{seed} });
+}
+
+test "bounded mutation exploration of animation mux" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8l = makeSimpleVP8L(16, 16, false);
+    var seed_payload: [64]u8 = undefined;
+    seed_payload[0] = 0; // both frames lossless
+    @memcpy(seed_payload[1..][0..vp8l.len], &vp8l);
+    @memcpy(seed_payload[1 + vp8l.len ..][0..vp8l.len], &vp8l);
+
+    try testing_fuzz.runMutations(fuzzMuxAnimationOne, seed_payload[0 .. 1 + vp8l.len * 2], .{
+        .prng_seed = 0x11d_0008,
+    });
 }

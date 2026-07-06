@@ -1201,6 +1201,22 @@ test "fuzz strict demux" {
     try std.testing.fuzz({}, fuzzParseOne, .{ .corpus = &.{seed} });
 }
 
+test "bounded mutation exploration of strict demux" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const vp8l = makeSimpleVP8L(2, 5, true);
+    const payload_size = container.chunk_header_size + vp8l.len + 1;
+    var file_buffer: [container.riff_header_size + payload_size]u8 = undefined;
+    @memcpy(file_buffer[0..4], "RIFF");
+    container.writeLittleU32(file_buffer[4..8], @intCast(file_buffer.len - 8));
+    @memcpy(file_buffer[8..12], "WEBP");
+    var offset: usize = 12;
+    writeChunk(&file_buffer, &offset, "VP8L", &vp8l);
+    assert(offset == file_buffer.len);
+
+    try testing_fuzz.runMutations(fuzzParseOne, &file_buffer, .{ .prng_seed = 0x11d_0002 });
+}
+
 fn fuzzParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [2048]u8 = undefined;
     const input_len = smith.slice(&input_buffer);
