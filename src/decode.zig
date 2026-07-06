@@ -614,6 +614,27 @@ test "fuzz public static decode" {
     try std.testing.fuzz({}, fuzzDecodeStaticOne, .{ .corpus = &.{seed} });
 }
 
+test "bounded mutation exploration of static decode" {
+    const testing_fuzz = @import("testing/fuzz.zig");
+
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    try testing_fuzz.runMutations(fuzzDecodeStaticOne, encoded, .{ .prng_seed = 0x11d_0001 });
+}
+
 fn fuzzDecodeStaticOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [2048]u8 = undefined;
     const input_len = smith.slice(&input_buffer);

@@ -291,6 +291,35 @@ Revisit when the toolchain updates.
 
 ## Recently Completed
 
+### Step 11 — Robustness Hardening (slice 11d: bounded mutation exploration)
+
+Plan 009 (branch `claude/step-11d-bounded-random-fuzz`, PR #84) adds a
+deterministic, bounded mutation-exploration helper to the test fuzz harness and
+wires it into every public fuzz target. `src/testing/fuzz.zig` exposes
+`pub fn runMutations(body, payload, options)` which runs `variant_count`
+(default 128) reproducible mutations of a known-good seed payload, each framed
+like a corpus entry so the existing fuzz body's `smith.slice` read sees the
+mutated bytes. Each variant applies 1–8 random byte substitutions at random
+offsets and, with probability 1/8, is first truncated to a random length in
+[0, payload.len] (empty included, the key parser boundary). The PRNG is a
+fixed-seed `std.Random.DefaultPrng` seeded per call site from
+`MutationOptions.prng_seed` — never entropy — so any failure is a permanent,
+reproducible regression; all scratch lives on the caller stack (allocation-free,
+payload capped at 4096). Two helper self-tests pin the call count and seed
+reproducibility.
+
+Bounded-mutation tests were added to all nine public fuzz targets
+(`src/alpha.zig`, `src/animation_decode.zig`, `src/animation_encode.zig`,
+`src/decode.zig`, `src/demux.zig`, `src/encode.zig` lossless+lossy,
+`src/mux.zig` static+animation), each using a unique seed in `0x11d_0001`…
+`0x11d_0009` so the targets diverge. The internal VP8/VP8L fuzz targets are
+intentionally untouched.
+
+Gates verified 2026-07-06 on the branch: `zig fmt --check .` pass, `zig build
+check` pass, `zig build test` pass (451/451 tests). Full-suite timing was main
+baseline 153.09s vs branch 154.36s (+1.26s), within noise for the 128-variant
+budgets across nine targets plus the two `runMutations` self-tests.
+
 ### Step 11 — Robustness Hardening (slice 11a: limits matrix review follow-up)
 
 Review follow-up for PR #80 closed three hardening gaps in the Step 11a matrix.
