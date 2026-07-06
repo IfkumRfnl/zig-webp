@@ -24,7 +24,7 @@ below and can be turned into plans on request.
 | 006 | Step 11a — limits & malicious-input contract matrix | P1 | M | — | DONE — merged to main via PR #80 (commit `5d6ed3c`; follow-up commits `735e0de`/`5178480` closed enforcement gaps) |
 | 007 | Step 11b — allocation-failure injection for animated decode | P1 | S | — | DONE — verified at `87ed625` (branch `deepseek/step-11b-animation-decode-alloc-failure`) |
 | 008 | Step 11c — fuzz smoke targets for the encode entry points | P1 | M | — | DONE — verified on branch `claude/step-11c-encoder-fuzz` |
-| 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — implemented on branch `claude/step-11d-bounded-random-fuzz`; helper unit tests pass (single-file `zig test src/testing/fuzz.zig`), full `zig build test`/`fmt`/`check` gates deferred to orchestrator |
+| 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — verified on branch `claude/step-11d-bounded-random-fuzz` (gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | TODO |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | TODO |
 

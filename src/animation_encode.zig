@@ -858,5 +858,5 @@ test "bounded mutation exploration of animation encode" {
         0xdd, 0xee, 0xff, 0x12, 0x34, 0x56, 0x78, 0x9a,
     };
 
-    try testing_fuzz.runMutations(fuzzAnimationEncodeOne, &seed_payload, .{ .prng_seed = 0x11d_0007 });
+    try testing_fuzz.runMutations(fuzzAnimationEncodeOne, &seed_payload, .{ .prng_seed = 0x11d_0009 });
 }

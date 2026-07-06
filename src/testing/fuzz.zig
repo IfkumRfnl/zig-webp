@@ -42,8 +42,9 @@ pub const MutationOptions = struct {
 /// entry so the body's `smith.slice` read sees the mutated bytes.
 ///
 /// Each variant is the payload with 1–8 random byte substitutions at random
-/// offsets; with probability 1/8 it is first truncated to a random shorter
-/// length. The PRNG is a fixed-seed `std.Random.DefaultPrng` — no entropy — so
+/// offsets; with probability 1/8 it is first truncated to a random length in
+/// [0, payload.len] (empty included, the key parser boundary). The PRNG is a
+/// fixed-seed `std.Random.DefaultPrng` — no entropy — so
 /// a failure under this helper is a permanent, reproducible regression test.
 /// Bounded and allocation-free: all scratch lives on the stack of the caller.
 pub fn runMutations(
@@ -63,9 +64,11 @@ pub fn runMutations(
     var i: usize = 0;
     while (i < mutation_options.variant_count) : (i += 1) {
         const base_len: usize = payload.len;
-        // With probability 1/8, truncate to a random length in [1, base_len].
+        // With probability 1/8, truncate to a random length in [0, base_len]
+        // (empty included): the zero-length boundary is the most important one
+        // for parsers and was previously unreachable here.
         const len: usize = if (base_len == 0) 0 else if (random.uintLessThan(u8, 8) == 0)
-            random.uintLessThan(usize, base_len) + 1
+            random.uintLessThan(usize, base_len + 1)
         else
             base_len;
 
