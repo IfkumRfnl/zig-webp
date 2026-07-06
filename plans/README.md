@@ -22,11 +22,11 @@ below and can be turned into plans on request.
 | 004 | Scheduled Zig-master canary workflow (toolchain + fuzz watch) | P2 | S | — | DONE — verified at `f0c00c9` (merged #36, commit `d96dc73`) |
 | 005 | Document the public API surface in src/root.zig | P3 | M | 003 (soft) | DONE — verified at `f0c00c9` (merged #37, commit `353178c`) |
 | 006 | Step 11a — limits & malicious-input contract matrix | P1 | M | — | DONE — merged to main via PR #80 (commit `5d6ed3c`; follow-up commits `735e0de`/`5178480` closed enforcement gaps) |
-| 007 | Step 11b — allocation-failure injection for animated decode | P1 | S | — | DONE — verified at `87ed625` (branch `deepseek/step-11b-animation-decode-alloc-failure`) |
-| 008 | Step 11c — fuzz smoke targets for the encode entry points | P1 | M | — | DONE — verified on branch `claude/step-11c-encoder-fuzz` |
-| 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — verified on branch `claude/step-11d-bounded-random-fuzz` (gate results in PROGRESS.MD) |
+| 007 | Step 11b — allocation-failure injection for animated decode | P1 | S | — | DONE — merged as PR #81 (merge commit `fc33d30`; implementation commit `462183a`) |
+| 008 | Step 11c — fuzz smoke targets for the encode entry points | P1 | M | — | DONE — merged as PR #82 (commit `f512f5e`; review follow-up PR #83, commit `0c33777`) |
+| 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — merged as PR #84 (commit `71ae902`; gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
-| 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — verified on branch `claude/vp8l-palette-hash-probe` |
+| 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
