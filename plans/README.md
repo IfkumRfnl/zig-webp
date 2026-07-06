@@ -26,7 +26,7 @@ below and can be turned into plans on request.
 | 008 | Step 11c — fuzz smoke targets for the encode entry points | P1 | M | — | DONE — verified on branch `claude/step-11c-encoder-fuzz` |
 | 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — verified on branch `claude/step-11d-bounded-random-fuzz` (gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
-| 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | TODO |
+| 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — verified on branch `claude/vp8l-palette-hash-probe` |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

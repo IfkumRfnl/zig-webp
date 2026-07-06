@@ -418,13 +418,38 @@ fn tryBuildPalette(
     var palette_buffer: [palette_size_max]pixel.Pixel = undefined;
     var palette_count: usize = 0;
 
-    // Collect distinct colors, bailing out past the palette limit.
+    // Collect distinct colors via a fixed open-addressing probe table so the
+    // scan is O(pixels) instead of O(pixels × palette_size_max). The table
+    // stores u16 indices into `palette_buffer` (with `maxInt(u16)` as the
+    // empty sentinel), sidestepping the pixel-value-0 sentinel problem: 0 is
+    // a legitimate pixel value, but index 0 only occupies a slot once a real
+    // color is written there. Reuses `color_cache.multiplier` for the hash.
+    const probe_table_bits: u5 = 10;
+    const probe_table_len: usize = @as(usize, 1) << probe_table_bits;
+    // Load factor ≤ 0.25 at the 256-color bail-out; if `color_table_size_max`
+    // ever grows, this assert forces the table to scale with it.
+    comptime assert(probe_table_len >= 4 * palette_size_max);
+    const probe_empty = std.math.maxInt(u16);
+    var probe_table: [probe_table_len]u16 = [_]u16{probe_empty} ** probe_table_len;
+    const probe_shift: u5 = @intCast(32 - @as(u6, probe_table_bits));
+
+    // Collect distinct colors, bailing out past the palette limit. The probe
+    // loop is bounded by `probe_table_len`; the table can never fill (256
+    // entries max in 1024 slots), so an empty slot is always reached.
     outer: for (source) |value| {
-        for (palette_buffer[0..palette_count]) |existing| {
-            if (existing == value) continue :outer;
+        const hash: u32 = color_cache.multiplier *% value;
+        var slot: usize = @intCast(hash >> probe_shift);
+        var probes: usize = 0;
+        while (probes < probe_table_len) : (probes += 1) {
+            const idx = probe_table[slot];
+            if (idx == probe_empty) break;
+            if (palette_buffer[idx] == value) continue :outer;
+            slot = (slot + 1) & (probe_table_len - 1);
         }
+        // Empty slot found: insert, bailing past the palette limit.
         if (palette_count == palette_size_max) return null;
         palette_buffer[palette_count] = value;
+        probe_table[slot] = @intCast(palette_count);
         palette_count += 1;
     }
 
@@ -1928,6 +1953,63 @@ test "encodes and round-trips a two-color (1-bit packed) palette image" {
     var pixels: [width * height]pixel.Pixel = undefined;
     for (&pixels, 0..) |*p, i| p.* = if ((i * 7 + i / 3) % 3 == 0) a else b;
     try decodeRoundTrip(testing.allocator, dims, &pixels);
+}
+
+test "tryBuildPalette collects transparent vs opaque black and bails past 256" {
+    // Exercises the probe-table edge cases the old linear scan handled
+    // implicitly: pixel value 0 (transparent black) is a legitimate color and
+    // must not collide with the u16-index empty sentinel; the >256 bail-out
+    // must fire on the 257th *distinct* color.
+
+    // Transparent black (0x00000000) and opaque black (0xFF000000) are both
+    // collected as distinct. Sorted ascending as u32: 0 then 0xFF000000.
+    {
+        const dims = try image.Dimensions.init(2, 1);
+        const pixels = [_]pixel.Pixel{ 0x00000000, 0xFF000000 };
+        const built = try tryBuildPalette(testing.allocator, dims, &pixels);
+        try testing.expect(built != null);
+        const b = built.?;
+        defer testing.allocator.free(b.palette);
+        defer testing.allocator.free(b.index_pixels);
+        defer testing.allocator.free(b.record.delta_table);
+        try testing.expectEqual(@as(usize, 2), b.palette.len);
+        try testing.expectEqual(@as(pixel.Pixel, 0x00000000), b.palette[0]);
+        try testing.expectEqual(@as(pixel.Pixel, 0xFF000000), b.palette[1]);
+    }
+
+    // Exactly 256 distinct colors: palette succeeds with count == 256.
+    {
+        const width: usize = 256;
+        const height: usize = 1;
+        const dims = try image.Dimensions.init(width, height);
+        const pixels = try testing.allocator.alloc(pixel.Pixel, width * height);
+        defer testing.allocator.free(pixels);
+        for (pixels, 0..) |*p, i| {
+            p.* = pixel.fromChannels(255, @intCast(i % 256), @intCast(i / 256), 0);
+        }
+        const built = try tryBuildPalette(testing.allocator, dims, pixels);
+        try testing.expect(built != null);
+        const b = built.?;
+        defer testing.allocator.free(b.palette);
+        defer testing.allocator.free(b.index_pixels);
+        defer testing.allocator.free(b.record.delta_table);
+        try testing.expectEqual(@as(usize, 256), b.palette.len);
+    }
+
+    // 257 distinct colors: the 257th distinct color triggers the bail-out
+    // past palette_size_max and tryBuildPalette returns null.
+    {
+        const width: usize = 257;
+        const height: usize = 1;
+        const dims = try image.Dimensions.init(width, height);
+        const pixels = try testing.allocator.alloc(pixel.Pixel, width * height);
+        defer testing.allocator.free(pixels);
+        for (pixels, 0..) |*p, i| {
+            p.* = pixel.fromChannels(255, @intCast(i % 256), @intCast(i / 256), 0);
+        }
+        const built = try tryBuildPalette(testing.allocator, dims, pixels);
+        try testing.expect(built == null);
+    }
 }
 
 test "encodes and round-trips a repetitive pattern exercising LZ77 copies" {
