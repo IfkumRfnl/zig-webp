@@ -1,8 +1,11 @@
 //! Public module surface for zig-webp, a zero-dependency WebP codec.
 //!
 //! Most callers need only a handful of names:
-//! - `decodeStatic` — decode a complete WebP file to pixels
-//!   (still lossless only at present; see PLAN.MD step 5 for lossy).
+//! - `decodeStatic` — decode a complete WebP still to pixels (lossless,
+//!   lossy, and lossy+alpha).
+//! - `decodeAnimation` — decode a complete animated WebP to composited frames.
+//! - `encodeLossless` — encode pixels into a lossless (VP8L) WebP file.
+//! - `encodeLossy` — encode pixels into a lossy (VP8) WebP file.
 //! - `parseFeatures` — probe dimensions/format/alpha/animation/metadata
 //!   without decoding pixels.
 //! - `parseWebP` — strict RIFF demux to chunk locations.
@@ -230,8 +233,9 @@ pub fn parseWebP(
 }
 
 /// Muxes an already-encoded VP8/VP8L bitstream (`StaticImage`) into a
-/// canonical WebP file. It does not encode pixels — bitstream encoders are
-/// future work. Returns caller-owned bytes (free with the same allocator).
+/// canonical WebP file. It does not encode pixels — use
+/// `encodeLossless`/`encodeLossy` for that. Returns caller-owned bytes
+/// (free with the same allocator).
 pub fn encodeStatic(
     gpa: std.mem.Allocator,
     static_image: StaticImage,
@@ -300,10 +304,10 @@ pub fn encodeAnimationMinimized(
 /// WebP file. The buffer may be `rgba`/`bgra`/`argb` (4-channel) or `rgb`
 /// (treated as opaque), read row-major honoring its stride. The current VP8L
 /// encoder applies LZ77 back-references plus decision-gated subtract-green,
-/// color, predictor, and palette/color-indexing transforms (single global
-/// prefix-code group, no color cache yet; see PLAN.MD step 7), so the output is
-/// valid and round-trips bit-exactly. `encode_options.format` must be
-/// `.lossless`.
+/// color, predictor, and palette/color-indexing transforms, with an optional
+/// color cache and optional meta-prefix (multiple prefix-code groups), each
+/// chosen by measured encoded size, so the output is valid and round-trips
+/// bit-exactly. `encode_options.format` must be `.lossless`.
 ///
 /// Set `encode_options.metadata` (raw ICCP/EXIF/XMP payloads) to attach metadata
 /// (step 9d); the file is then an extended (`VP8X`) container with those chunks

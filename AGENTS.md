@@ -51,5 +51,5 @@
     encoder/test ideas.
 - Do not copy reference implementation code. Reimplement from the specs and
   validate behavior with tests.
-- Run `zig fmt .` and `zig build test` before handing work back.
+- Run `zig build ci` (or `zig fmt .` plus `zig build check` plus `zig build test`) before handing work back.
 - Do not commit generated build output such as `.zig-cache/` or `zig-out/`.

@@ -5,7 +5,7 @@
     .fingerprint = 0x5614d508c6f31e1d,
     .dependencies = .{},
     .paths = .{
-        "AGENTS.MD",
+        "AGENTS.md",
         "CHANGELOG.MD",
         "PLAN.MD",
         "PROGRESS.MD",
