@@ -99,7 +99,7 @@ mechanically.
 
 ## Git workflow
 
-- Branch: `claude/c-abi-design` (repo convention: `claude/<slug>`).
+- Branch: `c-abi-design` (repo convention: `<slug>`).
 - Commit style: single imperative summary line, e.g.
   `Add C-ABI design section to PLAN.MD (step 13, post-1.0)`.
 - Do NOT push or open a PR unless the operator instructed it.

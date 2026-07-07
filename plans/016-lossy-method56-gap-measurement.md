@@ -121,8 +121,7 @@ the question.
 
 ## Git workflow
 
-- Branch: `claude/lossy-m56-gap-measurement` (repo convention:
-  `claude/<slug>`).
+- Branch: `lossy-m56-gap-measurement` (repo convention: `<slug>`).
 - Commit style: single imperative summary line, e.g.
   `Record lossy m5/m6 headroom measurements and recommendation`.
 - Do NOT push or open a PR unless the operator instructed it.

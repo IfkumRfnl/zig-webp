@@ -110,7 +110,7 @@ browser-check procedure.
 
 ## Git workflow
 
-- Branch: `claude/one-oh-compat-matrix` (repo convention: `claude/<slug>`).
+- Branch: `one-oh-compat-matrix` (repo convention: `<slug>`).
 - Commit style: single imperative summary line, e.g.
   `Define 1.0 stability tiers and add BE/macOS CI compatibility jobs`.
 - Do NOT push or open a PR unless the operator instructed it.

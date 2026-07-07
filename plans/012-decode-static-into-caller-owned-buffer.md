@@ -191,8 +191,7 @@ foundation the future C-ABI layer (plan 015) will export.
 
 ## Git workflow
 
-- Branch: `claude/decode-static-into` (repo convention: `claude/<slug>`;
-  see `git log` merges like `claude/step-11a-limits-hardening`).
+- Branch: `decode-static-into` (repo convention: `<slug>`; see `git log` merges like `step-11a-limits-hardening`).
 - Commit style: single imperative summary line, e.g.
   `Add decodeStaticInto: static decode into caller-owned buffers`.
 - Do NOT push or open a PR unless the operator instructed it.

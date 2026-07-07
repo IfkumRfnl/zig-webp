@@ -111,7 +111,7 @@ cannot silently rot.
 
 ## Git workflow
 
-- Branch: `claude/wasm32-spike` (repo convention: `claude/<slug>`).
+- Branch: `wasm32-spike` (repo convention: `<slug>`).
 - Commit style: single imperative summary line, e.g.
   `Add wasm32 compile gate and record wasm spike findings`.
 - Do NOT push or open a PR unless the operator instructed it.

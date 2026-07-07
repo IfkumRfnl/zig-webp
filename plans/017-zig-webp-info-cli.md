@@ -110,7 +110,7 @@ direction option in the 2026-06-13 audit and remains unbuilt.
 
 ## Git workflow
 
-- Branch: `claude/zig-webp-info-cli` (repo convention: `claude/<slug>`).
+- Branch: `zig-webp-info-cli` (repo convention: `<slug>`).
 - Commit style: single imperative summary line, e.g.
   `Add zig-webp-info: webpinfo-style container probe CLI`.
 - Do NOT push or open a PR unless the operator instructed it.
