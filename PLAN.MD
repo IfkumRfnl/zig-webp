@@ -376,7 +376,8 @@ input.
 
 - Stabilize APIs for:
   - feature probing without full decode;
-  - static decode to caller-owned buffers;
+  - static decode to caller-owned buffers (delivered: `decodeStaticInto`,
+    see `PROGRESS.MD`);
   - static encode from typed pixel buffers;
   - animation iteration and composition;
   - metadata extraction and muxing;

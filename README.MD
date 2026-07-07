@@ -16,8 +16,10 @@ locally generated `cwebp` files, both the simple and normal in-loop filters),
 converts to RGB with fancy chroma upsampling, and composes the decoded ALPH
 plane over lossy color — byte-exact against `dwebp -pam` for every lossy file,
 including lossy+alpha. The public `decodeStatic` entry point decodes both
-lossless and lossy stills to packed RGBA/BGRA/ARGB/RGB. Animated WebP decode
-is available too: `decodeAnimation` returns every composited frame, and
+lossless and lossy stills to packed RGBA/BGRA/ARGB/RGB, and `decodeStaticInto`
+performs the same decode into a caller-owned pixel buffer, honoring its
+stride and format. Animated WebP decode is available too: `decodeAnimation`
+returns every composited frame, and
 `AnimationDecoder` streams them one at a time over a reused canvas — both
 byte-exact against libwebp's `anim_dump` across a generated corpus spanning
 lossless/lossy/mixed frames, alpha, and every dispose/blend combination. The

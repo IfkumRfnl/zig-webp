@@ -19,11 +19,15 @@ const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
 
-pub fn decodeStatic(
+/// Shared demux prologue for the public static decode entry points: parses
+/// the container, rejects animations, and locates the still bitstream. The
+/// returned `ImageSource` borrows only from `bytes` (chunk payloads are
+/// slices of the input), so the demux result is torn down before returning.
+fn parseStaticSource(
     gpa: std.mem.Allocator,
     bytes: []const u8,
     decode_options: options.DecoderOptions,
-) errors.Error!image.OwnedBuffer {
+) errors.Error!ImageSource {
     var parsed = try demux.parse(gpa, bytes, .{
         .limits = decode_options.limits,
     });
@@ -34,12 +38,64 @@ pub fn decodeStatic(
     const format = parsed.features.format orelse return error.MissingImageData;
     const image_chunk = parsed.features.image_data orelse return error.MissingImageData;
 
-    return decodeImage(gpa, .{
+    return .{
         .format = format,
         .bitstream = image_chunk.payload(bytes),
         .alpha = if (parsed.features.alpha) |location| location.payload(bytes) else null,
         .dimensions = parsed.features.canvas,
-    }, decode_options);
+    };
+}
+
+pub fn decodeStatic(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    decode_options: options.DecoderOptions,
+) errors.Error!image.OwnedBuffer {
+    const source = try parseStaticSource(gpa, bytes, decode_options);
+    return decodeImage(gpa, source, decode_options);
+}
+
+/// Decodes a complete still WebP file into the caller-owned `dest` buffer,
+/// row-major, honoring `dest.stride`. `dest.format` is authoritative;
+/// `decode_options.output_format` is ignored on this path. `dest` must pass
+/// `Buffer.validate()` and `dest.dimensions` must exactly equal the file's
+/// canvas dimensions — any mismatch returns `error.InvalidCanvasSize`. Both
+/// checks run before any pixel is decoded. Internal scratch (including one
+/// packed output-sized buffer that is copied into `dest` and freed) is still
+/// allocated from `gpa` and budgeted against
+/// `decode_options.limits.allocation_bytes_max`, exactly like `decodeStatic`.
+/// Bytes in `dest.pixels` outside the written rows (stride padding, tail
+/// slack) are left untouched. Animated inputs fail with
+/// `error.UnsupportedAnimationDecode`.
+pub fn decodeStaticInto(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    dest: image.Buffer,
+    decode_options: options.DecoderOptions,
+) errors.Error!void {
+    try dest.validate();
+
+    const source = try parseStaticSource(gpa, bytes, decode_options);
+    if (dest.dimensions.width != source.dimensions.width) return error.InvalidCanvasSize;
+    if (dest.dimensions.height != source.dimensions.height) return error.InvalidCanvasSize;
+
+    var into_options = decode_options;
+    into_options.output_format = dest.format;
+    var decoded = try decodeImage(gpa, source, into_options);
+    defer decoded.deinit();
+
+    assert(decoded.buffer.format == dest.format);
+    // `decodeImage` always returns a packed buffer, so row `y` starts at
+    // `y * row_bytes` on the source side.
+    const row_bytes: usize = @intCast(try dest.rowBytes());
+    assert(decoded.buffer.stride == row_bytes);
+
+    var y: usize = 0;
+    while (y < dest.dimensions.height) : (y += 1) {
+        const source_row = decoded.buffer.pixels[y * row_bytes ..][0..row_bytes];
+        const target_row = dest.pixels[y * @as(usize, dest.stride) ..][0..row_bytes];
+        @memcpy(target_row, source_row);
+    }
 }
 
 /// A single still image's bitstream plus the chunk-level context needed to
@@ -692,4 +748,237 @@ test "meta-prefix static decode survives allocation failure at every site" {
         decodeStaticAllocationProbe,
         .{encoded},
     );
+}
+
+test "decodeStaticInto matches decodeStatic on a lossless corpus file" {
+    const corpus = @import("testing/corpus.zig");
+
+    const bytes = corpus.readFileAlloc(std.testing.allocator, "lossless1.webp", .{}) catch |err| switch (err) {
+        error.CorpusUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(bytes);
+
+    var expected = try decodeStatic(std.testing.allocator, bytes, .{});
+    defer expected.deinit();
+
+    const dest_pixels = try std.testing.allocator.alloc(u8, expected.buffer.pixels.len);
+    defer std.testing.allocator.free(dest_pixels);
+    const dest = image.Buffer{
+        .pixels = dest_pixels,
+        .dimensions = expected.buffer.dimensions,
+        .stride = expected.buffer.stride,
+        .format = .rgba,
+    };
+
+    try decodeStaticInto(std.testing.allocator, bytes, dest, .{});
+    try std.testing.expectEqualSlices(u8, expected.buffer.pixels, dest.pixels);
+}
+
+test "decodeStaticInto matches decodeStatic on a lossy corpus file" {
+    const corpus = @import("testing/corpus.zig");
+
+    const bytes = corpus.readFileAlloc(std.testing.allocator, "test.webp", .{}) catch |err| switch (err) {
+        error.CorpusUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(bytes);
+
+    var expected = try decodeStatic(std.testing.allocator, bytes, .{});
+    defer expected.deinit();
+
+    const dest_pixels = try std.testing.allocator.alloc(u8, expected.buffer.pixels.len);
+    defer std.testing.allocator.free(dest_pixels);
+    const dest = image.Buffer{
+        .pixels = dest_pixels,
+        .dimensions = expected.buffer.dimensions,
+        .stride = expected.buffer.stride,
+        .format = .rgba,
+    };
+
+    try decodeStaticInto(std.testing.allocator, bytes, dest, .{});
+    try std.testing.expectEqualSlices(u8, expected.buffer.pixels, dest.pixels);
+}
+
+test "decodeStaticInto honors stride and leaves padding untouched" {
+    const dimensions = try image.Dimensions.init(2, 2);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    // Stride 16 with 8-byte rows leaves 8 padding bytes after row 0, plus 8
+    // bytes of tail slack after row 1; all 16 sentinel bytes must survive.
+    const stride: u32 = 16;
+    var dest_pixels: [2 * 16]u8 = @splat(0xaa);
+    const dest = image.Buffer{
+        .pixels = &dest_pixels,
+        .dimensions = dimensions,
+        .stride = stride,
+        .format = .rgba,
+    };
+
+    try decodeStaticInto(std.testing.allocator, encoded, dest, .{});
+
+    const row = [_]u8{ 1, 2, 3, 4, 1, 2, 3, 4 };
+    const padding = [_]u8{0xaa} ** 8;
+    try std.testing.expectEqualSlices(u8, &row, dest_pixels[0..8]);
+    try std.testing.expectEqualSlices(u8, &padding, dest_pixels[8..16]);
+    try std.testing.expectEqualSlices(u8, &row, dest_pixels[16..24]);
+    try std.testing.expectEqualSlices(u8, &padding, dest_pixels[24..32]);
+}
+
+test "decodeStaticInto lets dest.format override output_format" {
+    const dimensions = try image.Dimensions.init(1, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    var expected = try decodeStatic(std.testing.allocator, encoded, .{
+        .output_format = .bgra,
+    });
+    defer expected.deinit();
+
+    var dest_pixels: [4]u8 = undefined;
+    const dest = image.Buffer{
+        .pixels = &dest_pixels,
+        .dimensions = dimensions,
+        .stride = 4,
+        .format = .bgra,
+    };
+
+    // The options ask for rgba; the caller's buffer format must win.
+    try decodeStaticInto(std.testing.allocator, encoded, dest, .{
+        .output_format = .rgba,
+    });
+    try std.testing.expectEqualSlices(u8, expected.buffer.pixels, &dest_pixels);
+}
+
+test "decodeStaticInto rejects dimension mismatches" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    // Larger and smaller than the 2x1 canvas must both be rejected.
+    var dest_pixels: [3 * 4]u8 = undefined;
+    try std.testing.expectError(error.InvalidCanvasSize, decodeStaticInto(
+        std.testing.allocator,
+        encoded,
+        .{
+            .pixels = &dest_pixels,
+            .dimensions = try image.Dimensions.init(3, 1),
+            .stride = 12,
+            .format = .rgba,
+        },
+        .{},
+    ));
+    try std.testing.expectError(error.InvalidCanvasSize, decodeStaticInto(
+        std.testing.allocator,
+        encoded,
+        .{
+            .pixels = &dest_pixels,
+            .dimensions = try image.Dimensions.init(1, 1),
+            .stride = 4,
+            .format = .rgba,
+        },
+        .{},
+    ));
+}
+
+test "decodeStaticInto rejects undersized pixel slices" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var vp8l_payload: [32]u8 = undefined;
+    const bitstream = try makeConstantVP8L(
+        &vp8l_payload,
+        dimensions,
+        vp8l_pixel.fromChannels(4, 1, 2, 3),
+    );
+    const encoded = try mux.encodeStatic(std.testing.allocator, .{
+        .canvas = dimensions,
+        .format = .lossless,
+        .bitstream = bitstream,
+        .has_alpha = true,
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+
+    // 2x1 rgba needs 8 bytes; 7 must fail `dest.validate()` up front.
+    var dest_pixels: [7]u8 = undefined;
+    try std.testing.expectError(error.OutputTooLarge, decodeStaticInto(
+        std.testing.allocator,
+        encoded,
+        .{
+            .pixels = &dest_pixels,
+            .dimensions = dimensions,
+            .stride = 8,
+            .format = .rgba,
+        },
+        .{},
+    ));
+}
+
+test "decodeStaticInto rejects animated input" {
+    const animation_encode = @import("animation_encode.zig");
+
+    const dimensions = try image.Dimensions.init(2, 2);
+    var frame_pixels: [2 * 2 * 4]u8 = @splat(0x80);
+    const frame = animation_encode.FrameSource{
+        .buffer = .{
+            .pixels = &frame_pixels,
+            .dimensions = dimensions,
+            .stride = 2 * 4,
+            .format = .rgba,
+        },
+        .duration_ms = 100,
+        .format = .lossless,
+    };
+    const sources = [_]animation_encode.FrameSource{ frame, frame };
+    const encoded = try animation_encode.encodeAnimationFromBuffers(
+        std.testing.allocator,
+        &sources,
+        .{ .canvas = dimensions },
+    );
+    defer std.testing.allocator.free(encoded);
+
+    var dest_pixels: [2 * 2 * 4]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedAnimationDecode, decodeStaticInto(
+        std.testing.allocator,
+        encoded,
+        .{
+            .pixels = &dest_pixels,
+            .dimensions = dimensions,
+            .stride = 2 * 4,
+            .format = .rgba,
+        },
+        .{},
+    ));
 }

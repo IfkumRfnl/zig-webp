@@ -30,7 +30,7 @@ below and can be turned into plans on request.
 | 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — merged as PR #84 (commit `71ae902`; gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
-| 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | TODO |
+| 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — executed on branch `decode-static-into` (commit `5843be4`); not yet merged (no PR opened per instructions) |
 | 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | TODO |
 | 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | TODO |
 | 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
@@ -40,6 +40,16 @@ below and can be turned into plans on request.
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-07** — Plan 012 executed end to end on branch
+  `decode-static-into`, commit `5843be4`. Drift check against planning commit
+  `4c5572a` was clean (zero diff in every in-scope file). Added
+  `decodeStaticInto` to `src/decode.zig` (shared `parseStaticSource` prologue
+  with `decodeStatic`, copy-based v1 per the plan's design decisions) and
+  re-exported it from `src/root.zig`; the stale `EncoderOptions` comment was
+  fixed in the same step. Seven decode tests plus five hardening-matrix rows
+  landed (452→464 tests, all passing); no STOP condition triggered and the
+  SHA-256 corpus gate pins `decodeStatic` unchanged. `zig build ci` exit 0.
 
 - **2026-07-04** — Plan 006 verified DONE on main: branch
   `claude/step-11a-limits-hardening` merged as PR #80 (HEAD `5d6ed3c`), with

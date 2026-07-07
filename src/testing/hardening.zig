@@ -302,6 +302,96 @@ test "decodeStatic honors allocation_bytes_max for lossy compressed alpha" {
     ));
 }
 
+/// Packed 8x8 rgba destination for the `decodeStaticInto` matrix rows.
+fn stillDestBuffer(pixels: *[still_w * still_h * 4]u8) !image.Buffer {
+    return .{
+        .pixels = pixels,
+        .dimensions = try image.Dimensions.init(still_w, still_h),
+        .stride = still_w * 4,
+        .format = .rgba,
+    };
+}
+
+test "decodeStaticInto honors input_bytes_max" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    var pixels: [still_w * still_h * 4]u8 = undefined;
+    try testing.expectError(error.InputTooLarge, decode.decodeStaticInto(
+        testing.allocator,
+        file,
+        try stillDestBuffer(&pixels),
+        .{ .limits = .{ .input_bytes_max = 8 } },
+    ));
+}
+
+test "decodeStaticInto honors output_pixels_max" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    var pixels: [still_w * still_h * 4]u8 = undefined;
+    try testing.expectError(error.CanvasTooLarge, decode.decodeStaticInto(
+        testing.allocator,
+        file,
+        try stillDestBuffer(&pixels),
+        .{ .limits = .{ .output_pixels_max = still_px - 1 } },
+    ));
+}
+
+test "decodeStaticInto honors allocation_bytes_max" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    // Same cap rationale as the decodeStatic row above: above demux
+    // bookkeeping, below decodeLossless's cumulative scratch reservation. The
+    // caller-owned dest is not charged, but the internal packed output is.
+    var pixels: [still_w * still_h * 4]u8 = undefined;
+    try testing.expectError(error.AllocationLimitExceeded, decode.decodeStaticInto(
+        testing.allocator,
+        file,
+        try stillDestBuffer(&pixels),
+        .{ .limits = .{ .allocation_bytes_max = 1024 } },
+    ));
+}
+
+test "decodeStaticInto fails with an error on truncated input" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    var pixels: [still_w * still_h * 4]u8 = undefined;
+    const dest = try stillDestBuffer(&pixels);
+
+    // Every truncation point must produce a clean error, never a panic or a
+    // partial write being reported as success.
+    var keep: usize = 0;
+    while (keep < file.len) : (keep += 1) {
+        const result = decode.decodeStaticInto(testing.allocator, file[0..keep], dest, .{});
+        try testing.expect(std.meta.isError(result));
+    }
+}
+
+fn decodeStaticIntoAllocationProbe(
+    gpa: std.mem.Allocator,
+    encoded: []const u8,
+    dest: image.Buffer,
+) !void {
+    try decode.decodeStaticInto(gpa, encoded, dest, .{});
+}
+
+test "decodeStaticInto survives allocation failure at every site" {
+    const file = try buildLosslessStill(testing.allocator);
+    defer testing.allocator.free(file);
+
+    // The dest buffer is caller-provided, so only internal scratch
+    // allocations are injected.
+    var pixels: [still_w * still_h * 4]u8 = undefined;
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        decodeStaticIntoAllocationProbe,
+        .{ file, try stillDestBuffer(&pixels) },
+    );
+}
+
 test "demux.parse honors input_bytes_max" {
     const file = try buildLosslessStill(testing.allocator);
     defer testing.allocator.free(file);
