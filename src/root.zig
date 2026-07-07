@@ -14,9 +14,30 @@
 //! - `encodeStatic` — mux an existing VP8/VP8L bitstream into a WebP file.
 //! - `ResourceLimits` / `DecoderOptions` — bound untrusted-input handling.
 //!
-//! The `vp8_*` and `vp8l_*` exports expose codec internals for tooling,
-//! tests, and advanced callers; their APIs are less stable than the
-//! functions above.
+//! ## API stability tiers
+//!
+//! - **Tier 1 (stable at 1.0, semver-governed)**: the entry points
+//!   `decodeStatic`, `decodeStaticInto`, `decodeAnimation`,
+//!   `AnimationDecoder`, `encodeLossless`, `encodeLossy`, `encodeStatic`,
+//!   `encodeAnimation`, `encodeAnimationFromBuffers`,
+//!   `encodeAnimationMinimized`, `parseFeatures`, `parseWebP`, `isWebP`,
+//!   `parseHeader`, `parseChunkHeader`, and `errorCategory`, plus their
+//!   parameter and result types: `DecoderOptions`, `EncoderOptions`,
+//!   `ResourceLimits`, `ImageBuffer`, `Dimensions`, `PixelFormat` (via
+//!   `image`), `Error`/`ErrorCategory`, `FeatureSummary`, `DemuxResult`,
+//!   the animation option/frame types (`AnimationImage`,
+//!   `AnimationFrameImage`, `AnimationInfo`, `CompositedFrame`,
+//!   `DecodedAnimation`, `DecodedAnimationFrame`, `AnimationFrameSource`,
+//!   `AnimationEncodeOptions`, `AnimationFrameInput`,
+//!   `AnimationMinimizeOptions`), and `MetadataPayloads`.
+//! - **Tier 2 (internals, no stability promise)**: the `vp8_*` and `vp8l_*`
+//!   module exports and their aliased `VP8*`/`VP8L*` types, plus
+//!   `bit_reader`/`bit_writer`, `testing`, and the other module re-exports —
+//!   exported for tooling, tests, and advanced callers; they may change in
+//!   any release.
+//!
+//! The breaking-change rule: additions to `errors.Error` are not breaking;
+//! removals or renames of Tier 1 names are.
 
 const std = @import("std");
 const corpus_tests = @import("testing/corpus.zig");

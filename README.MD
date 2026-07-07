@@ -7,6 +7,16 @@ Version `0.2.0` (preview; the public API is not yet frozen). See
 [`CHANGELOG.MD`](CHANGELOG.MD) for the release scope and
 [`RELEASING.MD`](RELEASING.MD) for the release gates and how each is checked.
 
+API stability is two-tiered: the named entry points (`decodeStatic`,
+`decodeStaticInto`, `decodeAnimation`, `AnimationDecoder`, the `encode*`
+functions, `parseFeatures`, `parseWebP`, `isWebP`, `parseHeader`,
+`parseChunkHeader`, `errorCategory`) and their parameter/result types are
+**Tier 1** — stable at 1.0 and semver-governed. The `vp8_*`/`vp8l_*` module
+exports, `bit_reader`/`bit_writer`, `testing`, and other module re-exports
+are **Tier 2** internals with no stability promise. Additions to
+`errors.Error` are not breaking; removals or renames of Tier 1 names are.
+See the module doc comment in `src/root.zig` for the full Tier 1 list.
+
 Status: static decode is complete for lossless (VP8L), lossy (VP8), and ALPH
 alpha, all matching `dwebp` byte-for-byte on the local `libwebp-test-data`
 corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
