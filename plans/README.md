@@ -3,6 +3,9 @@
 Plans 001–005: improve-skill audit of 2026-06-13 (commit `1aa7670`). Plan 006:
 step-11a slice authored against the roadmap. Plans 007–011: improve-skill
 audit of 2026-07-04 (commit `5d6ed3c`, standard depth, all categories).
+Plans 012–017: improve-skill **direction** audit of 2026-07-07 (commit
+`4c5572a`, `next` variant — roadmap options, not defects; the maintainer
+selected all six).
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -27,6 +30,12 @@ below and can be turned into plans on request.
 | 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — merged as PR #84 (commit `71ae902`; gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
+| 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | TODO |
+| 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | TODO |
+| 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | TODO |
+| 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
+| 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
+| 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -66,6 +75,18 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 
 ## Dependency notes
 
+- 013 depends softly on 012: the stability-tier list in 013 should include
+  `decodeStaticInto` if it exists. 013 works without it.
+- 015 depends hard on 012 and 013: the C-ABI design's memory model rests on
+  the caller-owned decode API, and its export scope on the Tier-1 list. Its
+  drift check enforces this.
+- 014, 016, 017 are pairwise independent of everything (disjoint files:
+  014 touches build.zig+CI, 016 touches only PROGRESS.MD, 017 touches
+  tools/+build.zig — 014 and 017 both edit `build.zig`'s different regions;
+  execute serially or rebase, don't run concurrently on the same branch).
+- Recommended order: 012 → 013 → 014 → 017 → 016 → 015 (015 is written to be
+  executed after 1.0-track work; its own sequencing note says the follow-up
+  implementation waits for 1.0).
 - 005 depends softly on 003: plan 003 writes the "not yet honored"
   doc-comment framing for `EncoderOptions` that 005's alias comments mirror.
   Different files, no merge conflict — just execute 003 first.
@@ -75,6 +96,30 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   mutation-exploration mechanism. It works without 008 (decode targets only).
 - 007/008/010/011 are pairwise independent (disjoint files); any order.
   Recommended: 007 → 010 → 008 → 009 → 011.
+
+## Audit context — 2026-07-07 (commit `4c5572a`, direction/`next` variant)
+
+Direction-only audit at the 0.2.0 release commit; no defect sweep this run
+(the 2026-07-04 full audit stands). Six grounded direction findings were
+presented; the maintainer selected all six, planned as 012–017:
+
+- **D1** Step-12 caller-owned decode buffers (`PLAN.MD` step 12, no code
+  existed) → plan 012.
+- **D2** "Compatibility testing" undefined in the 1.0 gate; big-endian and
+  macOS untested in CI; browser check unrecorded → plan 013.
+- **D3** WASM build spike (carried from 2026-07-04 options) → plan 014.
+- **D4** C-ABI layer, design only, sequenced after API stabilization per
+  `PLAN.MD:32` → plan 015.
+- **D5** `EncoderOptions.method` 5–6 are a documented no-op clamp; measure
+  the headroom before (or instead of) building the lever → plan 016.
+  Near-lossless noted as adjacent future work, not measured there.
+- **D6** `zig-webp-info` CLI (carried from 2026-06-13 options) → plan 017.
+
+Not offered, again: streaming/incremental decode (rejected by design,
+`PLAN.MD:26-27`); re-opening step-10 lossless-decode perf (decided tradeoff
+with recorded rationale). Incidental docs finding: `src/root.zig:133-135`
+still claims no encode path consumes `EncoderOptions` — folded into plan 012
+step 3 rather than a separate plan.
 
 ## Audit context — 2026-07-04 (commit `5d6ed3c`)
 
@@ -116,14 +161,18 @@ audited decoders).
 
 ### Direction options (2026-07-04, maintainer decisions)
 
+All three options below were picked up by the 2026-07-07 direction audit and
+are now planned — see plans 012 (`decodeStaticInto`), 014 (WASM spike), and
+015 (C-ABI design).
+
 - **`decodeStaticInto` (caller-owned buffers)** — stated step-12 goal
   (PLAN.MD:379) with no code yet; fits the deterministic-allocation
-  competitive dimension. Design/spike plan on request.
+  competitive dimension. → plan 012.
 - **WASM (`wasm32`) build spike** — zero-dep no-libc pure Zig makes it
   disproportionately cheap; 32-bit `usize` paths and allocator story are the
-  unknowns.
+  unknowns. → plan 014.
 - **C-ABI export layer** — PLAN.MD:32 sequences it after API stabilization;
-  nearly reached. Queue a design plan post-1.0.
+  nearly reached. → plan 015 (design doc; implementation post-1.0).
 - Streaming/incremental decode was considered and NOT offered: PLAN.MD:26-27
   explicitly rejects it (complete input buffers by design).
 
@@ -176,6 +225,7 @@ behavior (untested by CI, documented in PLAN.MD).
 - `zig-webp-info` CLI: `parseFeatures` + `metadata.RawLocations` already
   expose everything a webpinfo-equivalent needs; aligns with AGENTS.md's
   chosen competitive dimensions (probing speed, mux/demux ergonomics).
+  → planned 2026-07-07 as plan 017.
 - Encoder API symmetry spike before PLAN step 7: decide the
   `encode(gpa, image.Buffer, options)` shape now so the VP8L encoder
   doesn't inherit the bitstream-in-only `mux.encodeStatic` asymmetry.
