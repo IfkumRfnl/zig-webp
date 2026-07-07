@@ -30,7 +30,7 @@ below and can be turned into plans on request.
 | 009 | Step 11d — bounded mutation exploration for all fuzz targets | P2 | M | 008 (soft) | DONE — merged as PR #84 (commit `71ae902`; gate results in PROGRESS.MD) |
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
-| 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — executed on branch `decode-static-into` (commit `5843be4`); not yet merged (no PR opened per instructions) |
+| 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — merged as PR #90 (merge commit `772485e`; implementation commit `5843be4`; codex review green on first pass) |
 | 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | TODO |
 | 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | TODO |
 | 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
