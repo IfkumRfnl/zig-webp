@@ -132,9 +132,18 @@ ubuntu-latest with `qemu-user-static`) and `macos` (`zig build check` +
 `zig build test` on macos-latest aarch64). The local qemu proof was skipped
 by operator decision (no sudo available to install `qemu-user-static`);
 powerpc64 cross-compilation was verified locally
-(`zig build check -Dtarget=powerpc64-linux`, exit 0, 2026-07-07), and the
-first CI run of the `big-endian` job is the full-suite proof — record its
-result here once it runs. Windows remains deferred: the `setup-zig` composite
+(`zig build check -Dtarget=powerpc64-linux`, exit 0, 2026-07-07). **The
+first CI run of the `big-endian` job passed (PR #92, 2026-07-07, 16m18s):
+the full 464-test suite — including the byte-exact SHA-256 corpus
+regression — is green on a big-endian host under QEMU; no endianness bugs
+found.** The first `macos` job run failed in the `setup-zig` composite
+action: macOS runners report `uname -m`/`uname -s` as `arm64`/`Darwin`,
+but ziglang.org's index keys the build `aarch64-macos` (the plan's claim
+that the action "works as-is on macOS" was wrong). Fixed on the same branch
+with operator authorization (an out-of-plan-scope deviation): the action now
+normalizes `arm64`→`aarch64` and `darwin`→`macos`, and the SHA-256 check
+falls back to `shasum -a 256` where GNU `sha256sum` is absent.
+Windows remains deferred: the `setup-zig` composite
 action resolves `uname -m`/`uname -s` keys against `.tar.xz` archives, while
 `x86_64-windows` ships as `.zip` and Git-bash `uname -s` reports
 `MINGW64_NT-...`; whoever picks it up should extend the composite action, not

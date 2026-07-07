@@ -32,8 +32,18 @@ runs:
       run: |
         set -euo pipefail
 
-        # ziglang.org index keys are "<arch>-<os>", e.g. "x86_64-linux".
-        platform="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
+        # ziglang.org index keys are "<arch>-<os>", e.g. "x86_64-linux" or
+        # "aarch64-macos". Normalize uname output to that vocabulary
+        # (macOS reports "arm64"/"Darwin").
+        arch="$(uname -m)"
+        case "$arch" in
+          arm64) arch=aarch64 ;;
+        esac
+        os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$os" in
+          darwin) os=macos ;;
+        esac
+        platform="${arch}-${os}"
 
         index="$(curl -fsSL --retry 3 --retry-all-errors https://ziglang.org/download/index.json)"
         tarball="$(printf '%s' "$index" | jq -r --arg v "$ZIG_VERSION" --arg p "$platform" '.[$v][$p].tarball // empty')"
@@ -47,7 +57,12 @@ runs:
         echo "Installing Zig $ZIG_VERSION for $platform"
         echo "  tarball: $tarball"
         curl -fsSL --retry 3 --retry-all-errors "$tarball" -o "$RUNNER_TEMP/zig.tar.xz"
-        echo "${shasum}  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+        # GNU sha256sum on Linux; macOS ships perl shasum instead.
+        if command -v sha256sum >/dev/null 2>&1; then
+          echo "${shasum}  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+        else
+          echo "${shasum}  $RUNNER_TEMP/zig.tar.xz" | shasum -a 256 -c -
+        fi
 
         dest="$RUNNER_TEMP/zig"
         mkdir -p "$dest"
