@@ -67,9 +67,12 @@ ownership/error surface is settled.
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
-(`.github/workflows/ci.yml`): `zig fmt --check .`, `zig build check`, and
-`zig build test` on Zig 0.16.0. The local `zig build ci` step bundles the same
-gate set. The test suite includes a hash-based corpus regression
+(`.github/workflows/ci.yml`) as three jobs on Zig 0.16.0: `test`
+(ubuntu-latest: `zig fmt --check .`, `zig build check`, `zig build test`),
+`big-endian` (ubuntu-latest: `zig build test -Dtarget=powerpc64-linux -fqemu`
+under `qemu-user-static`), and `macos` (macos-latest aarch64:
+`zig build check`, `zig build test`). The local `zig build ci` step bundles
+the Linux-job gate set. The test suite includes a hash-based corpus regression
 (`src/testing/corpus.zig`): decoded RGBA planes of all 131 still images (43
 lossless and 88 lossy, the latter with composed ALPH alpha) and decoded alpha
 planes of all 18 ALPH-bearing files (149 rows) are compared against committed
@@ -110,6 +113,43 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
 ## Recently Completed
+
+### Step 12 — Release criteria (1.0 stability contract + compatibility matrix)
+
+Plan 013 (branch `one-oh-compat-matrix`, 2026-07-07) makes the 1.0 gate's
+"compatibility testing" checkable. The API stability contract is now written:
+`src/root.zig`'s module doc defines two tiers (Tier 1 — the named entry
+points and their parameter/result types, semver-governed at 1.0; Tier 2 —
+`vp8_*`/`vp8l_*` and other module internals, no stability promise; additions
+to `errors.Error` are not breaking, removals/renames of Tier 1 names are),
+mirrored in `README.MD`. `RELEASING.MD` gained a "Compatibility matrix
+(1.0 gate)" section defining exactly what compatibility testing means (Linux
+x86_64, macOS aarch64, big-endian powerpc64 under QEMU, ≥2-browser manual
+render, Windows deferred), plus the written browser-check procedure;
+`PLAN.MD`'s 1.0.0 criterion now references that matrix by name. CI gained two
+jobs: `big-endian` (`zig build test -Dtarget=powerpc64-linux -fqemu` on
+ubuntu-latest with `qemu-user-static`) and `macos` (`zig build check` +
+`zig build test` on macos-latest aarch64). The local qemu proof was skipped
+by operator decision (no sudo available to install `qemu-user-static`);
+powerpc64 cross-compilation was verified locally
+(`zig build check -Dtarget=powerpc64-linux`, exit 0, 2026-07-07). **The
+first CI run of the `big-endian` job passed (PR #92, 2026-07-07, 16m18s):
+the full 464-test suite — including the byte-exact SHA-256 corpus
+regression — is green on a big-endian host under QEMU; no endianness bugs
+found.** The first `macos` job run failed in the `setup-zig` composite
+action: macOS runners report `uname -m`/`uname -s` as `arm64`/`Darwin`,
+but ziglang.org's index keys the build `aarch64-macos` (the plan's claim
+that the action "works as-is on macOS" was wrong). Fixed on the same branch
+with operator authorization (an out-of-plan-scope deviation): the action now
+normalizes `arm64`→`aarch64` and `darwin`→`macos`, and the SHA-256 check
+falls back to `shasum -a 256` where GNU `sha256sum` is absent.
+Windows remains deferred: the `setup-zig` composite
+action resolves `uname -m`/`uname -s` keys against `.tar.xz` archives, while
+`x86_64-windows` ships as `.zip` and Git-bash `uname -s` reports
+`MINGW64_NT-...`; whoever picks it up should extend the composite action, not
+add a third-party action. The ≥2-browser render check (the last open step-9
+item) has its procedure recorded in `RELEASING.MD`; its result is a pre-tag
+manual gate, still unrecorded.
 
 ### Step 12 — Public API (caller-owned decode buffers: `decodeStaticInto`)
 

@@ -32,10 +32,11 @@ Non-goals, explicitly out of scope unless deliberately revisited:
 - A C ABI or bindings layer before the Zig API stabilizes.
 
 Portability and threading stance: development and CI test little-endian
-64-bit targets. Code must not assume host endianness, but big-endian targets
-remain untested until CI covers one. The library is thread-compatible: no
-global mutable state, so distinct decode/encode jobs may run on distinct
-threads. Internal parallelism is deferred to step 10.
+64-bit targets. Code must not assume host endianness; CI additionally runs
+the full test suite on big-endian powerpc64 under user-mode QEMU
+(`zig build test -Dtarget=powerpc64-linux -fqemu`). The library is
+thread-compatible: no global mutable state, so distinct decode/encode jobs
+may run on distinct threads. Internal parallelism is deferred to step 10.
 
 ## Toolchain Policy
 
@@ -389,7 +390,8 @@ input.
 - Release `0.1.0` only after the step 5 decode gate and the step 7 validity
   and size gates hold in CI.
 - Release `1.0.0` only after the 8b and 8c gates, animation encode, metadata,
-  hardening, docs, and compatibility testing are all met.
+  hardening, docs, and the compatibility matrix in `RELEASING.MD`
+  ("Compatibility matrix (1.0 gate)") are all met.
 
 ## Near-Term Work Items
 

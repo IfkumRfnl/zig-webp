@@ -11,8 +11,8 @@ CI or only as a local oracle. It also records the release procedure.
 - **`0.1.0`** — release only after the **step 5 decode gate** and the **step 7
   validity and size gates** hold.
 - **`1.0.0`** — release only after the **8b and 8c** lossy-encode gates,
-  animation encode, metadata, hardening (step 11), docs, and compatibility
-  testing are all met.
+  animation encode, metadata, hardening (step 11), docs, and the
+  [compatibility matrix](#compatibility-matrix-10-gate) below are all met.
 
 ### Gate → check mapping
 
@@ -59,6 +59,38 @@ Verified at the `0.1.0` commit:
   validity).
 - `compare-encode-corpus` — **median ratio 1.0368×**, aggregate 1.0460×
   (step-7 size gate, ≤ 1.10×).
+
+## Compatibility matrix (1.0 gate)
+
+`PLAN.MD`'s 1.0.0 bar requires "compatibility testing"; this matrix defines
+that phrase. All rows must hold before tagging 1.0.0.
+
+| Dimension | Check | Where | Pass |
+|---|---|---|---|
+| Linux x86_64 (LE, 64-bit) | `zig build ci` | CI (`ci.yml` `test` job), every PR | exit 0 |
+| macOS aarch64 (LE, 64-bit) | `zig build check` + `zig build test` | CI (`ci.yml` `macos` job), every PR | exit 0 |
+| Big-endian (powerpc64) | `zig build test -Dtarget=powerpc64-linux -fqemu` | CI (`ci.yml` `big-endian` job), every PR | exit 0 |
+| Browsers (≥2) | manual render of the two `testdata/animation/anim_minimized_*.webp` samples | manual, recorded in `PROGRESS.MD` before tagging 1.0 | moving region animates correctly in both |
+| Windows | deferred | — | recorded as deferred with reason (the `setup-zig` composite action resolves `uname -m`/`uname -s` keys against tar.xz archives; `x86_64-windows` ships as `.zip` and Git-bash `uname -s` reports `MINGW64_NT-...`) |
+
+The big-endian row is the substantive one: it runs the full test suite —
+including the byte-exact SHA-256 corpus regression — on a BE host under
+user-mode QEMU, so decoded planes must be identical regardless of host
+endianness.
+
+### Browser check procedure
+
+Manual pre-tag gate (not CI). In each of at least two browsers (e.g. Firefox
+and Chromium):
+
+1. Open `testdata/animation/anim_minimized_lossless.webp`.
+2. Open `testdata/animation/anim_minimized_lossy.webp`.
+3. Pass condition: each file displays as an animation whose moving region
+   animates correctly (no stuck first frame, no corrupted or misplaced
+   rectangles, no wrong background bleed-through).
+
+Record the browsers, versions, date, and result in `PROGRESS.MD`. Re-run
+whenever animation encode output changes.
 
 ## Release procedure
 

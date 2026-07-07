@@ -34,3 +34,42 @@ jobs:
       # tools/webp-oracle.sh.
       - name: Run tests
         run: zig build test
+
+  # Compatibility-matrix row (RELEASING.MD): the full test suite — including
+  # the byte-exact SHA-256 corpus regression — on a big-endian target,
+  # executed under user-mode QEMU.
+  big-endian:
+    name: Big-endian tests (powerpc64, QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.16.0
+
+      - name: Install QEMU user-mode emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Run tests on powerpc64 under QEMU
+        run: zig build test -Dtarget=powerpc64-linux -fqemu
+
+  # Compatibility-matrix row (RELEASING.MD): macOS aarch64. No fmt check
+  # here — redundant with the Linux job.
+  macos:
+    name: macOS tests (aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.16.0
+
+      - name: Compile library and tools
+        run: zig build check
+
+      - name: Run tests
+        run: zig build test
