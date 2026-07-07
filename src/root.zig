@@ -3,6 +3,8 @@
 //! Most callers need only a handful of names:
 //! - `decodeStatic` — decode a complete WebP still to pixels (lossless,
 //!   lossy, and lossy+alpha).
+//! - `decodeStaticInto` — the same decode into a caller-owned pixel buffer,
+//!   honoring its stride and format.
 //! - `decodeAnimation` — decode a complete animated WebP to composited frames.
 //! - `encodeLossless` — encode pixels into a lossless (VP8L) WebP file.
 //! - `encodeLossy` — encode pixels into a lossy (VP8) WebP file.
@@ -130,8 +132,8 @@ pub const DemuxOptions = demux.Options;
 pub const DemuxResult = demux.Result;
 /// Validated image width and height in pixels.
 pub const Dimensions = image.Dimensions;
-/// Forward-looking encode options; no encode path consumes these yet
-/// (encoders are PLAN.MD steps 7-8).
+/// Options bag for the still pixel encoders (`encodeLossless`/`encodeLossy`);
+/// see `options.EncoderOptions` for the per-field documentation.
 pub const EncoderOptions = options.EncoderOptions;
 /// The error set returned by every fallible entry point.
 pub const Error = errors.Error;
@@ -386,6 +388,25 @@ pub fn decodeStatic(
     decode_options: DecoderOptions,
 ) Error!image.OwnedBuffer {
     return decode.decodeStatic(gpa, bytes, decode_options);
+}
+
+/// Decodes a complete still WebP file into the caller-owned `dest` buffer,
+/// row-major, honoring `dest.stride`. `dest.format` is authoritative and
+/// `DecoderOptions.output_format` is ignored on this path. `dest` must pass
+/// `ImageBuffer.validate()` and its dimensions must exactly equal the file's
+/// canvas dimensions; any mismatch fails with `error.InvalidCanvasSize`
+/// before any pixel is decoded. Internal scratch (including one packed
+/// output-sized buffer) is still allocated from `gpa` and budgeted against
+/// `DecoderOptions.limits.allocation_bytes_max`. Bytes in `dest.pixels`
+/// outside the written rows (stride padding, tail slack) are left untouched.
+/// Animated inputs fail with `error.UnsupportedAnimationDecode`.
+pub fn decodeStaticInto(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    dest: ImageBuffer,
+    decode_options: DecoderOptions,
+) Error!void {
+    return decode.decodeStaticInto(gpa, bytes, dest, decode_options);
 }
 
 /// Decodes an animated WebP into composited per-frame buffers, matching

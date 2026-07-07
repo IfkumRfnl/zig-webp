@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-06
+Last updated: 2026-07-07
 
 ## Current Position
 
@@ -110,6 +110,36 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
 ## Recently Completed
+
+### Step 12 — Public API (caller-owned decode buffers: `decodeStaticInto`)
+
+Plan 012 (branch `decode-static-into`, 2026-07-07) delivers the step-12
+"static decode to caller-owned buffers" API. `decodeStaticInto(gpa, bytes,
+dest, options)` decodes a still WebP into a caller-owned `ImageBuffer`,
+row-major, honoring `dest.stride`; `dest.format` is authoritative and
+`DecoderOptions.output_format` is ignored on that path. The contract:
+`dest.validate()` must pass and `dest.dimensions` must exactly equal the
+file's canvas (`error.InvalidCanvasSize` otherwise), both checked before any
+pixel is decoded; bytes outside the written rows (stride padding, tail slack)
+are left untouched; animated inputs fail with
+`error.UnsupportedAnimationDecode`. The v1 implementation decodes through the
+shared `decodeImage` primitive into a packed internal buffer (allocated from
+`gpa` and budgeted against `limits.allocation_bytes_max` exactly like
+`decodeStatic`) and row-copies into `dest`; threading the caller's stride
+through the codec output stages is a recorded follow-up optimization.
+`decodeStatic` itself is unchanged — it now shares a `parseStaticSource`
+demux prologue with the new entry point, and the SHA-256 corpus gate pins its
+output byte-for-byte.
+
+Test evidence (2026-07-07, 464/464 passing, was 452): `src/decode.zig` adds
+seven tests — byte-equality with `decodeStatic` on a lossless
+(`lossless1.webp`) and a lossy (`test.webp`) corpus file, stride-padding
+sentinel survival, `dest.format` overriding `output_format`,
+larger-and-smaller dimension mismatches, undersized pixel slices, and
+animated-input rejection. `src/testing/hardening.zig` adds five matrix rows —
+`input_bytes_max`, `output_pixels_max`, `allocation_bytes_max`, clean errors
+at every input truncation point, and `checkAllAllocationFailures` injection
+over the internal scratch (the dest buffer is caller-provided).
 
 ### Step 11 — Robustness Hardening (slice 11d: bounded mutation exploration)
 
