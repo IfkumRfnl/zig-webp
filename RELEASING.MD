@@ -34,6 +34,27 @@ measurements** that require `libwebp`'s `cwebp`/`dwebp`/`anim_dump` on `PATH`;
 their latest results are recorded with dates in `PROGRESS.MD`. Re-run them
 locally before tagging.
 
+### 1.0.0 gate status
+
+Verified at the `1.0.0` release commit (2026-07-08):
+
+- `zig build ci` — exit 0 (`zig fmt --check .`, `zig build check`,
+  `zig build test`; 464/464 tests, corpus regression / step-5 decode gate).
+- `zig build encode-report` — 77 sources, **0 round-trip mismatches** (step-7
+  validity).
+- `compare-encode-corpus` — **median ratio 1.0368×**, aggregate 1.0460×
+  (step-7 size gate, ≤ 1.10×; unchanged from `0.2.0`).
+- Step 8b — matched-size photo-corpus mean luma PSNR within 1.0 dB of
+  `cwebp -q 75 -m 4` (recorded **+0.08 dB**, 2026-06-21; method-4 output
+  asserted byte-identical since).
+- Step 8c — target-size mode **0.32–2.83%** off requested size (≤ 5% gate);
+  target-PSNR 38.01–38.08 dB achieved (reproduced in `zig build ci` metrics).
+- `compare-anim-corpus` — 10/10 committed animations byte-exact against
+  `anim_dump`.
+- Compatibility matrix — Linux x86_64, macOS aarch64, and big-endian
+  powerpc64 CI jobs green; browser check passed 2026-07-08 (Firefox +
+  Chromium); Windows deferred with reason below.
+
 ### 0.2.0 gate status
 
 Verified at the `0.2.0` release commit (2026-07-07):

@@ -2,9 +2,54 @@
 
 All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
-aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
-the major version is `0`, the public API may still change between minor
-releases.
+follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
+`1.0.0`, Tier-1 names are frozen and semver-governed; Tier-2 internals may
+still change in any release. See `src/root.zig` for the Tier-1 list.
+
+## [1.0.0] — 2026-07-08
+
+First stable release. Roadmap steps 0–12 are complete: the codec feature set
+from `0.2.0` is unchanged, and this release freezes the Tier-1 public API,
+documents its contracts end to end, and closes the compatibility matrix that
+`PLAN.MD` requires for `1.0.0`.
+
+### API stability
+
+- Tier-1 surface is frozen and semver-governed: the named entry points
+  (`decodeStatic`, `decodeStaticInto`, `decodeAnimation`, `AnimationDecoder`,
+  the `encode*` functions except the bitstream-level tooling encoders,
+  `parseFeatures`, `parseWebP`, `isWebP`, `parseHeader`, `parseChunkHeader`,
+  `errorCategory`) and their parameter/result types. Removals or renames of
+  Tier-1 names are breaking; additions to `errors.Error` are not.
+- Tier-2 internals (`vp8_*`/`vp8l_*` modules, `encodeVP8LBitstream` /
+  `encodeVP8Bitstream`, `bit_reader`/`bit_writer`, `testing`, and other module
+  re-exports) carry no stability promise.
+- `decodeStaticInto` decodes a still WebP into a caller-owned pixel buffer,
+  honoring stride and format (same decode path as `decodeStatic`).
+- A recorded Tier-1 audit walked every entry point and contract-listed type
+  against ownership, allocation bounds, error semantics, naming/parameter
+  order, and pixel-format/stride contracts; findings were documentation-only
+  (no behavior changes, no Tier-1 renames).
+
+### Compatibility
+
+- CI runs the full test suite on Linux x86_64, macOS aarch64, and big-endian
+  powerpc64 under user-mode QEMU.
+- Manual ≥2-browser render check of the minimized animation samples passed in
+  Firefox and Chromium (2026-07-08).
+- Windows CI remains deferred (recorded reason in `RELEASING.MD`).
+
+### Notes
+
+- Verified at the release commit: `zig build ci` green (464/464 tests);
+  `zig build encode-report` 77 sources, 0 round-trip mismatches (step-7
+  validity); `compare-encode-corpus` median 1.0368× vs `cwebp -lossless`
+  (step-7 size gate ≤1.10×); step-8b matched-size photo-corpus luma PSNR
+  within 1.0 dB of `cwebp -q 75 -m 4` (recorded +0.08 dB); step-8c
+  target-size within 5% (0.32–2.83% off); `compare-anim-corpus` 10/10
+  committed animations byte-exact against `anim_dump`.
+- Out of scope, unchanged: streaming/incremental decode, non-key-frame VP8,
+  ICC color application, and a C ABI (design tracked as plan 015).
 
 ## [0.2.0] — 2026-07-07
 
