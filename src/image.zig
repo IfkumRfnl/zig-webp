@@ -23,6 +23,10 @@ pub const Dimensions = struct {
     }
 };
 
+/// Byte order of one pixel in a `Buffer`, named most-significant channel
+/// first: `rgba` stores bytes `R,G,B,A`, `bgra` stores `B,G,R,A`, and `argb`
+/// stores `A,R,G,B`. `rgb` is 3 bytes per pixel (`R,G,B`) and carries no
+/// alpha: decoders drop alpha into it, encoders treat it as fully opaque.
 pub const PixelFormat = enum {
     rgb,
     rgba,
@@ -40,9 +44,15 @@ pub const PixelFormat = enum {
     }
 };
 
+/// A pixel plane read and written row-major: row `y` starts at byte
+/// `y * stride` of `pixels`. The buffer does not own `pixels` (see
+/// `OwnedBuffer` for the owning variant); `validate` is the entry-point
+/// precondition.
 pub const Buffer = struct {
     pixels: []u8,
     dimensions: Dimensions,
+    /// Distance in bytes between the starts of consecutive rows; must be at
+    /// least `width * format.channelCount()` (checked by `validate`).
     stride: u32,
     format: PixelFormat,
 
@@ -54,6 +64,10 @@ pub const Buffer = struct {
         return row_bytes;
     }
 
+    /// Checks the buffer invariants: valid dimensions
+    /// (`error.InvalidCanvasSize`/`error.DimensionsOverflow`), a stride of at
+    /// least one row of pixels, and a `pixels` slice long enough for
+    /// `height` rows at that stride (`error.OutputTooLarge` otherwise).
     pub fn validate(self: Buffer) errors.Error!void {
         _ = try self.dimensions.pixelCount();
 
@@ -69,6 +83,9 @@ pub const Buffer = struct {
     }
 };
 
+/// A `Buffer` plus the allocator that owns its pixels. Returned by
+/// `decodeStatic`; the buffer is tightly packed (stride == row bytes). Free
+/// with `deinit`.
 pub const OwnedBuffer = struct {
     gpa: std.mem.Allocator,
     buffer: Buffer,

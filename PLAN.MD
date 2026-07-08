@@ -376,15 +376,21 @@ input.
 ### 12. Public API and Release Criteria
 
 - Stabilize APIs for:
-  - feature probing without full decode;
+  - feature probing without full decode (delivered: `parseFeatures` audited,
+    contract final, see `PROGRESS.MD`);
   - static decode to caller-owned buffers (delivered: `decodeStaticInto`,
     see `PROGRESS.MD`);
-  - static encode from typed pixel buffers;
-  - animation iteration and composition;
-  - metadata extraction and muxing;
-  - memory and security limits.
+  - static encode from typed pixel buffers (delivered: `encodeLossless`/
+    `encodeLossy` audited, see `PROGRESS.MD`);
+  - animation iteration and composition (delivered: `decodeAnimation`/
+    `AnimationDecoder` audited, see `PROGRESS.MD`);
+  - metadata extraction and muxing (delivered: `MetadataPayloads` contract
+    audited both directions, see `PROGRESS.MD`);
+  - memory and security limits (delivered: `ResourceLimits` and per-entry
+    budget docs audited, see `PROGRESS.MD`).
 - Document pixel formats, ownership, allocation behavior, and error
-  semantics.
+  semantics (delivered: 2026-07-08 Tier-1 audit checked all four across the
+  surface, see `PROGRESS.MD`).
 - Require `zig build test`, hash-based corpus regression, encoder validity
   gates, and fuzz smoke budgets in CI.
 - Release `0.1.0` only after the step 5 decode gate and the step 7 validity

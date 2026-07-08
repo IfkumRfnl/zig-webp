@@ -9,10 +9,12 @@ Version `0.2.0` (preview; the public API is not yet frozen). See
 
 API stability is two-tiered: the named entry points (`decodeStatic`,
 `decodeStaticInto`, `decodeAnimation`, `AnimationDecoder`, the `encode*`
-functions, `parseFeatures`, `parseWebP`, `isWebP`, `parseHeader`,
+functions except the bitstream-level `encodeVP8LBitstream`/`encodeVP8Bitstream`
+tooling, `parseFeatures`, `parseWebP`, `isWebP`, `parseHeader`,
 `parseChunkHeader`, `errorCategory`) and their parameter/result types are
 **Tier 1** — stable at 1.0 and semver-governed. The `vp8_*`/`vp8l_*` module
-exports, `bit_reader`/`bit_writer`, `testing`, and other module re-exports
+exports, the two bitstream-level encoders, `bit_reader`/`bit_writer`,
+`testing`, and other module re-exports
 are **Tier 2** internals with no stability promise. Additions to
 `errors.Error` are not breaking; removals or renames of Tier 1 names are.
 See the module doc comment in `src/root.zig` for the full Tier 1 list.
@@ -75,9 +77,10 @@ content-change tolerance (`AnimationMinimizeOptions.tolerance`), so lossy
 animations shrink to sub-rects instead of full-canvas keyframes (≈48% smaller
 than a naive per-frame lossy encode on a moving-region sample, within ~0.1 dB of
 its luma PSNR). The still pixel
-encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). The only open
-step-9 item is the manual ≥2-browser render confirmation (two sample animations
-under `testdata/animation/`). The installed `zig-webp-encode` tool re-encodes a still WebP as
+encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). Step 9 is
+complete: the manual ≥2-browser render check of the two sample animations under
+`testdata/animation/` passed in Firefox and Chromium (2026-07-08, recorded in
+`PROGRESS.MD`). The installed `zig-webp-encode` tool re-encodes a still WebP as
 lossy `VP8 `.
 
 Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered:

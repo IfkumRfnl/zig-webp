@@ -23,18 +23,20 @@
 //!   `encodeAnimationMinimized`, `parseFeatures`, `parseWebP`, `isWebP`,
 //!   `parseHeader`, `parseChunkHeader`, and `errorCategory`, plus their
 //!   parameter and result types: `DecoderOptions`, `EncoderOptions`,
-//!   `ResourceLimits`, `ImageBuffer`, `Dimensions`, `PixelFormat` (via
-//!   `image`), `Error`/`ErrorCategory`, `FeatureSummary`, `DemuxResult`,
-//!   the animation option/frame types (`AnimationImage`,
-//!   `AnimationFrameImage`, `AnimationInfo`, `CompositedFrame`,
-//!   `DecodedAnimation`, `DecodedAnimationFrame`, `AnimationFrameSource`,
-//!   `AnimationEncodeOptions`, `AnimationFrameInput`,
+//!   `ResourceLimits`, `ImageBuffer`, `Dimensions`, `PixelFormat` and
+//!   `OwnedBuffer` (via `image`), `Error`/`ErrorCategory`, `FeatureSummary`,
+//!   `DemuxOptions`, `DemuxResult`, `MuxOptions`, `StaticImage`,
+//!   `ContainerHeader`, `ChunkHeader`, the animation option/frame types
+//!   (`AnimationImage`, `AnimationFrameImage`, `AnimationInfo`,
+//!   `CompositedFrame`, `DecodedAnimation`, `DecodedAnimationFrame`,
+//!   `AnimationFrameSource`, `AnimationEncodeOptions`, `AnimationFrameInput`,
 //!   `AnimationMinimizeOptions`), and `MetadataPayloads`.
 //! - **Tier 2 (internals, no stability promise)**: the `vp8_*` and `vp8l_*`
-//!   module exports and their aliased `VP8*`/`VP8L*` types, plus
-//!   `bit_reader`/`bit_writer`, `testing`, and the other module re-exports —
-//!   exported for tooling, tests, and advanced callers; they may change in
-//!   any release.
+//!   module exports and their aliased `VP8*`/`VP8L*` types, the
+//!   bitstream-level tooling entry points `encodeVP8LBitstream` and
+//!   `encodeVP8Bitstream`, plus `bit_reader`/`bit_writer`, `testing`, and the
+//!   other module re-exports — exported for tooling, tests, and advanced
+//!   callers; they may change in any release.
 //!
 //! The breaking-change rule: additions to `errors.Error` are not breaking;
 //! removals or renames of Tier 1 names are.
@@ -108,15 +110,24 @@ pub const AnimationImage = mux.AnimationImage;
 /// `ALPH`). Distinct from `AnimationFrame`, which is a decoded/parsed frame.
 pub const AnimationFrameImage = mux.FrameImage;
 /// Streaming animated-WebP decoder: composites one frame at a time onto a
-/// reused canvas (bounded memory). The caller owns it and must `deinit`.
+/// reused canvas (bounded memory; the demux and canvas allocations are
+/// budgeted against `DecoderOptions.limits.allocation_bytes_max`). `init`
+/// requires a 4-channel `DecoderOptions.output_format` (else
+/// `error.UnsupportedImageFormat`) and an animated input (else
+/// `error.NotAnimated`); the input bytes must outlive the decoder. The
+/// caller owns it and must `deinit`.
 pub const AnimationDecoder = animation_decode.Decoder;
 /// Global animation properties (canvas, frame count, loop count, background).
 pub const AnimationInfo = animation_decode.Info;
-/// One composited animation frame; from `AnimationDecoder.next` its pixels
-/// borrow the decoder's canvas, from `decodeAnimation` they are owned.
+/// One composited animation frame from `AnimationDecoder.next`; its pixels
+/// borrow the decoder's canvas and are valid only until the next
+/// `next`/`reset`/`deinit` call. `decodeAnimation` returns owned
+/// `DecodedAnimationFrame`s instead.
 pub const CompositedFrame = animation_decode.Frame;
 /// Result of `decodeAnimation`: every composited frame as its own buffer.
 pub const DecodedAnimation = animation_decode.OwnedAnimation;
+/// One composited frame of a `DecodedAnimation`, with its own packed pixel
+/// buffer (freed by `DecodedAnimation.deinit`) plus duration and timestamp.
 pub const DecodedAnimationFrame = animation_decode.OwnedFrame;
 /// One source frame for `encodeAnimationFromBuffers`: a pixel buffer plus its
 /// canvas offset, duration, blend/dispose methods, and per-frame codec. Distinct
@@ -139,14 +150,21 @@ pub const BitReader = bit_reader.BitReader;
 pub const BitWriter = bit_writer.BitWriter;
 pub const ByteReader = bit_reader.ByteReader;
 pub const ByteWriter = bit_writer.ByteWriter;
+/// Result of `parseChunkHeader`: a chunk's FourCC tag and payload size.
 pub const ChunkHeader = container.ChunkHeader;
 pub const ChunkKind = container.ChunkKind;
 pub const ChunkLocation = container.ChunkLocation;
 /// Borrowed VP8 YUV 4:2:0 planes accepted by `color.upsampleFancy`.
 pub const ColorPlanes = color.Planes;
+/// Result of `parseHeader`: the validated RIFF payload size (see
+/// `fileSizeBytes` for the implied total file size).
 pub const ContainerHeader = container.ContainerHeader;
 /// Decode-time options: resource limits and output pixel format.
 pub const DecoderOptions = options.DecoderOptions;
+/// Options for `parseFeatures`/`parseWebP`: resource limits plus container
+/// strictness knobs (`allow_trailing_data` permits bytes after the RIFF
+/// payload; `strict_padding` requires zero padding bytes on odd-sized
+/// chunks).
 pub const DemuxOptions = demux.Options;
 /// Result of `parseWebP`: chunk locations, features, and metadata; the
 /// caller owns it and must call `deinit`.
@@ -163,10 +181,16 @@ pub const ErrorCategory = errors.Category;
 /// By-value feature probe: dimensions, format, alpha, animation, metadata.
 pub const FeatureSummary = features.Summary;
 pub const FourCC = container.FourCC;
-/// A decoded pixel plane with its dimensions, stride, and format.
+/// A pixel buffer with its dimensions, stride, and format — decode output,
+/// encoder input, and the caller-owned destination of `decodeStaticInto`.
 pub const ImageBuffer = image.Buffer;
-/// Borrowed metadata chunk payloads (ICCP/EXIF/XMP) carried by a file.
+/// Borrowed raw metadata chunk payloads (ICCP/EXIF/XMP): returned by demux
+/// (slices into the parsed file) and accepted by the encoders (caller-owned;
+/// must outlive the encode call).
 pub const MetadataPayloads = metadata.RawPayloads;
+/// Options for the mux entry points (`encodeStatic`/`encodeAnimation`):
+/// resource limits plus `force_extended` to emit a `VP8X` container even
+/// when no feature requires it.
 pub const MuxOptions = mux.Options;
 /// Bounds on input size and allocation for handling untrusted input.
 pub const ResourceLimits = limits.ResourceLimits;
@@ -222,11 +246,15 @@ pub fn isWebP(bytes: []const u8) bool {
 }
 
 /// Bounded parse of the RIFF/WebP container header from a complete buffer.
+/// Fails with `error.InputTooSmall`, `error.InvalidRiffSignature`,
+/// `error.InvalidWebPSignature`, `error.InvalidRiffSize`, or
+/// `error.FileTooLarge`; allocation-free.
 pub fn parseHeader(bytes: []const u8) Error!ContainerHeader {
     return container.parseHeader(bytes);
 }
 
 /// Bounded parse of a single chunk header from a complete buffer slice.
+/// Fails with `error.TruncatedChunkHeader` on short input; allocation-free.
 pub fn parseChunkHeader(bytes: []const u8) Error!ChunkHeader {
     return container.parseChunkHeader(bytes);
 }
@@ -245,8 +273,11 @@ pub fn parseFeatures(
 
 /// Strict RIFF/WebP demux of a complete buffer into chunk locations and
 /// features; rejects malformed chunk ordering and duplicate chunks. Does
-/// not decode pixels. The caller owns the result and must call
-/// `DemuxResult.deinit`.
+/// not decode pixels. Allocation is bounded by `DemuxOptions.limits`
+/// (`allocation_bytes_max`, `chunk_count_max`, `frame_count_max`). The
+/// caller owns the result and must call `DemuxResult.deinit`; the returned
+/// locations are offsets into `bytes` (pass the same buffer to
+/// `DemuxResult.metadataPayloads`).
 pub fn parseWebP(
     gpa: std.mem.Allocator,
     bytes: []const u8,
@@ -257,8 +288,11 @@ pub fn parseWebP(
 
 /// Muxes an already-encoded VP8/VP8L bitstream (`StaticImage`) into a
 /// canonical WebP file. It does not encode pixels — use
-/// `encodeLossless`/`encodeLossy` for that. Returns caller-owned bytes
-/// (free with the same allocator).
+/// `encodeLossless`/`encodeLossy` for that. The bitstream must parse and
+/// match the declared canvas/format (else `error.InvalidMuxChunk`); the
+/// canvas is bounded by `MuxOptions.limits.output_pixels_max` and the output
+/// file allocation is budgeted against `limits.allocation_bytes_max`.
+/// Returns caller-owned bytes (free with the same allocator).
 pub fn encodeStatic(
     gpa: std.mem.Allocator,
     static_image: StaticImage,
@@ -273,9 +307,12 @@ pub fn encodeStatic(
 /// encode pixels — each frame supplies its own VP8/VP8L bitstream — and is the
 /// animated analogue of `encodeStatic`. Every frame's rectangle, even-offset,
 /// codec, dimensions, and alpha are validated against the canvas and the
-/// container rules, so the output round-trips through `parseWebP` and is
-/// accepted by `webpinfo`/`webpmux`. Returns caller-owned bytes (free with the
-/// same allocator).
+/// container rules (`error.InvalidFrameChunk`/`error.InvalidMuxChunk`; an
+/// empty frame list is `error.MissingImageData`), so the output round-trips
+/// through `parseWebP` and is accepted by `webpinfo`/`webpmux`. The canvas,
+/// frame count, and chunk count are bounded by `MuxOptions.limits`, and the
+/// output file allocation is budgeted against `limits.allocation_bytes_max`.
+/// Returns caller-owned bytes (free with the same allocator).
 pub fn encodeAnimation(
     gpa: std.mem.Allocator,
     anim: AnimationImage,
@@ -290,9 +327,13 @@ pub fn encodeAnimation(
 /// encoder plus an optional lossless `ALPH` plane — and the frames are muxed via
 /// `encodeAnimation`. This is the pixel-level animated analogue of
 /// `encodeLossy`/`encodeLossless`; the caller dictates each frame's rectangle,
-/// blend, and dispose (automatic sub-rectangle/differencing optimization is a
-/// later step). The output round-trips through `decodeAnimation` and is accepted
-/// by `webpinfo`/`webpmux`/`anim_dump`. Returns caller-owned bytes (free with
+/// blend, and dispose (use `encodeAnimationMinimized` for automatic
+/// sub-rectangle/differencing). An empty frame list fails with
+/// `error.MissingImageData`. The canvas and frame count are bounded by
+/// `AnimationEncodeOptions.limits`, and per-frame encode scratch and the
+/// muxed file are budgeted against `limits.allocation_bytes_max`. The output
+/// round-trips through `decodeAnimation` and is accepted by
+/// `webpinfo`/`webpmux`/`anim_dump`. Returns caller-owned bytes (free with
 /// the same allocator).
 pub fn encodeAnimationFromBuffers(
     gpa: std.mem.Allocator,
@@ -314,7 +355,13 @@ pub fn encodeAnimationFromBuffers(
 /// decoder's reconstructed canvas so error never accumulates. The output is
 /// accepted by `webpinfo`/`webpmux`/`anim_dump`.
 /// Unlike `encodeAnimationFromBuffers` (the explicit-rect API), the caller does
-/// not pick per-frame rectangles or compositing. Returns caller-owned bytes.
+/// not pick per-frame rectangles or compositing. Every input buffer's
+/// dimensions must equal the canvas (else `error.InvalidCanvasSize`); an
+/// empty frame list fails with `error.MissingImageData`. The canvas and
+/// frame count are bounded by `AnimationMinimizeOptions.limits`, and the
+/// optimizer's canvas tracking, per-frame encode scratch, and the muxed file
+/// are budgeted against `limits.allocation_bytes_max`. Returns caller-owned
+/// bytes (free with the same allocator).
 pub fn encodeAnimationMinimized(
     gpa: std.mem.Allocator,
     frames: []const AnimationFrameInput,
@@ -330,7 +377,12 @@ pub fn encodeAnimationMinimized(
 /// color, predictor, and palette/color-indexing transforms, with an optional
 /// color cache and optional meta-prefix (multiple prefix-code groups), each
 /// chosen by measured encoded size, so the output is valid and round-trips
-/// bit-exactly. `encode_options.format` must be `.lossless`.
+/// bit-exactly. `encode_options.format` must be `.lossless` (else
+/// `error.UnsupportedImageFormat`). The canvas is bounded by
+/// `encode_options.limits.output_pixels_max` (which also bounds the
+/// encoder's pixel-count-proportional scratch) and the muxed file allocation
+/// is budgeted against `limits.allocation_bytes_max`; width or height above
+/// the VP8L 14-bit limit (16384) fails with `error.InvalidVP8LHeader`.
 ///
 /// Set `encode_options.metadata` (raw ICCP/EXIF/XMP payloads) to attach metadata
 /// (step 9d); the file is then an extended (`VP8X`) container with those chunks
@@ -368,7 +420,12 @@ pub fn encodeVP8LBitstream(
 /// input emits a plain `VP8 ` file. `encode_options.quality` (0..100) selects the
 /// color quantizer (or set `target_size`/`target_psnr` for a size/PSNR search),
 /// `encode_options.alpha_quality` (0..100) the alpha compression effort, and
-/// `encode_options.format` must be `.lossy`.
+/// `encode_options.format` must be `.lossy` (else
+/// `error.UnsupportedImageFormat`). Width or height above the VP8 14-bit
+/// limit (16383) fails with `error.InvalidCanvasSize`; the canvas is bounded
+/// by `encode_options.limits.output_pixels_max`, and encode scratch (color,
+/// alpha, and search passes) plus the muxed file are budgeted against
+/// `limits.allocation_bytes_max`.
 ///
 /// Set `encode_options.metadata` (raw ICCP/EXIF/XMP payloads) to attach metadata
 /// (step 9d); the chunks are written in spec-canonical order and coexist with a
@@ -398,7 +455,8 @@ pub fn encodeVP8Bitstream(
 
 /// Decodes a complete still WebP file into an owned pixel buffer: lossless
 /// (VP8L), lossy (VP8), and lossy+alpha (the `ALPH` plane composed over color),
-/// to packed `rgba`/`bgra`/`argb`/`rgb` per `DecoderOptions.output_format`.
+/// to a tightly packed `rgba`/`bgra`/`argb`/`rgb` buffer (stride == width ×
+/// channels) per `DecoderOptions.output_format`.
 /// Animated inputs fail with `error.UnsupportedAnimationDecode` — decode those
 /// via `decodeAnimation` / `AnimationDecoder`. Allocation is budgeted against
 /// `DecoderOptions.limits.allocation_bytes_max`. The caller frees the
@@ -433,10 +491,13 @@ pub fn decodeStaticInto(
 /// Decodes an animated WebP into composited per-frame buffers, matching
 /// libwebp's `WebPAnimDecoder`/`anim_dump`: a transparent canvas with spec
 /// keyframe, blend, and dispose rules. Each frame is reconstructed through the
-/// static VP8/VP8L/alpha decoders. Requires a 4-channel `output_format`; still
-/// images fail with `error.NotAnimated`. For bounded per-frame memory, drive
-/// `AnimationDecoder` directly. The caller frees the result via
-/// `DecodedAnimation.deinit`.
+/// static VP8/VP8L/alpha decoders. Requires a 4-channel `output_format` (else
+/// `error.UnsupportedImageFormat`); still images fail with
+/// `error.NotAnimated`. Allocation — including the full set of owned frame
+/// buffers — is budgeted against
+/// `DecoderOptions.limits.allocation_bytes_max`; for bounded per-frame
+/// memory, drive `AnimationDecoder` directly. The caller frees the result
+/// via `DecodedAnimation.deinit`.
 pub fn decodeAnimation(
     gpa: std.mem.Allocator,
     bytes: []const u8,
