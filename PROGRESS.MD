@@ -80,7 +80,9 @@ CI runs on every pull request and push to main
 `big-endian` (ubuntu-latest: `zig build test -Dtarget=powerpc64-linux -fqemu`
 under `qemu-user-static`), `macos` (macos-latest aarch64:
 `zig build check`, `zig build test`), and `wasm` (ubuntu-latest:
-`zig build wasm-check` for wasm32-wasi and wasm32-freestanding). The local
+`zig build wasm-check` compile gate for wasm32-wasi and wasm32-freestanding
+plus the full suite under wasmtime via
+`zig build test -Dtarget=wasm32-wasi -fwasmtime`). The local
 `zig build ci` step bundles the Linux-job gate set (not the wasm job). The
 test suite includes a hash-based corpus regression
 (`src/testing/corpus.zig`): decoded RGBA planes of all 131 still images (43
@@ -123,6 +125,26 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
 ## Recently Completed
+
+### 2026-07-09 — 32-bit `usize` shift fix and wasm32 test gate
+
+Follow-up to the plan 014 spike findings below (same branch). Fixed the five
+`@as(usize, 1) << @as(u6, …)` sites in `src/vp8l/huffman.zig` (lines 180,
+312, 339, 341, 361) by dropping the explicit `u6` and letting `@intCast`
+infer `Log2Int(usize)` — `u5` on 32-bit targets, `u6` on 64-bit. A sweep of
+all shift sites confirmed these were the only `usize` shifts with a
+hardcoded `u6` amount; the rest shift fixed-width `u32`/`u64`/`i64` or use
+`u2`/`u3`/`u5` amounts that coerce on both register widths.
+
+Gates strengthened to cover the class: `zig build wasm-check` now also
+compiles (without running) the unit tests for wasm32-wasi, forcing full
+semantic analysis on a 32-bit `usize` target — the exportless static
+libraries alone stayed green with the bug present. The CI `wasm` job
+additionally runs the full suite under wasmtime
+(`zig build test -Dtarget=wasm32-wasi -fwasmtime`). Verified locally:
+464/464 tests pass on wasm32-wasi under wasmtime, including the SHA-256
+corpus regression (file reads work via the `--dir=.` preopen), and
+`zig build ci` stays green on the 64-bit host.
 
 ### 2026-07-09 — Plan 014: wasm32 build spike
 
@@ -175,7 +197,8 @@ with no exports are not marketable numbers.
 
 1. Fix `src/vp8l/huffman.zig` (and sibling `usize` shift sites) for 32-bit
    `usize`, then add a wasm32-wasi unit-test step under wasmtime
-   (`--dir .` for corpus file reads).
+   (`--dir .` for corpus file reads). *Landed 2026-07-09 — see the entry
+   above.*
 2. `wasm32-freestanding` export surface + caller-owned allocator handoff
    (pairs with plan 015 / plan 012).
 3. npm-publishable browser demo; ReleaseSmall size reporting once exports

@@ -171,6 +171,9 @@ pub fn build(b: *std.Build) void {
     // Wasm compile gate: resolves its own wasm32 targets so `-Dtarget=` does
     // not have to retarget the host CLI tools. Not wired into `check`/`ci` —
     // CI runs this via a dedicated job (see .github/workflows/ci.yml).
+    // The static libraries alone only trigger lazy analysis (no exports), so
+    // the gate also compiles — without running — the unit tests for
+    // wasm32-wasi to force full semantic analysis on a 32-bit usize target.
     const wasm_wasi_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
@@ -203,9 +206,14 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
 
-    const wasm_check_step = b.step("wasm-check", "Compile the library for wasm32-wasi and wasm32-freestanding");
+    const webp_wasm_wasi_tests = b.addTest(.{
+        .root_module = webp_wasm_wasi_module,
+    });
+
+    const wasm_check_step = b.step("wasm-check", "Compile the library and unit tests for wasm32");
     wasm_check_step.dependOn(&webp_wasm_wasi_library.step);
     wasm_check_step.dependOn(&webp_wasm_freestanding_library.step);
+    wasm_check_step.dependOn(&webp_wasm_wasi_tests.step);
 
     const fmt_check = b.addFmt(.{ .paths = &.{"."}, .check = true });
     const ci_step = b.step("ci", "Run the full CI gate set: fmt check, compile, tests");

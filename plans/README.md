@@ -36,7 +36,7 @@ below and can be turned into plans on request.
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
 | 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — merged as PR #90 (merge commit `772485e`; implementation commit `5843be4`; codex review green on first pass) |
 | 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | DONE — merged as PR #92 (merge commit `753b6e7`; first `big-endian` CI run green: full 464-test suite on powerpc64 under QEMU, no endianness bugs; `macos` job green after an operator-authorized setup-zig key-mapping fix, commit `c7b03da`; browser check remains a pre-tag manual gate) |
-| 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | DONE — branch `wasm32-spike`; `wasm-check` + CI job landed; full wasm32 tests blocked by `src/vp8l/huffman.zig:180` 32-bit shift-type error (follow-up) |
+| 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | DONE — branch `wasm32-spike`; `wasm-check` + full wasm32-wasi suite under wasmtime in CI; 32-bit Huffman shift fix landed |
 | 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
 | 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
 | 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
@@ -50,11 +50,12 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   `wasm32-spike`. Drift vs `4c5572a`: `ci.yml` gained plan-013 BE/macOS
   jobs and `limits.zig` gained doc comments only — plan excerpts still
   held. Both `wasm32-wasi` and `wasm32-freestanding` compile via
-  `zig build-lib` / `zig build wasm-check`. Full
-  `zig build test -Dtarget=wasm32-wasi -fwasmtime` fails at compile with
+  `zig build-lib` / `zig build wasm-check`. Initial spike found
   `src/vp8l/huffman.zig:180` (`u6` shift into 32-bit `usize`); same on
-  `x86-linux`. Per STOP/out-of-scope: no `src/` fix; CI gets compile-only
-  `wasm` job; findings in PROGRESS.MD.
+  `x86-linux`. Follow-up on the same branch fixed the five Huffman
+  `usize` shift sites (`@intCast` → `Log2Int(usize)`), strengthened
+  `wasm-check` to compile wasi unit tests (full analysis), and CI now
+  runs the full suite under wasmtime.
 
 - **2026-07-08** — Plan 018 executed end to end on branch
   `step-12-tier1-audit` (isolated worktree `/home/hayk/zig-webp-exec-018`,
