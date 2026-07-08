@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-07
+Last updated: 2026-07-08
 
 ## Current Position
 
@@ -37,10 +37,10 @@ automatic frame minimization (`encodeAnimationMinimized`), lossy-frame
 optimization, and still metadata from `EncoderOptions.metadata` are delivered.
 Automated gates hold for demux validity, `webpinfo` cleanliness, `anim_dump`
 parity, lossless byte-exact minimized round-trips, and lossy minimized validity
-and PSNR. The only remaining step-9 gate is manual: open
-`testdata/animation/anim_minimized_lossless.webp` and
-`testdata/animation/anim_minimized_lossy.webp` in at least two major browsers
-and record that both animate correctly.
+and PSNR. The last step-9 gate, the manual ≥2-browser render check, passed on
+2026-07-08: `testdata/animation/anim_minimized_lossless.webp` and
+`testdata/animation/anim_minimized_lossy.webp` both animate correctly in
+Firefox and Chromium (operator-run; versions not recorded). Step 9 is complete.
 
 Step 10 (performance) is delivered. The benchmark harness, scalar baseline,
 vectorized YUV-to-RGB conversion, and table-driven VP8 boolean-reader
@@ -148,8 +148,9 @@ action resolves `uname -m`/`uname -s` keys against `.tar.xz` archives, while
 `x86_64-windows` ships as `.zip` and Git-bash `uname -s` reports
 `MINGW64_NT-...`; whoever picks it up should extend the composite action, not
 add a third-party action. The ≥2-browser render check (the last open step-9
-item) has its procedure recorded in `RELEASING.MD`; its result is a pre-tag
-manual gate, still unrecorded.
+item) has its procedure recorded in `RELEASING.MD`; it passed on 2026-07-08 in
+Firefox and Chromium (see the step-9 paragraph in Current Position), closing
+the browsers row of the compatibility matrix.
 
 ### Step 12 — Public API (caller-owned decode buffers: `decodeStaticInto`)
 
