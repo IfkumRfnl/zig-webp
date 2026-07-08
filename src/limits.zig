@@ -6,11 +6,23 @@ const container = @import("container.zig");
 const errors = @import("errors.zig");
 
 pub const ResourceLimits = struct {
+    /// Largest accepted input buffer in bytes; above it parsing fails with
+    /// `error.InputTooLarge`.
     input_bytes_max: u64 = container.file_size_max,
+    /// Largest still-image canvas in pixels (width * height); above it
+    /// validation fails with `error.CanvasTooLarge`.
     output_pixels_max: u64 = 16_777_216,
+    /// Budget for scratch/output heap allocation on the paths that meter it
+    /// (see each entry point's doc); exceeding it fails with
+    /// `error.AllocationLimitExceeded`.
     allocation_bytes_max: u64 = 256 * 1024 * 1024,
+    /// Largest accepted animation frame count; above it
+    /// `error.FrameCountTooLarge`.
     frame_count_max: u32 = 4096,
+    /// Largest animated canvas in pixels; above it `error.CanvasTooLarge`.
     animation_canvas_pixels_max: u64 = 16_777_216,
+    /// Largest accepted container chunk count; above it
+    /// `error.TooManyChunks`.
     chunk_count_max: u32 = 65_536,
 
     pub fn validateInputBytes(self: ResourceLimits, len: u64) errors.Error!void {

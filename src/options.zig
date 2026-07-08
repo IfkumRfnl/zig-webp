@@ -24,6 +24,8 @@ pub const EncoderOptions = struct {
     limits: limits.ResourceLimits = .{},
     format: features.FormatKind = .lossless,
     quality: u8 = 75,
+    /// Reserved; has no effect today. Metadata attachment on encode is
+    /// controlled by `metadata` below — this flag is read by nothing.
     preserve_metadata: bool = true,
     /// Effort level (0..6, `cwebp -m` compatible): higher trades encode time
     /// for quality by widening the rate-distortion search (step 8c-1). The
