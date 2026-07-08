@@ -35,6 +35,23 @@ jobs:
       - name: Run tests
         run: zig build test
 
+  # Compatibility-matrix / portability row: prove the library module still
+  # compiles for wasm32. Full wasm32 test execution is blocked by a known
+  # 32-bit usize shift-type error in src/vp8l/huffman.zig (see PROGRESS.MD);
+  # this job is compile-only until that follow-up lands.
+  wasm:
+    name: Wasm32 compile gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.16.0
+
+      - name: Compile library for wasm32-wasi and wasm32-freestanding
+        run: zig build wasm-check
+
   # Compatibility-matrix row (RELEASING.MD): the full test suite — including
   # the byte-exact SHA-256 corpus regression — on a big-endian target,
   # executed under user-mode QEMU.
