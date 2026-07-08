@@ -6,6 +6,10 @@ audit of 2026-07-04 (commit `5d6ed3c`, standard depth, all categories).
 Plans 012–017: improve-skill **direction** audit of 2026-07-07 (commit
 `4c5572a`, `next` variant — roadmap options, not defects; the maintainer
 selected all six).
+Plan 018: authored 2026-07-08 on maintainer request (step-12 close-out and
+1.0 release readiness), outside an audit session; refined the same day after
+a fresh-context cold read (18 gaps triaged) and baseline re-verification
+(464/464 tests at `6d62f55`).
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -36,10 +40,35 @@ below and can be turned into plans on request.
 | 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
 | 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
 | 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
+| 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — executed on branch `step-12-tier1-audit` (worktree `/home/hayk/zig-webp-exec-018`, HEAD `131efd0`); reviewer-verified, not merged (no PR per instructions) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-08** — Plan 018 executed end to end on branch
+  `step-12-tier1-audit` (isolated worktree `/home/hayk/zig-webp-exec-018`,
+  three commits `b76811f`/`432dcb1`/`131efd0` from planning commit `6d62f55`;
+  drift check clean). Dispatch note: an interrupted first dispatch's executor
+  completed the work; a second executor verified it and reported — the
+  reviewer re-ran every done criterion regardless. The Tier-1 audit scored
+  all 16 entry points + 29 type/lead rows (45 total); **every finding was
+  doc-class** — no behavior changes, no Tier-1 renames (step 3 skipped, no
+  operator approval needed). Both plan leads confirmed: six missing
+  parameter/result types added to the contract list (`OwnedBuffer`,
+  `DemuxOptions`, `MuxOptions`, `StaticImage`, `ContainerHeader`,
+  `ChunkHeader`), and `encodeVP8LBitstream`/`encodeVP8Bitstream` classified
+  explicitly Tier 2 (root.zig + README). New audit finding:
+  `EncoderOptions.preserve_metadata` is a never-read knob, now documented
+  reserved/no-effect. Reviewer verification: `zig build ci` exit 0 in the
+  worktree (464/464), all done-criteria greps pass, scope clean (7 files,
+  all in-scope), CI run `28878252291` at `6d62f55` confirmed green via `gh`
+  (3 jobs), oracle modes re-run by the executor with artifacts on disk
+  (`/tmp/plan018-encode-corpus.tsv`, `/tmp/plan018-anim-diff/`) matching the
+  0.2.0 records digit-for-digit. 1.0.0 readiness recorded in `PROGRESS.MD`;
+  remaining decisions (tag now vs land 014/016/017 first; run the release
+  procedure) are the operator's. **Not merged** — merging is the operator's
+  call.
 
 - **2026-07-07** — Plan 012 executed end to end on branch
   `decode-static-into`, commit `5843be4`. Drift check against planning commit
@@ -97,6 +126,10 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - Recommended order: 012 → 013 → 014 → 017 → 016 → 015 (015 is written to be
   executed after 1.0-track work; its own sequencing note says the follow-up
   implementation waits for 1.0).
+- 018 (added 2026-07-08) depends hard on 012 and 013 (both DONE) and is the
+  1.0 critical path: execute it before deciding to tag. 014/016/017 are
+  additive and may land before or after the tag — 018's step 5 surfaces that
+  choice to the operator. 015 stays post-1.0 per its own sequencing note.
 - 005 depends softly on 003: plan 003 writes the "not yet honored"
   doc-comment framing for `EncoderOptions` that 005's alias comments mirror.
   Different files, no merge conflict — just execute 003 first.
