@@ -59,10 +59,18 @@ VP8L-compressed `ALPH` decode. Coverage-guided `zig build test --fuzz` remains
 blocked by the Zig 0.16.0 test-runner instrumentation bug, but the weekly Zig
 master canary watches for that upstream blocker to clear.
 
-The next roadmap area is step 12: public API stabilization and release criteria.
-The highest-leverage API gap called out by the plan index is `decodeStaticInto`
-for caller-owned output buffers; platform and FFI work should wait until that
-ownership/error surface is settled.
+Step 12's remaining stabilization work is done. A 2026-07-08 audit of the
+Tier-1 surface walked all 16 stable entry points and every contract-listed
+type against a
+fixed checklist (ownership, allocation bounds, error semantics, naming and
+parameter order, pixel-format/stride contracts); the findings table lives under
+Recently Completed. Every finding was doc-class — no behavior changes and no
+Tier-1 renames. The contract list in `src/root.zig` now also names the six
+parameter/result types it had omitted, and the two bitstream-level encoders
+(`encodeVP8LBitstream`/`encodeVP8Bitstream`) are explicitly Tier 2. With the
+compatibility matrix closed, the remaining 1.0.0 decisions are the operator's:
+tag now versus landing plans 014/016/017 first, then `RELEASING.MD`'s release
+procedure.
 
 ## Cross-Cutting Practices
 
@@ -113,6 +121,125 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
 ## Recently Completed
+
+### Step 12 — Tier-1 API audit and 1.0 readiness
+
+Plan 018 (branch `step-12-tier1-audit`, 2026-07-08) closes step 12's remaining
+"stabilize APIs" and "document pixel formats, ownership, allocation behavior,
+and error semantics" bullets with a recorded audit of the full Tier-1 surface:
+all 16 entry points and every contract-listed type were scored against a fixed
+checklist — (a) ownership/free obligations, (b) allocation bounded and stated
+where budgeted against `ResourceLimits.allocation_bytes_max`, (c) notable
+failure modes named and `errorCategory` coverage, (d) naming and parameter
+order (`gpa` first, options bag last, `*_options`), (e) pixel-format/stride
+contract wherever an `ImageBuffer` crosses the API. Both known leads from the
+plan were confirmed: six parameter/result types were missing from the Tier-1
+list (now added — `OwnedBuffer` via `image`, `DemuxOptions`, `MuxOptions`,
+`StaticImage`, `ContainerHeader`, `ChunkHeader`; each is a new conscious freeze
+commitment), and the two root-level bitstream encoders were in neither tier
+(now explicitly Tier 2 in `src/root.zig` and `README.MD` — they are tooling
+entry points, so freezing them would buy nothing and cost flexibility). Every
+finding was doc-class; nothing moved behavior, and no Tier-1 rename was
+recommended or applied. `zig build ci` passed after the fixes (2026-07-08,
+464/464 tests, corpus hashes unchanged).
+
+Findings table (fix class `doc` = documentation corrected in this pass,
+`none` = checked with no action needed; `n/a` marks checklist items that do
+not apply to the row):
+
+| Name | Checklist item | Finding | Fix class |
+|---|---|---|---|
+| `decodeStatic` | e (a–d ok) | output stride contract was implicit ("packed"); now states stride == width × channels | doc |
+| `decodeStaticInto` | a–e | checked, no finding: dest ownership, stride/format authority, scratch budget, `InvalidCanvasSize`/`UnsupportedAnimationDecode` all stated | none |
+| `decodeAnimation` | b, c (a, d, e ok) | (b) allocation budget (canvas + owned frames vs `allocation_bytes_max`) undocumented; (c) `error.UnsupportedImageFormat` for 3-channel output unnamed | doc |
+| `AnimationDecoder` (`init`/`next`/`reset`/`info`/`deinit`) | a, b, c (d, e ok) | root alias omitted: input bytes must outlive the decoder; demux/canvas allocation budget; `init` failure modes (`NotAnimated`, `UnsupportedImageFormat`) | doc |
+| `encodeLossless` | b, c (a, d, e ok) | (b) allocation honesty unstated (canvas bounded by `output_pixels_max`, which also bounds pixel-proportional scratch; muxed file charged to `allocation_bytes_max`); (c) wrong-format error and VP8L 14-bit cap (>16384 → `InvalidVP8LHeader`) unnamed | doc |
+| `encodeLossy` | b, c (a, d, e ok) | (b) enforced scratch+mux budgets unstated; (c) VP8 14-bit cap (>16383 → `InvalidCanvasSize`) and wrong-format error unnamed | doc |
+| `encodeStatic` | b, c (a, d ok; e n/a) | (b) limits/budget unstated; (c) `InvalidMuxChunk` for bitstream/canvas mismatch unnamed | doc |
+| `encodeAnimation` | b, c (a ok; d note; e n/a) | (b) limits/budget unstated; (c) frame-validation errors unnamed; (d) param `anim` abbreviated — cosmetic, parameter names are not API | doc |
+| `encodeAnimationFromBuffers` | b, c (a, d, e ok) | (b) budget unstated; (c) empty-list `MissingImageData` unnamed; stale "optimization is a later step" (9c shipped) | doc |
+| `encodeAnimationMinimized` | b, c (a, d, e ok) | (b) budget unstated; (c) `InvalidCanvasSize` for non-canvas-sized input and empty-list `MissingImageData` unnamed | doc |
+| `parseFeatures` | a–d (e n/a) | checked, no finding: by-value result, budget stated, strict validation described | none |
+| `parseWebP` | b (a, c, d ok; e n/a) | allocation bound unstated (parity with `parseFeatures`); doc now also states locations are offsets into `bytes` | doc |
+| `isWebP` | a, d (b, c, e n/a) | checked, no finding: allocation-free stated; no errors by design | none |
+| `parseHeader` | c (d ok; a, b, e n/a) | failure modes unnamed (`InputTooSmall`/`InvalidRiffSignature`/`InvalidWebPSignature`/`InvalidRiffSize`/`FileTooLarge`) | doc |
+| `parseChunkHeader` | c (d ok; a, b, e n/a) | `TruncatedChunkHeader` unnamed | doc |
+| `errorCategory` | c, d (a, b, e n/a) | checked, no finding: total function, exhaustive switch over `Error` (compile-enforced) | none |
+| `DecoderOptions` | b–e (a n/a) | checked, no finding: `preserve_metadata`/`decode_animation` no-ops are honestly documented, recorded tradeoffs | none |
+| `EncoderOptions` | c (b, d ok; a, e n/a) | `preserve_metadata` was an undocumented, never-read knob (a fourth no-op beyond the three recorded ones); now documented as reserved/no effect | doc |
+| `ResourceLimits` | c (b, d ok; a, e n/a) | per-field docs absent — which limit produces which error was only readable from code; added, including that `allocation_bytes_max` meters only the paths that document it | doc |
+| `ImageBuffer` | a, e (c, d ok; b n/a) | root alias said "decoded pixel plane" though it is also encoder input and `decodeStaticInto` dest; stride/row-major semantics and `validate` errors undocumented on the type | doc |
+| `Dimensions` | c, d (a, b, e n/a) | checked, no finding: `init` validates via `pixelCount` (`InvalidCanvasSize`/`DimensionsOverflow`) | none |
+| `PixelFormat` (via `image`) | e (d ok; a–c n/a) | per-variant byte order was stated nowhere; added (`rgba` = R,G,B,A etc.; `rgb` 3-byte, no alpha) | doc |
+| `Error` | c, d (a, b, e n/a) | checked, no finding: one shared set stays (decided); additions-not-breaking rule recorded in the contract | none |
+| `ErrorCategory` | c, d (a, b, e n/a) | checked, no finding: five self-describing classes; `errorCategory` exhaustive | none |
+| `FeatureSummary` | a, d (b, c, e n/a) | checked, no finding: by-value, nothing to free. Note: embeds optional `container.ChunkLocation` fields — transitive field types freeze with their parent but are enumerated only at signature level | none |
+| `DemuxResult` | a, d (b ok; c, e n/a) | (a) ok (`deinit` stated). (d) note: `animation_info` is module-level `animation.Info`, a distinct type from Tier-1 `AnimationInfo` (`animation_decode.Info`); same short name, reachable only via Tier-2 module exports — no action | none |
+| `AnimationImage` | a–d (e n/a) | checked, no finding: root + mux docs cover placement, validation, metadata | none |
+| `AnimationFrameImage` | a–e | checked, no finding: rect/duration/blend/dispose/alpha constraints documented at the type | none |
+| `AnimationInfo` | a, d (b, c, e n/a) | checked, no finding: by-value; background documented as informational | none |
+| `CompositedFrame` | a (d, e ok; b, c n/a) | alias claimed frames "from `decodeAnimation` are owned" — that entry point returns `DecodedAnimationFrame`, never this type; borrow window (valid until next `next`/`reset`/`deinit`) now stated at root | doc |
+| `DecodedAnimation` | a, d (b, c, e n/a) | checked, no finding: `deinit` ownership stated | none |
+| `DecodedAnimationFrame` | a (d, e ok; b, c n/a) | root alias had no doc; added (owned by `DecodedAnimation`, packed buffer, duration/timestamp) | doc |
+| `AnimationFrameSource` | a–e | checked, no finding: stride/format, even-offset rule, per-frame codec documented | none |
+| `AnimationEncodeOptions` | b–e (a n/a) | checked, no finding: limits plus shared lossy quality/method/alpha knobs documented | none |
+| `AnimationFrameInput` | a–e | checked, no finding: full-canvas requirement and transparent-RGB canonicalization documented | none |
+| `AnimationMinimizeOptions` | b–e (a n/a) | checked, no finding: `keyframe_interval` clamp (`keyframe_interval_max` = 4096) and `tolerance` documented | none |
+| `MetadataPayloads` | a (d ok; b, c, e n/a) | alias described only the demux direction ("carried by a file"); it is also encoder input (caller-owned, must outlive the encode) — root alias now states both | doc |
+| `OwnedBuffer` (via `image`, added to list) | a (d, e ok; b, c n/a) | result type of `decodeStatic` was absent from the Tier-1 list; the type had no doc (owner, `deinit`, packed stride) — both fixed | doc |
+| `DemuxOptions` (added to list) | a, c, d (b ok; e n/a) | parameter type of `parseFeatures`/`parseWebP` absent from the list; `allow_trailing_data`/`strict_padding` documented nowhere public — root alias now documents them | doc |
+| `MuxOptions` (added to list) | a, d (b ok; c, e n/a) | parameter type of `encodeStatic`/`encodeAnimation` absent from the list; `force_extended` undocumented — root alias now documents it | doc |
+| `StaticImage` (added to list) | a–d (e n/a) | parameter type of `encodeStatic` absent from the list; existing alias doc adequate, list membership fixed | doc |
+| `ContainerHeader` (added to list) | a, d (b, c, e n/a) | result type of `parseHeader` absent from the list; alias undocumented — added | doc |
+| `ChunkHeader` (added to list) | a, d (b, c, e n/a) | result type of `parseChunkHeader` absent from the list; alias undocumented — added | doc |
+| Known lead 1 — missing parameter/result types | contract completeness | CONFIRMED: `OwnedBuffer`, `DemuxOptions`, `MuxOptions`, `StaticImage`, `ContainerHeader`, `ChunkHeader` all appear in Tier-1 signatures but were missing from the enumerated list; all six added to the `src/root.zig` contract (truth-up, not scope expansion) | doc |
+| Known lead 2 — `encodeVP8LBitstream`/`encodeVP8Bitstream` | tier classification; d | CONFIRMED unclassified; audit concludes Tier 2 (docs say "for tooling"; raw bitstream layer, no limits plumbing) — now explicit in contract and README. (d) noted: `encodeVP8Bitstream` takes `[]const VP8LARGBPixel` (a VP8L-named packed-ARGB type in a VP8 signature) and a bare `quality: u8` instead of an options bag; both are Tier-2 after classification, renameable in any release — no action for 1.0 | doc |
+
+Applied fixes (all doc-class, commit `432dcb1`): `src/root.zig` — Tier-1 list
+gains the six missing types, Tier-2 bullet names the two bitstream encoders,
+and the forwarding/alias docs listed above gained ownership, budget, error,
+and stride clauses; `src/options.zig` — `EncoderOptions.preserve_metadata`
+documented as reserved/no-effect; `src/image.zig` — `PixelFormat` byte order,
+`Buffer` row-major/stride semantics, `validate` errors, `OwnedBuffer`
+ownership; `src/limits.zig` — per-field `ResourceLimits` docs; `README.MD` —
+tier statement now excludes the two bitstream-level encoders from the Tier-1
+`encode*` grouping (and names them Tier 2), and the stale "only open step-9
+item" sentence now records the passed browser check.
+
+**1.0.0 readiness** (2026-07-08, verified at `step-12-tier1-audit` HEAD).
+Every `RELEASING.MD` gate holds:
+
+- *CI-covered gates* (fmt, build, step-5 corpus hashes, lossless round-trip
+  units): local `zig build ci` exit 0 at HEAD (464 tests), and the CI record
+  for the planning commit `6d62f55` — run 28878252291, all three jobs green
+  (`Format, tests, and corpus regression`; `Big-endian tests (powerpc64,
+  QEMU)`; `macOS tests (aarch64)`); verified via `gh run view` (a bare
+  `gh run list --commit 6d62f55` returns empty — query quirk, not a missing
+  run).
+- *Local-oracle gates* (all four tools resolved; every mode re-run this
+  session): step-7 validity — `zig build encode-report`, 77 sources,
+  **0 round-trip mismatches** (= 0.2.0 record); step-7 size —
+  `compare-encode-corpus`, **median 1.0368×**, aggregate 1.0460× (≤ 1.10×
+  gate, = 0.2.0 record); step-8b — `compare-encode-lossy` **0/135
+  `dwebp`-invalid** (= record; the size aggregate ~1.98× is the recorded
+  8c-2 `-noalpha`-baseline skew) and `encode-lossy-report` clean (34
+  sources, mean luma 37.13 dB); the matched-size +0.08 dB PSNR gate result
+  stands as recorded 2026-06-21 (method-4 output has been asserted
+  byte-identical since); step-8c target-size — reproduced in this session's
+  `zig build ci` metrics output, **0.32–2.83% off** (≤ 5% gate) and
+  target-PSNR 38.01–38.08 dB achieved, digit-for-digit the recorded 8c-3
+  row; animation parity — `compare-anim-corpus` over `testdata/animation`,
+  **10/10 byte-exact** (= 0.2.0 record).
+- *Compatibility matrix*: Linux x86_64, macOS aarch64, and big-endian
+  powerpc64 rows green in the `6d62f55` CI run above; browsers row recorded
+  2026-07-08 (Firefox + Chromium, both minimized samples animate correctly);
+  Windows recorded-deferred with reason.
+
+The remaining decisions are the operator's: (1) tag 1.0.0 now versus landing
+any of plans 014 (WASM spike), 016 (m5/6 measurement), or 017 (info CLI)
+first — all additive and non-breaking; and (2) executing `RELEASING.MD`'s
+release procedure (version bump in `build.zig.zon`, dated `CHANGELOG.MD`
+entry, release PR, tag after merge).
 
 ### Step 12 — Release criteria (1.0 stability contract + compatibility matrix)
 
