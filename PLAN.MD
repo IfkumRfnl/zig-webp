@@ -34,9 +34,13 @@ Non-goals, explicitly out of scope unless deliberately revisited:
 Portability and threading stance: development and CI test little-endian
 64-bit targets. Code must not assume host endianness; CI additionally runs
 the full test suite on big-endian powerpc64 under user-mode QEMU
-(`zig build test -Dtarget=powerpc64-linux -fqemu`). The library is
-thread-compatible: no global mutable state, so distinct decode/encode jobs
-may run on distinct threads. Internal parallelism is deferred to step 10.
+(`zig build test -Dtarget=powerpc64-linux -fqemu`) and on 32-bit
+wasm32-wasi under wasmtime (`zig build test -Dtarget=wasm32-wasi
+-fwasmtime`); a `zig build wasm-check` gate additionally compiles the
+library for wasm32-wasi and wasm32-freestanding plus the wasi unit tests.
+The library is thread-compatible: no global mutable state, so
+distinct decode/encode jobs may run on distinct threads. Internal
+parallelism is deferred to step 10.
 
 ## Toolchain Policy
 

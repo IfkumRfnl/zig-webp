@@ -152,7 +152,9 @@ compared against SHA-256 hashes in `testdata/corpus-hashes.tsv` and
 `testdata/animation/hashes.tsv`, so the check needs no `dwebp`/`anim_dump`. The
 local `zig build ci` gate bundles the same three steps CI runs on every pull
 request — `zig fmt --check .`, `zig build check`, and `zig build test` — into a
-single command. Regenerate
+single command. CI also runs the full suite on wasm32-wasi under wasmtime
+(`zig build test -Dtarget=wasm32-wasi -fwasmtime`) and a `zig build wasm-check`
+compile gate for wasm32-wasi/freestanding. Regenerate
 the manifests with `zig build corpus-hashes` / `zig build anim-hashes` only
 after a corpus-wide oracle run confirms the decoded planes and composited
 frames (`tools/webp-oracle.sh compare-anim`).

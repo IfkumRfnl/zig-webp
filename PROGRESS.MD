@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-08
+Last updated: 2026-07-09
 
 ## Current Position
 
@@ -75,12 +75,16 @@ procedure.
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
-(`.github/workflows/ci.yml`) as three jobs on Zig 0.16.0: `test`
+(`.github/workflows/ci.yml`) as four jobs on Zig 0.16.0: `test`
 (ubuntu-latest: `zig fmt --check .`, `zig build check`, `zig build test`),
 `big-endian` (ubuntu-latest: `zig build test -Dtarget=powerpc64-linux -fqemu`
-under `qemu-user-static`), and `macos` (macos-latest aarch64:
-`zig build check`, `zig build test`). The local `zig build ci` step bundles
-the Linux-job gate set. The test suite includes a hash-based corpus regression
+under `qemu-user-static`), `macos` (macos-latest aarch64:
+`zig build check`, `zig build test`), and `wasm` (ubuntu-latest:
+`zig build wasm-check` compile gate for wasm32-wasi and wasm32-freestanding
+plus the full suite under wasmtime via
+`zig build test -Dtarget=wasm32-wasi -fwasmtime`). The local
+`zig build ci` step bundles the Linux-job gate set (not the wasm job). The
+test suite includes a hash-based corpus regression
 (`src/testing/corpus.zig`): decoded RGBA planes of all 131 still images (43
 lossless and 88 lossy, the latter with composed ALPH alpha) and decoded alpha
 planes of all 18 ALPH-bearing files (149 rows) are compared against committed
@@ -121,6 +125,84 @@ instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
 ## Recently Completed
+
+### 2026-07-09 — 32-bit `usize` shift fix and wasm32 test gate
+
+Follow-up to the plan 014 spike findings below (same branch). Fixed the five
+`@as(usize, 1) << @as(u6, …)` sites in `src/vp8l/huffman.zig` (lines 180,
+312, 339, 341, 361) by dropping the explicit `u6` and letting `@intCast`
+infer `Log2Int(usize)` — `u5` on 32-bit targets, `u6` on 64-bit. A sweep of
+all shift sites confirmed these were the only `usize` shifts with a
+hardcoded `u6` amount; the rest shift fixed-width `u32`/`u64`/`i64` or use
+`u2`/`u3`/`u5` amounts that coerce on both register widths.
+
+Gates strengthened to cover the class: `zig build wasm-check` now also
+compiles (without running) the unit tests for wasm32-wasi, forcing full
+semantic analysis on a 32-bit `usize` target — the exportless static
+libraries alone stayed green with the bug present. The CI `wasm` job
+additionally runs the full suite under wasmtime
+(`zig build test -Dtarget=wasm32-wasi -fwasmtime`). Verified locally:
+464/464 tests pass on wasm32-wasi under wasmtime, including the SHA-256
+corpus regression (file reads work via the `--dir=.` preopen), and
+`zig build ci` stays green on the 64-bit host.
+
+### 2026-07-09 — Plan 014: wasm32 build spike
+
+Spike on branch `wasm32-spike` (Zig 0.16.0, wasmtime 46.0.1). No `src/` or
+`tools/` changes — findings only, plus the smallest CI gate that proved true.
+
+**Compile (step 1):**
+
+| Target | Command | Result |
+|---|---|---|
+| `wasm32-wasi` | `zig build-lib src/root.zig -target wasm32-wasi -O ReleaseSmall --name zig-webp-wasm -femit-bin=…` | exit 0 |
+| `wasm32-freestanding` | same with `-target wasm32-freestanding` | exit 0 |
+
+(`-femit-bin=/dev/null` fails with LLD `UnableToWriteArchive`; use a real
+path.) Both targets also succeed via the new `zig build wasm-check` step
+(ReleaseSmall static libraries for wasi and freestanding, independent of
+`-Dtarget`). Caveat: a static archive with no forced exports is a weak
+analysis gate — full semantic analysis of Huffman table construction only
+fires when tests or tools reference that path (see below).
+
+**Test under wasmtime (step 3):**
+
+```sh
+zig build test -Dtarget=wasm32-wasi -fwasmtime
+```
+
+Failed at **compile** time (never reached the runtime / preopen question):
+
+```
+src/vp8l/huffman.zig:180:63: error: expected type 'u5', found 'u6'
+    const subtable_entry_count = @as(usize, 1) << @as(u6, @intCast(extra_bits));
+```
+
+Same error on `zig test src/root.zig -target x86-linux --test-no-exec` and
+on `zig build check -Dtarget=wasm32-wasi` (every tool that pulls in VP8L
+Huffman). Root cause: on 32-bit targets `Log2Int(usize)` is `u5`, so a `u6`
+shift amount is a type error; on 64-bit hosts `Log2Int(usize)` is `u6` and
+the cast is accepted. Additional `@as(usize, 1) << @as(u6, …)` sites in the
+same file (lines 312, 339, 341, 361) will need the same treatment. This is
+exactly the 32-bit portability bug the spike was meant to surface — fixing
+it is a follow-up plan (out of scope here).
+
+**CI deliverable:** `.github/workflows/ci.yml` gains a `wasm` job that runs
+`zig build wasm-check` only. No wasm test step until the shift-type fix
+lands. README unchanged (suite does not pass on wasm). Binary size of a
+useful wasm artifact was not measured — empty archives / shared-lib stubs
+with no exports are not marketable numbers.
+
+**Follow-ups:**
+
+1. Fix `src/vp8l/huffman.zig` (and sibling `usize` shift sites) for 32-bit
+   `usize`, then add a wasm32-wasi unit-test step under wasmtime
+   (`--dir .` for corpus file reads). *Landed 2026-07-09 — see the entry
+   above.*
+2. `wasm32-freestanding` export surface + caller-owned allocator handoff
+   (pairs with plan 015 / plan 012).
+3. npm-publishable browser demo; ReleaseSmall size reporting once exports
+   exist.
 
 ### Step 12 — Tier-1 API audit and 1.0 readiness
 

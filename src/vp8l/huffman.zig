@@ -177,7 +177,7 @@ pub fn Table(comptime options: TableOptions) type {
             for (max_extra_bits_by_root, 0..) |extra_bits, root_index| {
                 if (extra_bits == 0) continue;
 
-                const subtable_entry_count = @as(usize, 1) << @as(u6, @intCast(extra_bits));
+                const subtable_entry_count = @as(usize, 1) << @intCast(extra_bits);
                 if (subtable_entry_count > entries_buffer.len - entry_count) {
                     return error.OutputTooLarge;
                 }
@@ -309,7 +309,7 @@ pub fn Table(comptime options: TableOptions) type {
             assert(length <= root_bits);
             assert(entries.len == root_entry_count);
 
-            const stride = @as(usize, 1) << @as(u6, @intCast(length));
+            const stride = @as(usize, 1) << @intCast(length);
             var index: usize = @intCast(reversed);
             while (index < root_entry_count) : (index += stride) {
                 if (entries[index].op != .invalid) return error.InvalidHuffmanTree;
@@ -336,9 +336,9 @@ pub fn Table(comptime options: TableOptions) type {
             const extra_bits = length - root_bits;
             assert(extra_bits <= root_entry.bits);
 
-            const subtable_entry_count = @as(usize, 1) << @as(u6, @intCast(root_entry.bits));
+            const subtable_entry_count = @as(usize, 1) << @intCast(root_entry.bits);
             const subtable_code = (reversed >> root_bits) & maskBits(@intCast(extra_bits));
-            const stride = @as(usize, 1) << @as(u6, @intCast(extra_bits));
+            const stride = @as(usize, 1) << @intCast(extra_bits);
             var index: usize = @intCast(subtable_code);
             while (index < subtable_entry_count) : (index += stride) {
                 const entry_index = @as(usize, root_entry.offset) + index;
@@ -358,7 +358,7 @@ pub fn Table(comptime options: TableOptions) type {
                     .symbol => {},
                     .table => {
                         const subtable_start = @as(usize, root_entry.offset);
-                        const subtable_len = @as(usize, 1) << @as(u6, @intCast(root_entry.bits));
+                        const subtable_len = @as(usize, 1) << @intCast(root_entry.bits);
                         const subtable_end = subtable_start + subtable_len;
                         if (subtable_start < root_entry_count) return error.InvalidHuffmanTree;
                         if (subtable_end > entries.len) return error.InvalidHuffmanTree;

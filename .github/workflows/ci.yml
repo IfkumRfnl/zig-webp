@@ -35,6 +35,31 @@ jobs:
       - name: Run tests
         run: zig build test
 
+  # Compatibility-matrix / portability row: the full test suite — including
+  # the byte-exact SHA-256 corpus regression — on a 32-bit usize target
+  # (wasm32-wasi) under wasmtime, plus `zig build wasm-check` compile gates
+  # for the wasi/freestanding static libraries and the wasi test binary.
+  wasm:
+    name: Wasm32 tests (wasi, wasmtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.16.0
+
+      - name: Install wasmtime
+        run: |
+          curl -fsSL https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Compile library and unit tests for wasm32
+        run: zig build wasm-check
+
+      - name: Run tests on wasm32-wasi under wasmtime
+        run: zig build test -Dtarget=wasm32-wasi -fwasmtime
+
   # Compatibility-matrix row (RELEASING.MD): the full test suite — including
   # the byte-exact SHA-256 corpus regression — on a big-endian target,
   # executed under user-mode QEMU.
