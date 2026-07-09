@@ -77,8 +77,10 @@ procedure.
 CI runs on every pull request and push to main
 (`.github/workflows/ci.yml`) as four jobs on Zig 0.16.0: `test`
 (ubuntu-latest: `zig fmt --check .`, `zig build check`, `zig build test`),
-`big-endian` (ubuntu-latest: `zig build test -Dtarget=powerpc64-linux -fqemu`
-under `qemu-user-static`), `macos` (macos-latest aarch64:
+`big-endian` (ubuntu-latest:
+`zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux
+-Doptimize=ReleaseSafe -fqemu` under `qemu-user-static`), `macos`
+(macos-latest aarch64:
 `zig build check`, `zig build test`), and `wasm` (ubuntu-latest:
 `zig build wasm-check` compile gate for wasm32-wasi and wasm32-freestanding
 plus the full suite under wasmtime via
@@ -123,6 +125,38 @@ failures are reproducible and CI-stable. Coverage-guided runs via
 bundled `lib/compiler/test_runner.zig` fails to compile under fuzz
 instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
+
+## In Progress
+
+### 2026-07-08 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards) — Step 7 pending
+
+The `big-endian` CI job was the slow outlier (12m49s–16m40s on 2026-07-08
+runs) because the full 464-test suite ran Debug under QEMU TCG. Same-machine
+baselines at `29be0df` (qemu 10.0.8): Debug 18m24s vs ReleaseSafe 4m23s
+(all 464 pass). Sharding across 4 parallel simple-mode qemu processes cut
+local wall time further to **215s (~3m35s)** for
+`zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux
+-Doptimize=ReleaseSafe -fqemu` (exit 0; four `ran 116 of 464` lines sum to
+464; zero failed/leaked).
+
+Delivered: `tools/shard_test_runner.zig` (mirrors Zig 0.16.0 default-runner
+terminal + non-fuzz `fuzz` path), `-Dtest-shards` wiring in `build.zig`
+(default path and `zig build ci` stay unsharded/default-runner), CI job +
+docs updated. Native probes: fail/leak/misconfig all exit 1; `zig build ci`
+exit 0. **Step 7 (observe the sharded ReleaseSafe `big-endian` CI job after
+push) is not yet done; the times above are local QEMU measurements, not a
+recorded CI run.**
+
+Local quirk (not a regression): the sharded `.simple`-runner `.check` path
+can still print a benign `failed command: …` trailer on a successful
+(exit 0) run — the simple-mode runner writes its normal per-shard output
+(`ran 116 of 464`, pass counts) to stderr, which the build runner surfaces
+alongside the command line. The exit code is 0 and the build succeeds, so
+the trailer is not a failure; read the exit code and the shard-count lines,
+not the `failed command:` line. This is independent of the earlier
+unsharded default-runner quirk on hosts without binfmt_misc
+(`failed command: … --listen=-` under direct qemu); the sharded path does
+not use the `--listen` IPC protocol.
 
 ## Recently Completed
 

@@ -63,6 +63,8 @@ jobs:
   # Compatibility-matrix row (RELEASING.MD): the full test suite — including
   # the byte-exact SHA-256 corpus regression — on a big-endian target,
   # executed under user-mode QEMU.
+  # ReleaseSafe (safety checks stay on) and 4-way sharding keep the emulated
+  # run to minutes; see plans/019 and RELEASING.MD for the rationale.
   big-endian:
     name: Big-endian tests (powerpc64, QEMU)
     runs-on: ubuntu-latest
@@ -78,8 +80,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
 
-      - name: Run tests on powerpc64 under QEMU
-        run: zig build test -Dtarget=powerpc64-linux -fqemu
+      - name: Run tests on powerpc64 under QEMU (ReleaseSafe, 4 shards)
+        run: zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux -Doptimize=ReleaseSafe -fqemu
 
   # Compatibility-matrix row (RELEASING.MD): macOS aarch64. No fmt check
   # here — redundant with the Linux job.
