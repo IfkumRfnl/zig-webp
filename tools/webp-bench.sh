@@ -84,14 +84,16 @@ min_ms() {
 
 # Best-of-`runs` of dwebp's self-reported internal decode time for still "$1",
 # in integer milliseconds. Parses the "Time to decode picture: Xs" line from
-# `dwebp -v`. Integer conversion truncates toward zero, so any genuine
-# sub-millisecond internal time becomes 0 (a 1 ms quantization floor, not a
-# missing-line failure). Nonzero dwebp exit or a missing/unparseable timing
-# line → "FAIL" (never conflate with quantized 0).
+# `dwebp -v -pam`. Use PAM (RGBA) so the timed conversion matches the wall-clock
+# `dwebp -pam` path and Zig's RGBA decode; default PNG would convert opaque
+# stills to RGB and under-report. Integer conversion truncates toward zero, so
+# any genuine sub-millisecond internal time becomes 0 (a 1 ms quantization
+# floor, not a missing-line failure). Nonzero dwebp exit or a missing/
+# unparseable timing line → "FAIL" (never conflate with quantized 0).
 min_internal_decode_ms() {
   local f="$1" best=-1 out secs ms rc
   for _ in $(seq 1 "$runs"); do
-    out=$(dwebp -v "$f" -o /dev/null 2>&1)
+    out=$(dwebp -v "$f" -pam -o /dev/null 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ]; then echo "FAIL"; return 0; fi
     secs=$(printf '%s\n' "$out" | sed -n 's/.*[Tt]ime to decode picture: *\([0-9.]*\)s.*/\1/p')
