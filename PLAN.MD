@@ -29,7 +29,10 @@ Non-goals, explicitly out of scope unless deliberately revisited:
   golden/altref frames, and non-key-frame decode.
 - Applying ICC color management. Profiles are exposed as raw chunks; color
   transformation is the caller's concern.
-- A C ABI or bindings layer before the Zig API stabilizes.
+- A C ABI or bindings layer before the Zig API stabilizes. That sequencing
+  guard was the 1.0 precondition; the post-1.0 C-ABI *design* lives in
+  step 13 below and is not implemented yet (no shipped C header, exports,
+  or compatibility promise).
 
 Portability and threading stance: development and CI test little-endian
 64-bit targets. Code must not assume host endianness; CI additionally runs
@@ -404,6 +407,270 @@ input.
 - Release `1.0.0` only after the 8b and 8c gates, animation encode, metadata,
   hardening, docs, and the compatibility matrix in `RELEASING.MD`
   ("Compatibility matrix (1.0 gate)") are all met.
+
+
+### 13. C ABI (post-1.0)
+
+Forward-looking design only. Version 1.0.0 shipped the Zig Tier-1 surface;
+this step records the C export contracts a later implementation plan must
+execute. Nothing here authorizes `src/capi.zig`, an installed header, shared
+library scaffolding, or CI wiring today.
+
+#### 1. Scope of the exported surface (v1)
+
+**Decision.** C ABI v1 exports the still-image Tier-1 core only:
+`isWebP` / `parseHeader` / `parseChunkHeader` / `parseFeatures` analogues,
+`decodeStaticInto` (caller-owned pixels only), `encodeLossless` /
+`encodeLossy` (library-owned output bytes + paired free), and error helpers.
+No library-allocated pixel decode in v1.
+
+**Rationale.** Still probe/decode/encode covers the common FFI adoption path
+without opaque streaming handles or nested animation ownership.
+
+**Rejected.** Mirroring all of Tier 1 in v1 (animation + mux + demux detail)
+would freeze hard-to-version nested ownership before any C caller exists.
+Also rejected: a `decodeStatic`-style library-allocated pixel API in v1 —
+that forces cross-language pixel ownership the Into path was added to avoid.
+
+**Tier-1 entry-point partition** (complete; silence is not a decision):
+
+| Zig Tier-1 entry point | C ABI |
+|---|---|
+| `isWebP` | **v1** |
+| `parseHeader` | **v1** |
+| `parseChunkHeader` | **v1** |
+| `parseFeatures` | **v1** |
+| `decodeStaticInto` | **v1** |
+| `encodeLossless` | **v1** |
+| `encodeLossy` | **v1** |
+| `errorCategory` | **v1** (as `zwebp_error_category` / `zwebp_error_name`) |
+| `decodeStatic` | **non-goal** for C (Into is the C decode shape; no parallel owning-pixel export) |
+| `decodeAnimation` | **deferred v2** (batch owning frames; prefer streaming handle) |
+| `AnimationDecoder` | **deferred v2** (opaque `zwebp_anim_decoder*` handle: create / next / reset / destroy) |
+| `parseWebP` | **deferred** pending decision 10 (chunk-location demux vs probe-only) |
+| `encodeStatic` | **deferred v2** (pre-encoded bitstream mux; niche for C) |
+| `encodeAnimation` | **deferred v2** (nested frame bitstream + metadata ownership) |
+| `encodeAnimationFromBuffers` | **deferred v2** |
+| `encodeAnimationMinimized` | **deferred v2** |
+
+Supporting Tier-1 *types* appear in C only as the extern structs / enums
+needed by the classified entry points above (limits, buffers, options,
+feature summary scalars, error codes). Tier-2 Zig exports are C non-goals.
+
+#### 2. Naming and header
+
+**Decision.** Prefix `zwebp_`. One hand-written installed header
+`include/zwebp.h`. The header is a maintained artifact, not auto-emitted.
+
+**Rationale.** Short, and it does not collide with libwebp's `WebP*` /
+`webp/` namespace — a C program may link both. Zig has no reliable
+auto-header emit for this surface.
+
+**Rejected.** `webp_zig_` (longer, still WebP-adjacent) and generating the
+header from Zig `@export` metadata (fragile across toolchain versions).
+
+**Implementation gate (future).** CI must compile the header against the
+exports — e.g. build a tiny C smoke program that `#include`s `zwebp.h` and
+links the static library — so header/export drift fails the build.
+
+#### 3. Error model
+
+**Decision.** Fallible C functions return `int32_t` status: `0` success;
+negative stable codes for the **subset of `errors.Error` reachable from the
+exported C surface** (today: the v1 wrappers around `isWebP` /
+`parseHeader` / `parseChunkHeader` / `parseFeatures` / `decodeStaticInto` /
+`encodeLossless` / `encodeLossy`, plus the error helpers). Codes are
+numbered explicitly in `include/zwebp.h` / the future `src/capi.zig` map
+and are **appended-only**: new reachable Zig errors get new negative
+codes; never reuse or renumber. Provide `zwebp_error_category(int32_t)`
+mirroring `errors.category` for known codes (`container`,
+`resource_limit`, `unsupported`, `bitstream`, `allocation`) and
+`zwebp_error_name(int32_t)` returning a static NUL-terminated string.
+
+Do **not** stabilize corpus/testing-only or other Zig errors that no
+exported C entry point can return (e.g. `CorpusUnavailable`,
+`InvalidCorpusPath`). If a wrapper ever observes an unmapped Zig error,
+translate it to a single reserved deterministic fallback code (e.g.
+`ZWEBP_ERROR_INTERNAL`) whose category is `unsupported` (or a documented
+fixed category) and whose name is a static string — never invent
+ad-hoc numbers at runtime. Each C wrapper must keep a mapping that is
+exhaustive for the Zig errors that wrapper can produce; a future
+implementation gate requires compile-time or unit-test exhaustiveness
+checks over every exported wrapper's reachable set (and a regression
+asserting the fallback path for an intentionally unmapped sentinel).
+
+**Rationale.** Plan 013's "additions to `errors.Error` are not breaking"
+still holds on the Zig side; the C ABI freezes only the FFI-visible code
+list, so internal/test taxonomy churn does not widen the C surface.
+
+**Rejected.** One C code per every `errors.Error` member (would freeze
+unreachable testing/internal errors into the ABI); returning Zig
+error-set integer values (not a stable ABI); POSIX `errno`-style
+thread-local detail; out-parameters for the code while returning `bool`.
+
+#### 4. Memory model
+
+**Decision.** No allocator object crosses the C boundary in v1. Internal
+scratch and encoder output are owned by a process-wide thread-safe Zig
+allocator chosen at implementation time (must be thread-safe and introduce
+no global mutable codec state, matching the library threading stance).
+Decode pixels are always caller-owned via the Into contract. Encoder
+success fills an owning result (`uint8_t* data; uint64_t len;`) freed with
+`zwebp_free(ptr, len)` — both pointer and length, so size-aware allocators
+remain possible. `ResourceLimits.allocation_bytes_max` remains the caller's
+bound on internal scratch/output exactly as in Zig.
+
+**Rationale.** Process-wide ownership keeps the C call shape close to
+"buffer in, status out" without a context handle on every call; Into
+already solved decode-side cross-language ownership.
+
+**Rejected.** Passing a caller allocator vtable across the ABI in v1
+(large surface, hard to version, conflicts with the Zig-side
+caller-controlled allocator story). Also rejected for v1: a mandatory
+opaque `zwebp_context*` on every call (better for WASM freestanding and
+allocator-failure injection from C, but heavier than host C needs; revisit
+under decision 10 if freestanding shares this surface).
+
+#### 5. Struct strategy
+
+**Decision.** Extern structs with a leading `uint32_t struct_size` set by
+the matching `zwebp_*_init` defaulting function (callers may instead set
+`struct_size = sizeof(...)` before use). Mirror:
+
+- `zwebp_limits` — the six `ResourceLimits` integer fields;
+- `zwebp_buffer` — `uint8_t* pixels; uint64_t len; uint32_t width, height,
+  stride; int32_t format;` (pointer+len, not a Zig slice);
+- `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
+  as needed by v1 entry points.
+
+Zig optionals (`target_size: ?u32`, `target_psnr: ?f32`, metadata slices)
+become value + `bool has_*` (and pointer+length for payloads). Never treat
+`0` as unset.
+
+**Directional `struct_size` compatibility** (precise; this is how appended
+fields stay non-breaking):
+
+- Each option/config struct defines a **minimum recognized prefix** (the
+  v1 field layout including `struct_size` itself). Callees **never read
+  beyond `min(caller.struct_size, library_sizeof)`** bytes.
+- A **newer library** accepting an **older/smaller** caller struct must
+  accept `struct_size` values that equal a **supported historical prefix**
+  (including the current `library_sizeof`), treat absent trailing fields as
+  init-defaults, and must not read past the caller-provided size. Sizes
+  below `min_prefix`, or sizes that are not an exact supported prefix,
+  are rejected.
+- An **older library** receiving a **newer/larger** caller struct may
+  **reject** sizes above the version it understands (it must not guess at
+  trailing fields, and still must not read past `caller.struct_size`).
+  Forward progress for callers is to rebuild against a newer header/soname,
+  not to require old binaries to accept unknown tails.
+- Shrinking or reordering fields inside the recognized prefix is
+  C-breaking; appending fields (and bumping the library `sizeof`) is
+  non-breaking for callers that keep setting `struct_size` to their own
+  `sizeof` and for libraries that default the absent tail as above.
+
+**Rationale.** Explicit presence flags avoid sentinel rot (`0` is a legal
+PSNR target). Directional size rules give libwebp-style extensibility
+without the contradiction of "reject smaller sizes" while claiming
+appended fields are non-breaking.
+
+**Rejected.** `0`-as-unset sentinels; requiring C callers to hand-fill Zig
+defaults; packing Zig slices as fat pointers; bidirectional "accept any
+`sizeof`" (old libraries must not silently ignore unknown trailing
+semantics); rejecting every smaller-than-current struct (would make
+appended fields a breaking change for old callers).
+
+#### 6. Feature probe result
+
+**Decision.** `zwebp_features` is a by-value extern struct of Summary
+*scalars* only: file kind, format presence + kind, width, height,
+`has_alpha`, `is_animation`, metadata presence bits (ICCP/EXIF/XMP), and
+`chunk_count`. No pointers, no `ChunkLocation` fields, nothing to free.
+Frame count is not part of `features.Summary` today and is not invented
+here — animation frame counts arrive with deferred animation/demux APIs.
+
+**Rationale.** Matches the Zig probe's "by value, nothing to free"
+contract and stays honest about what `parseFeatures` actually returns.
+
+**Rejected.** Exporting chunk offsets in the probe result (that is demux
+detail; see decision 10).
+
+#### 7. Artifact and build
+
+**Decision.** Future `build.zig` grows a Tier-2 `capi` module rooted at
+`src/capi.zig`, linked into the existing static library plus an optional
+shared-library step; `include/zwebp.h` installed via `b.installFile` (or
+equivalent). The Zig module remains the package's primary artifact; C is
+an adoption layer.
+
+**Future implementation acceptance gates** (must all hold before claiming
+the C ABI ships):
+
+1. **Header/export consistency** — a C translation unit that includes
+   `zwebp.h` compiles and links against the built library (catches missing
+   exports and signature drift).
+2. **Behavioral decode gate** — a C smoke program decodes a committed
+   corpus still into a caller-owned buffer via the Into analogue and
+   byte-compares against Zig `decodeStatic` / corpus hash expectations.
+3. **Error-map exhaustiveness** — for each exported C wrapper, a test
+   (comptime preference, else unit) proves the Zig→C status map covers that
+   wrapper's reachable `errors.Error` set, and a separate case proves the
+   reserved unmapped-error fallback code/category/name.
+4. **`struct_size` directionality** — tests cover (a) older/smaller prefix
+   accepted with defaulted tail fields and (b) oversized/unknown size
+   rejected without reading past the caller-provided bytes.
+5. Wire those checks into `zig build check` or a dedicated step invoked by
+   CI.
+
+**Rejected.** Shipping a shared library without the header-drift,
+decode-behavior, error-map exhaustiveness, and `struct_size`
+directionality gates; treating header install as documentation-only.
+
+#### 8. ABI stability policy
+
+**Decision.** The C ABI versions independently of the already-stable Zig
+1.x package API. The header defines `ZWEBP_ABI_VERSION` (and a query
+function). Shared-library soname follows the C major (e.g. `libzwebp.so.1`);
+soname / C major bumps only on C-breaking changes (removed entry points,
+changed signatures, reused or renumbered published error codes, shrinking/
+reordering a recognized `struct_size` prefix, or changing the directional
+size rules in decision 5). Non-breaking: appending C error codes for newly
+reachable Zig errors; appending struct fields under decision 5's newer-
+library-defaults-absent-tail / older-library-may-reject-larger rules.
+Implementing or evolving the C layer does not silently extend the Zig 1.x
+compatibility promise to an unimplemented surface — C stability starts
+when the C ABI is released.
+
+**Rationale.** Zig 1.x can keep improving internals and additive Tier-1 APIs
+while C callers pin a narrower, explicitly versioned FFI contract.
+
+**Rejected.** Coupling C soname 1:1 to Zig package minor tags, or claiming
+C ABI stability before any C artifact exists.
+
+#### 9. Explicit non-goals for C ABI v1
+
+- No callbacks into user code.
+- No streaming or incremental decode of partial files (mirrors the Zig
+  library non-goal).
+- No caller-allocator ABI.
+- No thread-pool / internal-parallelism knobs.
+- No animation encode (`encodeAnimation` /
+  `encodeAnimationFromBuffers` / `encodeAnimationMinimized`) — still Tier 1
+  in Zig, deferred from the first C surface because nested frame and
+  metadata ownership need a separate design review.
+- No language-specific bindings (Python/Rust/etc.); those consume this C
+  ABI downstream.
+- No claim that this design is already implemented.
+
+#### 10. Open questions left open
+
+- **WASM freestanding exports:** whether wasm32-freestanding shares this
+  exact host C surface or a slimmed one (possibly with an explicit context /
+  arena inject — see decision 4's rejected alternative). Plan 014 follow-ups
+  must consume this answer rather than inventing a third surface.
+- **`parseWebP`:** whether chunk-location demux detail is worth a C export
+  at all versus keeping C on `parseFeatures` + still decode/encode. Deferred
+  until a concrete FFI caller needs remux/chunk surgery.
 
 ## Near-Term Work Items
 
