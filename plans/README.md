@@ -50,7 +50,7 @@ below and can be turned into plans on request.
 | 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
 | 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — executed on branch `step-12-tier1-audit` (worktree `/home/hayk/zig-webp-exec-018`, HEAD `131efd0`); reviewer-verified, not merged (no PR per instructions) |
 | 019 | Big-endian CI job to ~3 min: ReleaseSafe + 4-way sharded QEMU run | P1 | M | — | DONE — PR #97 CI green; full 464-test powerpc64 ReleaseSafe suite passed in 3m9s with 4 QEMU shards (run `28993818050`) |
-| 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | TODO |
+| 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | DONE — branch `bench-dwebp-internal-timing` |
 | 021 | VP8L bit reader: bulk 64-bit refill + unchecked fast path, byte-exact | P1 | M | 020 (soft) | TODO |
 | 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft) | TODO |
 | 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | TODO |

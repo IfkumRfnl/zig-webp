@@ -126,6 +126,8 @@ bundled `lib/compiler/test_runner.zig` fails to compile under fuzz
 instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
+Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
+
 ## Recently Completed
 
 ### 2026-07-09 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards)
