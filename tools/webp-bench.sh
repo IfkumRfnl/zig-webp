@@ -10,10 +10,12 @@
 # absent — it never becomes a build dependency, and it is not wired into CI
 # (timing is environment-dependent and would flake).
 #
-# Caveat for honest comparison: dwebp/cwebp read and write real files, so their
-# times include input read + output formatting/write; `zig build bench` times
-# decode/encode in memory only. The ratio is indicative of codec speed, not an
-# exact apples-to-apples measurement — note that whenever you record it.
+# Caveat for honest comparison: the wall-clock columns (decode_ms, cwebp_*)
+# include input read + output formatting/write because dwebp/cwebp touch real
+# files; `zig build bench` times decode/encode in memory only, so those ratios
+# are indicative. The decode_int_ms column does not carry that caveat — it is
+# dwebp's self-reported internal decode time via `-v`, excluding file I/O and
+# PAM/PNG formatting.
 #
 # Usage:
 #   tools/webp-bench.sh [-n RUNS] [FILE.webp ...]
@@ -80,31 +82,54 @@ min_ms() {
   echo "$best"
 }
 
+# Best-of-`runs` of dwebp's self-reported internal decode time for still "$1",
+# in integer milliseconds. Parses the "Time to decode picture: Xs" line from
+# `dwebp -v`. Integer conversion truncates toward zero, so any genuine
+# sub-millisecond internal time becomes 0 (a 1 ms quantization floor, not a
+# missing-line failure). Nonzero dwebp exit or a missing/unparseable timing
+# line → "FAIL" (never conflate with quantized 0).
+min_internal_decode_ms() {
+  local f="$1" best=-1 out secs ms rc
+  for _ in $(seq 1 "$runs"); do
+    out=$(dwebp -v "$f" -o /dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then echo "FAIL"; return 0; fi
+    secs=$(printf '%s\n' "$out" | sed -n 's/.*[Tt]ime to decode picture: *\([0-9.]*\)s.*/\1/p')
+    if ! ms=$(printf '%s\n' "$secs" | awk 'NF { printf "%d", ($1 + 0) * 1000; found = 1; exit } END { if (!found) exit 1 }'); then
+      echo "FAIL"; return 0
+    fi
+    if [ "$best" -lt 0 ] || [ "$ms" -lt "$best" ]; then best=$ms; fi
+  done
+  echo "$best"
+}
+
 # An animation if webpinfo reports an ANMF frame chunk. Without webpinfo we
 # cannot tell, so treat it as a still (dwebp will then FAIL it, reported as such).
 is_animation() {
   has_tool webpinfo && webpinfo "$1" 2>/dev/null | grep -q "ANMF"
 }
 
-printf '# webp-bench: best of %d runs, milliseconds. decode = dwebp (still) / anim_dump (animation); cwebp = re-encode.\n' "$runs"
-printf '%-44s %12s %14s %14s\n' "file" "decode_ms" "cwebp_ll_ms" "cwebp_q75_ms"
+printf '# webp-bench: best of %d runs, milliseconds. decode = dwebp (still) / anim_dump (animation); decode_int_ms = dwebp self-reported decode time (excludes file I/O and PAM/PNG formatting); cwebp = re-encode.\n' "$runs"
+printf '%-44s %12s %14s %14s %14s\n' "file" "decode_ms" "decode_int_ms" "cwebp_ll_ms" "cwebp_q75_ms"
 
 for f in "${files[@]}"; do
   [ -f "$f" ] || { echo "SKIP missing: $f" >&2; continue; }
 
-  d="-"; cl="-"; cq="-"
+  d="-"; di="-"; cl="-"; cq="-"
   if is_animation "$f"; then
     # Animation: time the libwebp animation decoder. Pass -pam so it writes raw
     # PAM frames; without it anim_dump defaults to PNG output, whose compression
     # cost would inflate decode_ms vs the still path's `dwebp -pam` and the Zig
     # benchmark's in-memory decode. Re-encode is not an apples-to-apples
     # single-image comparison, so leave the cwebp columns n/a.
+    # decode_int_ms is "-" — anim_dump has no equivalent internal timer.
     if has_tool anim_dump; then
       d=$(min_ms anim_dump -pam -folder "$tmp_dir" "$f")
     fi
   else
     if has_tool dwebp; then
       d=$(min_ms dwebp "$f" -pam -o "$tmp_pam")
+      di=$(min_internal_decode_ms "$f")
     fi
     # Re-encode needs pristine source pixels; decode once to PAM, then time cwebp
     # on that. cwebp accepts PAM input.
@@ -114,5 +139,5 @@ for f in "${files[@]}"; do
     fi
   fi
 
-  printf '%-44s %12s %14s %14s\n' "$(basename "$f")" "$d" "$cl" "$cq"
+  printf '%-44s %12s %14s %14s %14s\n' "$(basename "$f")" "$d" "$di" "$cl" "$cq"
 done
