@@ -34,7 +34,9 @@ Non-goals, explicitly out of scope unless deliberately revisited:
 Portability and threading stance: development and CI test little-endian
 64-bit targets. Code must not assume host endianness; CI additionally runs
 the full test suite on big-endian powerpc64 under user-mode QEMU
-(`zig build test -Dtarget=powerpc64-linux -fqemu`) and on 32-bit
+(`zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux
+-Doptimize=ReleaseSafe -fqemu`; ReleaseSafe, sharded 4-way so the
+emulated gate stays fast; native jobs keep Debug) and on 32-bit
 wasm32-wasi under wasmtime (`zig build test -Dtarget=wasm32-wasi
 -fwasmtime`); a `zig build wasm-check` gate additionally compiles the
 library for wasm32-wasi and wasm32-freestanding plus the wasi unit tests.

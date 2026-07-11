@@ -10,6 +10,14 @@ Plan 018: authored 2026-07-08 on maintainer request (step-12 close-out and
 1.0 release readiness), outside an audit session; refined the same day after
 a fresh-context cold read (18 gaps triaged) and baseline re-verification
 (464/464 tests at `6d62f55`).
+Plan 019: authored 2026-07-08 on maintainer request (`plan` variant — speed
+up the big-endian CI job), outside an audit session; grounded in same-machine
+QEMU measurements (Debug 18m24s vs ReleaseSafe 4m23s, full 464-test suite on
+powerpc64 at `29be0df`); maintainer selected ReleaseSafe + 4-way sharding.
+Plans 020–027: improve-skill `plan` session of 2026-07-09 (commit `29be0df`;
+maintainer requested plans for the advised performance push after reviewing
+the step-10 record). See "Planning session — 2026-07-09" below for the
+selection rationale and one recorded reversal.
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -41,6 +49,15 @@ below and can be turned into plans on request.
 | 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
 | 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
 | 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — executed on branch `step-12-tier1-audit` (worktree `/home/hayk/zig-webp-exec-018`, HEAD `131efd0`); reviewer-verified, not merged (no PR per instructions) |
+| 019 | Big-endian CI job to ~3 min: ReleaseSafe + 4-way sharded QEMU run | P1 | M | — | DONE — PR #97 CI green; full 464-test powerpc64 ReleaseSafe suite passed in 3m9s with 4 QEMU shards (run `28993818050`) |
+| 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | TODO |
+| 021 | VP8L bit reader: bulk 64-bit refill + unchecked fast path, byte-exact | P1 | M | 020 (soft) | TODO |
+| 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft) | TODO |
+| 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | TODO |
+| 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | TODO |
+| 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
+| 026 | Luma SSIM column in the lossy encode report | P3 | S | — | TODO |
+| 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -150,6 +167,45 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   mutation-exploration mechanism. It works without 008 (decode targets only).
 - 007/008/010/011 are pairwise independent (disjoint files); any order.
   Recommended: 007 → 010 → 008 → 009 → 011.
+- 020 before 021–024 is soft but recommended: it upgrades the libwebp-side
+  ratio every perf plan records.
+- 021 before 022: independent changes to different files, but sequencing
+  them isolates each speedup in the PROGRESS.MD record (10b/10c precedent).
+- 024 depends HARD on 023: its Step-1 profile gate must run after the loop
+  filter is vectorized or the attribution is wrong. A REJECTED outcome for
+  024 is a valid, expected completion.
+- 025 and 026 are independent of everything above (disjoint files); 026
+  complements 016 — if 016 runs after 026 it should quote both PSNR and
+  SSIM.
+- 027 is post-1.0 track like 015; execute after the release decisions, with
+  020–023's measurements in hand.
+
+## Planning session — 2026-07-09 (commit `29be0df`, `plan` variant)
+
+No audit this session: the maintainer reviewed the step-10 performance
+record against libwebp and requested plans for the advised next push. Eight
+plans (020–027) cover: measurement honesty (020, 026), the lossless-decode
+scalar gap (021, 022), remaining lossy-decode SIMD (023, gated 024), the
+lossless-encode size tail (025), and a threading design doc (027).
+
+**Recorded reversal.** The 2026-07-07 session listed "re-opening step-10
+lossless-decode perf" as a decided tradeoff and did not offer it. That
+decision rested on the rationale recorded in `PLAN.MD` (the remaining gap
+is "a SIMD/maturity difference vs libwebp"). Code-level review this session
+found the rationale does not hold: libwebp's VP8L entropy loop is scalar C,
+and the measured 1.8–5.6× gap traces to per-symbol overhead in this
+library's own hot loop — double `ensureBits` per symbol and byte-at-a-time
+refill (`src/bit_reader.zig:150-194`), a per-pixel meta-prefix group lookup
+(`src/vp8l/entropy.zig:181`), and pixel-at-a-time LZ77 copies
+(`src/vp8l/entropy.zig:274-279`). The maintainer re-opened the item on that
+evidence → plans 021/022. Executors of those plans should also correct the
+`PLAN.MD` step-10 rationale sentence if their measurements confirm the new
+attribution.
+
+**Overlap check.** Plan 016 (m5/m6 headroom measurement, TODO) already
+covers the lossy-encoder measurement half of the advice; only the SSIM
+metric axis was new → plan 026. Nothing else in 020–027 duplicates an
+existing TODO/DONE plan or a rejected finding.
 
 ## Audit context — 2026-07-07 (commit `4c5572a`, direction/`next` variant)
 

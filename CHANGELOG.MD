@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 `1.0.0`, Tier-1 names are frozen and semver-governed; Tier-2 internals may
 still change in any release. See `src/root.zig` for the Tier-1 list.
 
+## [Unreleased]
+
+### Changed
+
+- The `big-endian` CI job runs the full suite in ReleaseSafe split across
+  four parallel QEMU shard processes via
+  `zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux
+  -Doptimize=ReleaseSafe -fqemu` (was: Debug, single process). Same 464
+  tests, safety checks still on; native jobs still run Debug. Local
+  same-machine QEMU baselines at `29be0df` measured Debug 18m24s vs
+  ReleaseSafe 4m23s (unsharded) and 215s (~3m35s) sharded; PR #97's
+  big-endian CI job passed in 3m9s.
+
 ## [1.0.0] — 2026-07-08
 
 First stable release. Roadmap steps 0–12 are complete: the codec feature set
@@ -176,5 +189,6 @@ acceptance results recorded in `PROGRESS.MD`.
 - The cross-browser render confirmation for animation encode is set up but not
   automated; see the browser-render check in `PROGRESS.MD`.
 
+[Unreleased]: https://github.com/IfkumRfnl/zig-webp/compare/v1.0.0...HEAD
 [0.2.0]: https://github.com/IfkumRfnl/zig-webp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/IfkumRfnl/zig-webp/releases/tag/v0.1.0

@@ -165,8 +165,51 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    // Optional N-way sharding for slow environments (the big-endian CI job
+    // runs 4 shards in parallel under QEMU). Sharding uses a custom
+    // simple-mode runner that partitions tests by index modulo the shard
+    // count, so N shards cover the full suite by construction. The default
+    // path (no -Dtest-shards) is unchanged: one binary, default runner.
+    const test_shards = b.option(
+        u32,
+        "test-shards",
+        "Split `zig build test` across N parallel shard processes",
+    );
+
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    if (test_shards) |shard_count| {
+        if (shard_count == 0) {
+            std.debug.panic("-Dtest-shards must be >= 1", .{});
+        }
+        const sharded_tests = b.addTest(.{
+            .root_module = webp_module,
+            .test_runner = .{
+                .path = b.path("tools/shard_test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        var shard_index: u32 = 0;
+        while (shard_index < shard_count) : (shard_index += 1) {
+            const run_shard = b.addRunArtifact(sharded_tests);
+            run_shard.setEnvironmentVariable(
+                "TEST_SHARD_COUNT",
+                b.fmt("{d}", .{shard_count}),
+            );
+            run_shard.setEnvironmentVariable(
+                "TEST_SHARD_INDEX",
+                b.fmt("{d}", .{shard_index}),
+            );
+            // addRunArtifact only records an exit-code check (making the
+            // run step `.check`-eligible and cacheable) for the default
+            // runner; a custom simple-mode runner must request it
+            // explicitly via expectExitCode(0) so the shard step opts into
+            // the same `.check`/cacheable behavior.
+            run_shard.expectExitCode(0);
+            test_step.dependOn(&run_shard.step);
+        }
+    } else {
+        test_step.dependOn(&run_unit_tests.step);
+    }
 
     // Wasm compile gate: resolves its own wasm32 targets so `-Dtarget=` does
     // not have to retarget the host CLI tools. Not wired into `check`/`ci` —

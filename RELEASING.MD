@@ -90,14 +90,17 @@ that phrase. All rows must hold before tagging 1.0.0.
 |---|---|---|---|
 | Linux x86_64 (LE, 64-bit) | `zig build ci` | CI (`ci.yml` `test` job), every PR | exit 0 |
 | macOS aarch64 (LE, 64-bit) | `zig build check` + `zig build test` | CI (`ci.yml` `macos` job), every PR | exit 0 |
-| Big-endian (powerpc64) | `zig build test -Dtarget=powerpc64-linux -fqemu` | CI (`ci.yml` `big-endian` job), every PR | exit 0 |
+| Big-endian (powerpc64) | `zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux -Doptimize=ReleaseSafe -fqemu` | CI (`ci.yml` `big-endian` job), every PR | exit 0 |
 | Browsers (≥2) | manual render of the two `testdata/animation/anim_minimized_*.webp` samples | manual, recorded in `PROGRESS.MD` before tagging 1.0 | moving region animates correctly in both |
 | Windows | deferred | — | recorded as deferred with reason (the `setup-zig` composite action resolves `uname -m`/`uname -s` keys against tar.xz archives; `x86_64-windows` ships as `.zip` and Git-bash `uname -s` reports `MINGW64_NT-...`) |
 
 The big-endian row is the substantive one: it runs the full test suite —
 including the byte-exact SHA-256 corpus regression — on a BE host under
 user-mode QEMU, so decoded planes must be identical regardless of host
-endianness.
+endianness. The run is ReleaseSafe (runtime safety checks and assertions
+stay enabled; decoded bytes and the SHA-256 corpus comparison are
+optimize-mode-independent) and sharded 4-way for speed; Debug coverage
+remains on the native jobs.
 
 ### Browser check procedure
 
