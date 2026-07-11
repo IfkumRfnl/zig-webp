@@ -79,6 +79,13 @@ pub fn build(b: *std.Build) void {
             .install = true,
         },
         .{
+            .name = "zig-webp-info",
+            .source = "tools/zig-webp-info.zig",
+            .step = "info",
+            .description = "Print WebP container structure and features (webpinfo-style)",
+            .install = true,
+        },
+        .{
             .name = "zig-webp-corpus-hashes",
             .source = "tools/zig-webp-corpus-hashes.zig",
             .step = "corpus-hashes",
