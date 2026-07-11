@@ -16,8 +16,8 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
   -Doptimize=ReleaseSafe -fqemu` (was: Debug, single process). Same 464
   tests, safety checks still on; native jobs still run Debug. Local
   same-machine QEMU baselines at `29be0df` measured Debug 18m24s vs
-  ReleaseSafe 4m23s (unsharded) and 215s (~3m35s) sharded; the CI
-  after-duration is pending observation (plan 019, Step 7).
+  ReleaseSafe 4m23s (unsharded) and 215s (~3m35s) sharded; PR #97's
+  big-endian CI job passed in 3m9s.
 
 ## [1.0.0] — 2026-07-08
 

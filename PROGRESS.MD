@@ -126,9 +126,9 @@ bundled `lib/compiler/test_runner.zig` fails to compile under fuzz
 instrumentation (`*builtin.StackTrace` vs `*debug.StackTrace` mismatch). Revisit
 when the toolchain updates.
 
-## In Progress
+## Recently Completed
 
-### 2026-07-08 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards) — Step 7 pending
+### 2026-07-09 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards)
 
 The `big-endian` CI job was the slow outlier (12m49s–16m40s on 2026-07-08
 runs) because the full 464-test suite ran Debug under QEMU TCG. Same-machine
@@ -143,9 +143,9 @@ Delivered: `tools/shard_test_runner.zig` (mirrors Zig 0.16.0 default-runner
 terminal + non-fuzz `fuzz` path), `-Dtest-shards` wiring in `build.zig`
 (default path and `zig build ci` stay unsharded/default-runner), CI job +
 docs updated. Native probes: fail/leak/misconfig all exit 1; `zig build ci`
-exit 0. **Step 7 (observe the sharded ReleaseSafe `big-endian` CI job after
-push) is not yet done; the times above are local QEMU measurements, not a
-recorded CI run.**
+exit 0. PR #97's `Big-endian tests (powerpc64, QEMU)` job passed in **3m9s**
+(GitHub Actions run `28993818050`, job `86039146902`), completing the CI
+observation gate.
 
 Local quirk (not a regression): the sharded `.simple`-runner `.check` path
 can still print a benign `failed command: …` trailer on a successful
@@ -157,8 +157,6 @@ not the `failed command:` line. This is independent of the earlier
 unsharded default-runner quirk on hosts without binfmt_misc
 (`failed command: … --listen=-` under direct qemu); the sharded path does
 not use the `--listen` IPC protocol.
-
-## Recently Completed
 
 ### 2026-07-09 — 32-bit `usize` shift fix and wasm32 test gate
 
