@@ -133,18 +133,26 @@ zig build encode-lossy-report
 tools/webp-oracle.sh compare-encode-lossy
 zig build -Doptimize=ReleaseFast bench
 tools/webp-bench.sh
+tools/webp-rust-bench.sh
 ```
 
 The package exposes the `webp` module from `src/root.zig`.
 
 `zig build -Doptimize=ReleaseFast bench` times the decode/encode entry points in
 memory per asset class and prints a TSV (the PLAN.MD step-10 performance
-baseline). It must be built `ReleaseFast` — a Debug build is instrumented and
-several times slower, so its timings are not comparable to the committed
-baseline (the tool warns when run in Debug). The optional `tools/webp-bench.sh`
-times libwebp's `dwebp`/`cwebp` (and `anim_dump` for animations) over the same
-files for a same-machine ratio. Both are local reports — timing is
-environment-dependent and is not a CI gate.
+baseline), including still `decode-into` rows via `decodeStaticInto`. It must be
+built `ReleaseFast` — a Debug build is instrumented and several times slower, so
+its timings are not comparable to the committed baseline (the tool warns when
+run in Debug). The optional `tools/webp-bench.sh` times libwebp's `dwebp`/`cwebp`
+(and `anim_dump` for animations) over the same files for a same-machine ratio.
+The optional `tools/webp-rust-bench.sh` pairs still `decode-into` rows with a
+local `references/image-webp` Cargo adapter materialized only under
+`.zig-cache/` (skipped when Cargo or the reference clone is absent; never a
+package/CI dependency). It invokes Zig only via
+`zig build -Doptimize=ReleaseFast bench -- ...`, defaults to a two-file smoke
+set, and supports `--all` over `testdata/photos` plus the committed static
+corpus (skipping files without a validated Zig decode-into digest). These are
+local reports — timing is environment-dependent and is not a CI gate.
 
 `zig build test` includes a hash-based corpus regression: decoded RGBA and
 alpha planes of the committed corpus in `testdata/libwebp-test-data`, and the

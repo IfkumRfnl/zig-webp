@@ -32,13 +32,22 @@
 //! Timing numbers are environment-dependent (CPU, thermal state, scheduler) and
 //! are therefore a local/manual report, not a CI gate. The optional companion
 //! `tools/webp-bench.sh` times libwebp's `dwebp`/`cwebp` over the same files for
-//! a same-machine ratio.
+//! a same-machine ratio. The optional `tools/webp-rust-bench.sh` driver can
+//! pair this tool's still `decode-into` rows with a local `image-webp` (Rust)
+//! harness materialized under `.zig-cache/` — never a package/CI dependency.
+//!
+//! Still decode emits two operations per file: allocating `decode` (RGBA, as
+//! before) and `decode-into` via `decodeStaticInto` into a reused buffer
+//! (`.rgb` when opaque, `.rgba` when alpha). Destination allocation and a
+//! correctness check against allocating `decodeStatic` sit outside the timed
+//! interval.
 //!
 //! Usage: zig-webp-bench [--iters N] [--warmup N] [--budget-ms N]
 //!                       [--filter SUBSTR] [--decode-only|--encode-only]
-//!                       [OUTPUT.tsv]
+//!                       [--write-digests PATH] [OUTPUT.tsv]
 //! With no OUTPUT.tsv the report goes to stdout; a one-line summary goes to
-//! stderr either way.
+//! stderr either way. `--write-digests` records still `decode-into` SHA-256
+//! digests (file, sha256, format, alpha, width, height) for the Rust driver.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -80,6 +89,8 @@ const Config = struct {
     filter: ?[]const u8 = null,
     do_decode: bool = true,
     do_encode: bool = true,
+    /// When set, still `decode-into` rows also append digest TSV lines here.
+    digests_path: ?[]const u8 = null,
 };
 
 /// The result of timing one input: how many timed samples were taken, the
@@ -127,6 +138,19 @@ const DecodeStaticCtx = struct {
             .limits = bench_limits,
         });
         decoded.deinit();
+    }
+};
+
+/// Caller-owned still decode into a pre-allocated `dest` (allocated outside the
+/// timed loop). Format is `.rgb`/`.rgba` to match `image-webp`'s output layout.
+const DecodeStaticIntoCtx = struct {
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    dest: webp.ImageBuffer,
+    fn runOnce(self: @This()) !void {
+        try webp.decodeStaticInto(self.gpa, self.bytes, self.dest, .{
+            .limits = bench_limits,
+        });
     }
 };
 
@@ -231,16 +255,23 @@ fn formatName(format: ?webp.features.FormatKind) []const u8 {
     };
 }
 
-fn benchDecode(writer: *std.Io.Writer, ctx: cli.Cli, config: Config, stats: *Stats) !void {
-    try benchDecodeDir(writer, ctx, config, stats, encode_corpus.photos_root_path);
-    try benchDecodeDir(writer, ctx, config, stats, corpus.default_root_path);
-    try benchDecodeDir(writer, ctx, config, stats, corpus.default_animation_root_path);
+fn benchDecode(
+    writer: *std.Io.Writer,
+    digests_writer: ?*std.Io.Writer,
+    ctx: cli.Cli,
+    config: Config,
+    stats: *Stats,
+) !void {
+    try benchDecodeDir(writer, digests_writer, ctx, config, stats, encode_corpus.photos_root_path);
+    try benchDecodeDir(writer, digests_writer, ctx, config, stats, corpus.default_root_path);
+    try benchDecodeDir(writer, digests_writer, ctx, config, stats, corpus.default_animation_root_path);
 }
 
 /// Times decode of every `*.webp` under `dir_path`. Missing directories are
 /// skipped (a checkout may lack the in-tree corpus).
 fn benchDecodeDir(
     writer: *std.Io.Writer,
+    digests_writer: ?*std.Io.Writer,
     ctx: cli.Cli,
     config: Config,
     stats: *Stats,
@@ -297,8 +328,125 @@ fn benchDecodeDir(
                 continue;
             };
             try writeRow(writer, stats, asset_class, name, "decode", formatName(features.format), features.has_alpha, width, height, canvas_pixels, measurement, 0);
+
+            // decode-into: reuse a caller-owned buffer (rgb/rgba) allocated
+            // outside timing; validate against allocating decodeStatic first.
+            try benchDecodeStaticInto(
+                writer,
+                digests_writer,
+                ctx,
+                config,
+                stats,
+                asset_class,
+                name,
+                bytes,
+                features,
+                width,
+                height,
+                canvas_pixels,
+            );
         }
     }
+}
+
+/// Times `decodeStaticInto` into a reused destination. Allocates `dest`,
+/// validates one untimed decode against allocating `decodeStatic` with the
+/// same rgb/rgba format, then times repeated into-decodes. Digests (when
+/// requested) and `doNotOptimizeAway` sit outside the timed interval.
+fn benchDecodeStaticInto(
+    writer: *std.Io.Writer,
+    digests_writer: ?*std.Io.Writer,
+    ctx: cli.Cli,
+    config: Config,
+    stats: *Stats,
+    asset_class: []const u8,
+    name: []const u8,
+    bytes: []const u8,
+    features: webp.FeatureSummary,
+    width: u32,
+    height: u32,
+    canvas_pixels: u64,
+) !void {
+    const pixel_format: webp.image.PixelFormat = if (features.has_alpha) .rgba else .rgb;
+    const channels: u32 = pixel_format.channelCount();
+    const stride: u32 = width * channels;
+    const dest_len: usize = @as(usize, stride) * @as(usize, height);
+    const dest_pixels = try ctx.gpa.alloc(u8, dest_len);
+    defer ctx.gpa.free(dest_pixels);
+    const dest = webp.ImageBuffer{
+        .pixels = dest_pixels,
+        .dimensions = .{ .width = width, .height = height },
+        .stride = stride,
+        .format = pixel_format,
+    };
+
+    // Untimed reference: allocating decode in the same packed format.
+    var reference = webp.decodeStatic(ctx.gpa, bytes, .{
+        .output_format = pixel_format,
+        .limits = bench_limits,
+    }) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode-into reference error: {s})\n", .{ name, @errorName(err) });
+        defer ctx.gpa.free(msg);
+        try ctx.writeStderr(msg);
+        return;
+    };
+    defer reference.deinit();
+
+    webp.decodeStaticInto(ctx.gpa, bytes, dest, .{ .limits = bench_limits }) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode-into error: {s})\n", .{ name, @errorName(err) });
+        defer ctx.gpa.free(msg);
+        try ctx.writeStderr(msg);
+        return;
+    };
+
+    if (!std.mem.eql(u8, dest_pixels, reference.buffer.pixels)) {
+        const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode-into mismatch vs decodeStatic)\n", .{name});
+        defer ctx.gpa.free(msg);
+        try ctx.writeStderr(msg);
+        return;
+    }
+
+    if (digests_writer) |dw| {
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(dest_pixels, &digest, .{});
+        try dw.print("{s}\t{s}\t{s}\t{s}\t{d}\t{d}\n", .{
+            name,
+            std.fmt.bytesToHex(&digest, .lower),
+            formatName(features.format),
+            if (features.has_alpha) "alpha" else "opaque",
+            width,
+            height,
+        });
+    }
+
+    const into_measurement = timeMedian(ctx.io, config, DecodeStaticIntoCtx{
+        .gpa = ctx.gpa,
+        .bytes = bytes,
+        .dest = dest,
+    }) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode-into timing error: {s})\n", .{ name, @errorName(err) });
+        defer ctx.gpa.free(msg);
+        try ctx.writeStderr(msg);
+        return;
+    };
+    // Keep the reused buffer live across timing so the writes cannot be DCE'd.
+    std.mem.doNotOptimizeAway(dest_pixels[0]);
+    std.mem.doNotOptimizeAway(dest_pixels[dest_pixels.len - 1]);
+
+    try writeRow(
+        writer,
+        stats,
+        asset_class,
+        name,
+        "decode-into",
+        formatName(features.format),
+        features.has_alpha,
+        width,
+        height,
+        canvas_pixels,
+        into_measurement,
+        0,
+    );
 }
 
 // --- Encode benchmark ------------------------------------------------------
@@ -424,7 +572,7 @@ fn parseU32(ctx: cli.Cli, value: []const u8, usage_text: []const u8) u32 {
 const usage =
     "usage: zig-webp-bench [--iters N] [--warmup N] [--budget-ms N]\n" ++
     "                      [--filter SUBSTR] [--decode-only|--encode-only]\n" ++
-    "                      [OUTPUT.tsv]\n" ++
+    "                      [--write-digests PATH] [OUTPUT.tsv]\n" ++
     "Benchmarks this library's decode/encode entry points in memory and writes a TSV.\n";
 
 pub fn main(init: std.process.Init) !void {
@@ -462,6 +610,10 @@ pub fn main(init: std.process.Init) !void {
             config.do_encode = false;
         } else if (std.mem.eql(u8, arg, "--encode-only")) {
             config.do_decode = false;
+        } else if (std.mem.eql(u8, arg, "--write-digests")) {
+            i += 1;
+            if (i >= ctx.args.len) ctx.usageError(usage);
+            config.digests_path = ctx.args[i];
         } else if (output_path == null and !std.mem.startsWith(u8, arg, "--")) {
             output_path = arg;
         } else {
@@ -479,9 +631,22 @@ pub fn main(init: std.process.Init) !void {
         .{ config.iters, config.warmup, config.budget_ns / std.time.ns_per_ms },
     );
 
+    var digests_report: ?std.Io.Writer.Allocating = if (config.digests_path != null) .init(ctx.gpa) else null;
+    defer if (digests_report) |*dr| dr.deinit();
+    const digests_writer: ?*std.Io.Writer = if (digests_report) |*dr| &dr.writer else null;
+    if (digests_writer) |dw| {
+        try dw.writeAll("# zig-webp decode-into digests (SHA-256 of packed rgb/rgba pixels)\n");
+        try dw.writeAll("file\tsha256\tformat\talpha\twidth\theight\n");
+    }
+
     var stats = Stats{};
-    if (config.do_decode) try benchDecode(writer, ctx, config, &stats);
+    if (config.do_decode) try benchDecode(writer, digests_writer, ctx, config, &stats);
     if (config.do_encode) try benchEncode(writer, ctx, config, &stats);
+
+    if (config.digests_path) |digests_path| {
+        const payload = digests_report.?.written();
+        try ctx.writeOutput(digests_path, payload);
+    }
 
     if (output_path) |path| {
         try ctx.writeOutput(path, report.written());
