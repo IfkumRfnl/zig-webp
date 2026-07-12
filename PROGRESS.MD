@@ -150,6 +150,29 @@ fixtures under `testdata/`; `zig build info` with no args exits 2 with
 the usage line. `zig build check` compiles the tool; README lists it
 alongside the other installed CLIs.
 
+### 2026-07-11 — Horizontal VP8 loop-filter SIMD (plan 023; vertical left scalar)
+
+`@Vector` path for contiguous-lane horizontal edges in
+`src/vp8/loop_filter.zig` (comptime 8/16 lanes, floor `@divFloor` / lane
+masks, scalar `doFilter2`/`4`/`6` kept as authority). Vertical edges stay
+scalar — gather/transpose was deliberately deferred pending evidence that it
+wins. Callers and padding unchanged.
+
+- **Correctness.** Deterministic asymmetric scalar-vs-SIMD equivalence tests
+  (plus smooth-ramp low-HEV cases exercising filter4/filter6) pass;
+  `zig build test` **472/472**, `zig build ci`, `zig build wasm-check`, and
+  the byte-exact corpus-hash gate all pass.
+- **Speed (ReleaseFast, AMD EPYC 7663, single thread; direct Zig medians vs
+  plan-022 base reverse TSV; `--iters 5 --warmup 1 --budget-ms 500`).**
+  Lossy opaque **1.0738×** (n=70), lossy alpha **1.0334×** (n=18), aggregate
+  lossy **1.0654×** (n=88). High-filter examples: `lossy_q0_f100.webp`
+  **1.3367×**, `bryce.webp` **1.1032×**, `lossy_extreme_probabilities.webp`
+  ~**1.0007×**.
+- **135/135** `image-webp` decode-into comparison on the same harness.
+  Remaining Zig/`image-webp` geomean ratios (~**1.10×** lossy opaque,
+  ~**2.39×** lossy alpha) are environment-dependent and **not** a general
+  codec speed claim.
+
 ### 2026-07-11 — Optional image-webp decode-into bench + plan 022 specialized VP8L loop
 
 Local measurement notes for the optional Rust comparison harness and the
@@ -1280,6 +1303,7 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-26 | SIMD YUV→RGB color conversion (slice 10b): 1.11× lossy decode, byte-exact | `@Vector` rewrite of `color.upsampleLinePair`'s interior (fancy chroma upsample + BT.601 conversion), the largest data-parallel hot loop in lossy decode. Each output pair is a stencil over chroma columns `(x-1, x)` with no dependency on prior output, so it vectorizes; an 8-chroma-column (16-pixel) chunk computes the diamond and conversion in `@Vector(16, i32)` lanes and stores a packed-`u32`-per-pixel vector, for the 4-channel formats on little-endian. The scalar path is unchanged and remains the reference for boundaries, odd-width tail, `rgb`, and big-endian. **Bit-exact (CI gate, `zig build test`):** the committed corpus-hash regression (88 lossy stills → byte-for-byte vs libwebp-correct hashes, most at SIMD widths) still passes, plus a new non-circular equivalence test (wide-image `.rgb` scalar output == `.rgba` SIMD output for R/G/B). **Speed (local, thermal-controlled interleaved A/B vs `main`, ReleaseFast, i5-13450HX, single thread):** aggregate lossy decode **1.11×** (763.6→690.2 ms over the lossy corpus), up to **1.31×** on conversion-heavy files and ~1.2× on lossy+alpha; lossless decode unchanged (1.02×, noise — VP8L never calls this path). Reduces the `bryce` lossy-decode ratio vs single-threaded `dwebp` from ≈2.5× to ≈2.3×. Honest note: scalar micro-restructuring of the inverse transforms / IDCT DC fast-path was prototyped and rejected as code-layout noise (those stages aren't the bottleneck); the remaining lossless gap is the serial entropy decoder (already a fast multi-level Huffman table), documented as future work. |
 | 2026-06-26 | VP8 boolean-reader renormalization (slice 10c): 1.20× lossy decode, byte-exact | Replaces the VP8 bool reader's one-shift-at-a-time renormalization loop with a compile-time 128-entry shift-count table plus one bulk shift/load step. The arithmetic split and lazy truncation behavior are unchanged; this only removes per-bit loop overhead in the entropy hot path used by mode parsing and coefficient token decode. **Bit-exact (CI gate, `zig build test`):** the full suite and committed corpus-hash regression pass. **Speed (local, ReleaseFast, single thread, same benchmark harness):** aggregate lossy decode **1.20×** (699.5→583.3 ms over 88 lossy stills on this machine), `bryce` **563.1→475.5 ms** (local ratio vs `dwebp -pam` ≈1.96×→≈1.65×), `vp80-00-comprehensive-008` **10.03→8.84 ms**, `lossy_extreme_probabilities` **15.6→9.8 ms**. Lossless decode is unchanged in substance because VP8L does not use this reader. Rejected in the same investigation: scalar loop-filter index reshaping (byte-exact, no measurable win) and a dedicated probability-128 `readBit` path (slightly slower). Remaining lossy levers are loop-filter SIMD/lookup tables, row-pipeline locality, and threading. |
 | 2026-07-11 | Optional `image-webp` decode-into bench + plan 022 specialized VP8L loop (plan 021 rejected) | Optional local `tools/webp-rust-bench.sh` compares Zig `decode-into` to a caller-owned `image-webp` adapter under `.zig-cache/` (SKIP when `cargo`/`references/image-webp` absent). Full still set: **135 validated, 0 skips**. Plan 021 bulk-refill measured ~**1.011×** aggregate lossless and was **not** included. Plan 022 specializes `src/vp8l/entropy.zig` (hoisted tile-run group lookup, comptime cache/selector variants, no-cache LZ77 `@memset`/`@memcpy`/chunked copies). **Bit-exact gates unchanged** (corpus hashes / focused entropy tests). **Speed (ReleaseFast, AMD EPYC 7663, single thread, interleaved A/B vs harness-only base `7f6fd22`, `--iters 5 --warmup 1 --budget-ms 500`):** lossless aggregate ~**1.05×–1.08×**, opaque ~**1.08×–1.11×**, alpha ~**1.01×–1.05×**; lossy ~flat. **Zig/`image-webp` geomean (after):** lossless opaque ~**4.0×**, lossless alpha ~**31.8×**, lossy opaque ~**1.18×**, lossy alpha ~**2.4×**. Environment-dependent; not a CI gate; not a general-win claim. |
+| 2026-07-11 | Horizontal VP8 loop-filter SIMD (plan 023; vertical left scalar) | Contiguous-lane `@Vector` horizontal edges in `src/vp8/loop_filter.zig` (comptime 8/16 lanes; scalar `doFilter2`/`4`/`6` retained). Vertical gather/transpose deliberately left scalar pending evidence. **Correctness:** asymmetric + smooth-ramp (low-HEV filter4/6) scalar-vs-SIMD equivalence tests; `zig build test` **472/472**; `zig build ci`; `zig build wasm-check`; byte-exact corpus hashes. **Speed (ReleaseFast, AMD EPYC 7663, single thread; direct Zig medians vs plan-022 base reverse TSV; `--iters 5 --warmup 1 --budget-ms 500`):** lossy opaque **1.0738×** (n=70), lossy alpha **1.0334×** (n=18), aggregate lossy **1.0654×** (n=88); `lossy_q0_f100.webp` **1.3367×**, `bryce.webp` **1.1032×**, `lossy_extreme_probabilities.webp` ~**1.0007×**. **135/135** `image-webp` comparison; remaining Zig/`image-webp` geomean ~**1.10×** lossy opaque, ~**2.39×** lossy alpha. Environment-dependent; not a CI gate; not a general-win claim. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
