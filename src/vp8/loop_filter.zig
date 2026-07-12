@@ -168,6 +168,83 @@ fn filterMacroblock(
     const has_top = mb_y > 0;
 
     const y_stride = view.luma_stride;
+    const y_base = @as(usize, mb_y) * 16 * y_stride + @as(usize, mb_x) * 16;
+
+    switch (filter_type) {
+        .none => unreachable,
+        .simple => {
+            // Vertical edges stay scalar (strided edge pixels). Horizontal
+            // edges use contiguous-lane @Vector loads (along == 1).
+            if (has_left) {
+                simpleEdge(view.luma, y_base, 1, y_stride, 16, edge);
+            }
+            if (info.inner) {
+                for (1..4) |k| {
+                    simpleEdge(view.luma, y_base + 4 * k, 1, y_stride, 16, limit);
+                }
+            }
+            if (has_top) {
+                simpleEdgeH(16, view.luma, y_base, y_stride, edge);
+            }
+            if (info.inner) {
+                for (1..4) |k| {
+                    simpleEdgeH(16, view.luma, y_base + 4 * k * y_stride, y_stride, limit);
+                }
+            }
+        },
+        .complex => {
+            const uv_stride = view.chroma_stride;
+            const uv_base = @as(usize, mb_y) * 8 * uv_stride + @as(usize, mb_x) * 8;
+
+            if (has_left) {
+                complexEdge(view.luma, y_base, 1, y_stride, 16, edge, inner_limit, hev_threshold, true);
+                complexEdge(view.chroma_u, uv_base, 1, uv_stride, 8, edge, inner_limit, hev_threshold, true);
+                complexEdge(view.chroma_v, uv_base, 1, uv_stride, 8, edge, inner_limit, hev_threshold, true);
+            }
+            if (info.inner) {
+                for (1..4) |k| {
+                    complexEdge(view.luma, y_base + 4 * k, 1, y_stride, 16, limit, inner_limit, hev_threshold, false);
+                }
+                complexEdge(view.chroma_u, uv_base + 4, 1, uv_stride, 8, limit, inner_limit, hev_threshold, false);
+                complexEdge(view.chroma_v, uv_base + 4, 1, uv_stride, 8, limit, inner_limit, hev_threshold, false);
+            }
+            if (has_top) {
+                complexEdgeH(16, view.luma, y_base, y_stride, edge, inner_limit, hev_threshold, true);
+                complexEdgeH(8, view.chroma_u, uv_base, uv_stride, edge, inner_limit, hev_threshold, true);
+                complexEdgeH(8, view.chroma_v, uv_base, uv_stride, edge, inner_limit, hev_threshold, true);
+            }
+            if (info.inner) {
+                for (1..4) |k| {
+                    complexEdgeH(16, view.luma, y_base + 4 * k * y_stride, y_stride, limit, inner_limit, hev_threshold, false);
+                }
+                complexEdgeH(8, view.chroma_u, uv_base + 4 * uv_stride, uv_stride, limit, inner_limit, hev_threshold, false);
+                complexEdgeH(8, view.chroma_v, uv_base + 4 * uv_stride, uv_stride, limit, inner_limit, hev_threshold, false);
+            }
+        },
+    }
+}
+
+/// Scalar-only twin of `filterMacroblock` for equivalence tests. Mirrors the
+/// production edge order but always calls the scalar edge loops — never the
+/// horizontal SIMD entry points. Not a production "disable SIMD" knob.
+fn filterMacroblockScalar(
+    view: FrameView,
+    filter_type: Type,
+    info: *const FilterInfo,
+    mb_x: u32,
+    mb_y: u32,
+) void {
+    assert(filter_type != .none);
+    const limit = info.limit;
+    assert(limit >= 3);
+
+    const edge = limit + 4;
+    const inner_limit = info.inner_limit;
+    const hev_threshold = info.hev_threshold;
+    const has_left = mb_x > 0;
+    const has_top = mb_y > 0;
+
+    const y_stride = view.luma_stride;
     const y_step: i32 = @intCast(y_stride);
     const y_base = @as(usize, mb_y) * 16 * y_stride + @as(usize, mb_x) * 16;
 
@@ -224,6 +301,35 @@ fn filterMacroblock(
     }
 }
 
+fn applyFrameScalar(
+    view: FrameView,
+    grid: modes.MacroblockGrid,
+    macroblocks: []const modes.Macroblock,
+    has_nonzero: []const bool,
+    strengths: *const Strengths,
+    filter_type: Type,
+) void {
+    assert(filter_type != .none);
+    assert(macroblocks.len == grid.macroblockCount());
+    assert(has_nonzero.len == macroblocks.len);
+
+    var mb_y: u32 = 0;
+    while (mb_y < grid.rows) : (mb_y += 1) {
+        var mb_x: u32 = 0;
+        while (mb_x < grid.columns) : (mb_x += 1) {
+            const index = mb_y * grid.columns + mb_x;
+            const macroblock = &macroblocks[index];
+            const is_i4x4 = macroblock.luma_mode == .subblocks;
+            const template = &strengths[macroblock.segment_id][@intFromBool(is_i4x4)];
+            if (template.limit == 0) continue;
+
+            var info = template.*;
+            info.inner = info.inner or has_nonzero[index];
+            filterMacroblockScalar(view, filter_type, &info, mb_x, mb_y);
+        }
+    }
+}
+
 // --- Edge dispatch ----------------------------------------------------------
 //
 // `across` steps from one side of the edge to the other (it is the index
@@ -273,6 +379,257 @@ fn complexEdge(
             doFilter4(plane, center, across);
         }
     }
+}
+
+// --- Horizontal SIMD (contiguous lanes, along == 1) -------------------------
+//
+// Each tap row p3..q3 is one contiguous Lanes-byte load at center+k*stride.
+// Vertical edges (across == 1, along == stride) stay on the scalar path:
+// gather/transpose of Lanes eight-byte tap groups is not clearly bounded
+// enough to keep alongside the horizontal kernels without extra complexity.
+//
+// Plane padding is macroblock-aligned with no extra border (decoder
+// FrameAllocationPlan). has_top/has_left keep 4-tap reads inside the plane;
+// horizontal vector loads of Lanes bytes fit within the current macroblock
+// column (16 luma / 8 chroma). Do not grow padding.
+//
+// i16 headroom: taps 0..255; a = 3*(q0-p0)+sclip1(p1-q1) ∈ [-893, 892];
+// doFilter6 intermediate 27*a_clamped+63 with a_clamped ∈ [-128,127] ∈
+// [-3393, 3492]. All fit signed 16-bit.
+
+comptime {
+    assert(893 < 32768);
+    assert(3492 < 32768);
+}
+
+fn simpleEdgeH(comptime Lanes: usize, plane: []u8, base: usize, stride: usize, threshold: i32) void {
+    comptime assert(Lanes == 8 or Lanes == 16);
+    const threshold2: i16 = @intCast(2 * threshold + 1);
+
+    const p1 = loadRow(Lanes, plane, base, stride, -2);
+    const p0 = loadRow(Lanes, plane, base, stride, -1);
+    const q0 = loadRow(Lanes, plane, base, stride, 0);
+    const q1 = loadRow(Lanes, plane, base, stride, 1);
+
+    const needs = needsFilterVec(Lanes, p1, p0, q0, q1, threshold2);
+    const f2 = filter2Vec(Lanes, p1, p0, q0, q1);
+    storeRow(Lanes, plane, base, stride, -1, @select(i16, needs, f2.p0, p0));
+    storeRow(Lanes, plane, base, stride, 0, @select(i16, needs, f2.q0, q0));
+}
+
+fn complexEdgeH(
+    comptime Lanes: usize,
+    plane: []u8,
+    base: usize,
+    stride: usize,
+    threshold: i32,
+    inner_limit: i32,
+    hev_threshold: i32,
+    comptime macroblock_edge: bool,
+) void {
+    comptime assert(Lanes == 8 or Lanes == 16);
+    const threshold2: i16 = @intCast(2 * threshold + 1);
+    const inner: i16 = @intCast(inner_limit);
+    const hev_thr: i16 = @intCast(hev_threshold);
+
+    const p3 = loadRow(Lanes, plane, base, stride, -4);
+    const p2 = loadRow(Lanes, plane, base, stride, -3);
+    const p1 = loadRow(Lanes, plane, base, stride, -2);
+    const p0 = loadRow(Lanes, plane, base, stride, -1);
+    const q0 = loadRow(Lanes, plane, base, stride, 0);
+    const q1 = loadRow(Lanes, plane, base, stride, 1);
+    const q2 = loadRow(Lanes, plane, base, stride, 2);
+    const q3 = loadRow(Lanes, plane, base, stride, 3);
+
+    const needs2 = needsFilter2Vec(Lanes, p3, p2, p1, p0, q0, q1, q2, q3, threshold2, inner);
+    const hev_mask = hevVec(Lanes, p1, p0, q0, q1, hev_thr);
+    const f2 = filter2Vec(Lanes, p1, p0, q0, q1);
+
+    if (macroblock_edge) {
+        const f6 = filter6Vec(Lanes, p2, p1, p0, q0, q1, q2);
+        storeRow(Lanes, plane, base, stride, -3, @select(i16, needs2, @select(i16, hev_mask, p2, f6.p2), p2));
+        storeRow(Lanes, plane, base, stride, -2, @select(i16, needs2, @select(i16, hev_mask, p1, f6.p1), p1));
+        storeRow(Lanes, plane, base, stride, -1, @select(i16, needs2, @select(i16, hev_mask, f2.p0, f6.p0), p0));
+        storeRow(Lanes, plane, base, stride, 0, @select(i16, needs2, @select(i16, hev_mask, f2.q0, f6.q0), q0));
+        storeRow(Lanes, plane, base, stride, 1, @select(i16, needs2, @select(i16, hev_mask, q1, f6.q1), q1));
+        storeRow(Lanes, plane, base, stride, 2, @select(i16, needs2, @select(i16, hev_mask, q2, f6.q2), q2));
+    } else {
+        const f4 = filter4Vec(Lanes, p1, p0, q0, q1);
+        storeRow(Lanes, plane, base, stride, -2, @select(i16, needs2, @select(i16, hev_mask, p1, f4.p1), p1));
+        storeRow(Lanes, plane, base, stride, -1, @select(i16, needs2, @select(i16, hev_mask, f2.p0, f4.p0), p0));
+        storeRow(Lanes, plane, base, stride, 0, @select(i16, needs2, @select(i16, hev_mask, f2.q0, f4.q0), q0));
+        storeRow(Lanes, plane, base, stride, 1, @select(i16, needs2, @select(i16, hev_mask, q1, f4.q1), q1));
+    }
+}
+
+fn loadRow(comptime Lanes: usize, plane: []const u8, base: usize, stride: usize, offset: i32) @Vector(Lanes, i16) {
+    const signed = @as(i64, @intCast(base)) + @as(i64, offset) * @as(i64, @intCast(stride));
+    assert(signed >= 0);
+    const idx: usize = @intCast(signed);
+    assert(idx + Lanes <= plane.len);
+    const bytes: @Vector(Lanes, u8) = plane[idx..][0..Lanes].*;
+    return @intCast(bytes);
+}
+
+fn storeRow(comptime Lanes: usize, plane: []u8, base: usize, stride: usize, offset: i32, values: @Vector(Lanes, i16)) void {
+    const signed = @as(i64, @intCast(base)) + @as(i64, offset) * @as(i64, @intCast(stride));
+    assert(signed >= 0);
+    const idx: usize = @intCast(signed);
+    assert(idx + Lanes <= plane.len);
+    const clipped = clip255Vec(Lanes, values);
+    const bytes: @Vector(Lanes, u8) = @intCast(clipped);
+    plane[idx..][0..Lanes].* = bytes;
+}
+
+fn andBool(comptime Lanes: usize, a: @Vector(Lanes, bool), b: @Vector(Lanes, bool)) @Vector(Lanes, bool) {
+    return @select(bool, a, b, @as(@Vector(Lanes, bool), @splat(false)));
+}
+
+fn orBool(comptime Lanes: usize, a: @Vector(Lanes, bool), b: @Vector(Lanes, bool)) @Vector(Lanes, bool) {
+    return @select(bool, a, @as(@Vector(Lanes, bool), @splat(true)), b);
+}
+
+fn absVec(comptime Lanes: usize, value: @Vector(Lanes, i16)) @Vector(Lanes, i16) {
+    // @abs on signed vectors yields unsigned lanes in Zig 0.16; keep i16 to
+    // match the scalar `abs` helper used by the reference kernels.
+    const zero: @Vector(Lanes, i16) = @splat(0);
+    return @select(i16, value < zero, -value, value);
+}
+
+fn needsFilterVec(
+    comptime Lanes: usize,
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+    threshold: i16,
+) @Vector(Lanes, bool) {
+    const thr: @Vector(Lanes, i16) = @splat(threshold);
+    const four: @Vector(Lanes, i16) = @splat(4);
+    return four * absVec(Lanes, p0 - q0) + absVec(Lanes, p1 - q1) <= thr;
+}
+
+fn needsFilter2Vec(
+    comptime Lanes: usize,
+    p3: @Vector(Lanes, i16),
+    p2: @Vector(Lanes, i16),
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+    q2: @Vector(Lanes, i16),
+    q3: @Vector(Lanes, i16),
+    threshold: i16,
+    inner_limit: i16,
+) @Vector(Lanes, bool) {
+    const thr: @Vector(Lanes, i16) = @splat(threshold);
+    const lim: @Vector(Lanes, i16) = @splat(inner_limit);
+    const four: @Vector(Lanes, i16) = @splat(4);
+    const edge_ok = four * absVec(Lanes, p0 - q0) + absVec(Lanes, p1 - q1) <= thr;
+    const interior = andBool(
+        Lanes,
+        absVec(Lanes, p3 - p2) <= lim,
+        andBool(
+            Lanes,
+            absVec(Lanes, p2 - p1) <= lim,
+            andBool(
+                Lanes,
+                absVec(Lanes, p1 - p0) <= lim,
+                andBool(
+                    Lanes,
+                    absVec(Lanes, q3 - q2) <= lim,
+                    andBool(Lanes, absVec(Lanes, q2 - q1) <= lim, absVec(Lanes, q1 - q0) <= lim),
+                ),
+            ),
+        ),
+    );
+    return andBool(Lanes, edge_ok, interior);
+}
+
+fn hevVec(
+    comptime Lanes: usize,
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+    threshold: i16,
+) @Vector(Lanes, bool) {
+    const thr: @Vector(Lanes, i16) = @splat(threshold);
+    return orBool(Lanes, absVec(Lanes, p1 - p0) > thr, absVec(Lanes, q1 - q0) > thr);
+}
+
+fn filter2Vec(
+    comptime Lanes: usize,
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+) struct { p0: @Vector(Lanes, i16), q0: @Vector(Lanes, i16) } {
+    const Vec = @Vector(Lanes, i16);
+    const a = @as(Vec, @splat(3)) * (q0 - p0) + sclip1Vec(Lanes, p1 - q1);
+    const a1 = sclip2Vec(Lanes, @divFloor(a + @as(Vec, @splat(4)), @as(Vec, @splat(8))));
+    const a2 = sclip2Vec(Lanes, @divFloor(a + @as(Vec, @splat(3)), @as(Vec, @splat(8))));
+    return .{ .p0 = p0 + a2, .q0 = q0 - a1 };
+}
+
+fn filter4Vec(
+    comptime Lanes: usize,
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+) struct { p1: @Vector(Lanes, i16), p0: @Vector(Lanes, i16), q0: @Vector(Lanes, i16), q1: @Vector(Lanes, i16) } {
+    const Vec = @Vector(Lanes, i16);
+    const a = @as(Vec, @splat(3)) * (q0 - p0);
+    const a1 = sclip2Vec(Lanes, @divFloor(a + @as(Vec, @splat(4)), @as(Vec, @splat(8))));
+    const a2 = sclip2Vec(Lanes, @divFloor(a + @as(Vec, @splat(3)), @as(Vec, @splat(8))));
+    const a3 = @divFloor(a1 + @as(Vec, @splat(1)), @as(Vec, @splat(2)));
+    return .{ .p1 = p1 + a3, .p0 = p0 + a2, .q0 = q0 - a1, .q1 = q1 - a3 };
+}
+
+fn filter6Vec(
+    comptime Lanes: usize,
+    p2: @Vector(Lanes, i16),
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+    q2: @Vector(Lanes, i16),
+) struct {
+    p2: @Vector(Lanes, i16),
+    p1: @Vector(Lanes, i16),
+    p0: @Vector(Lanes, i16),
+    q0: @Vector(Lanes, i16),
+    q1: @Vector(Lanes, i16),
+    q2: @Vector(Lanes, i16),
+} {
+    const Vec = @Vector(Lanes, i16);
+    const a = sclip1Vec(Lanes, @as(Vec, @splat(3)) * (q0 - p0) + sclip1Vec(Lanes, p1 - q1));
+    const sixty_three: Vec = @splat(63);
+    const one_twenty_eight: Vec = @splat(128);
+    const a1 = @divFloor(@as(Vec, @splat(27)) * a + sixty_three, one_twenty_eight);
+    const a2 = @divFloor(@as(Vec, @splat(18)) * a + sixty_three, one_twenty_eight);
+    const a3 = @divFloor(@as(Vec, @splat(9)) * a + sixty_three, one_twenty_eight);
+    return .{
+        .p2 = p2 + a3,
+        .p1 = p1 + a2,
+        .p0 = p0 + a1,
+        .q0 = q0 - a1,
+        .q1 = q1 - a2,
+        .q2 = q2 - a3,
+    };
+}
+
+fn sclip1Vec(comptime Lanes: usize, value: @Vector(Lanes, i16)) @Vector(Lanes, i16) {
+    return @min(@max(value, @as(@Vector(Lanes, i16), @splat(-128))), @as(@Vector(Lanes, i16), @splat(127)));
+}
+
+fn sclip2Vec(comptime Lanes: usize, value: @Vector(Lanes, i16)) @Vector(Lanes, i16) {
+    return @min(@max(value, @as(@Vector(Lanes, i16), @splat(-16))), @as(@Vector(Lanes, i16), @splat(15)));
+}
+
+fn clip255Vec(comptime Lanes: usize, value: @Vector(Lanes, i16)) @Vector(Lanes, i16) {
+    return @min(@max(value, @as(@Vector(Lanes, i16), @splat(0))), @as(@Vector(Lanes, i16), @splat(255)));
 }
 
 // --- Kernels ----------------------------------------------------------------
@@ -513,4 +870,164 @@ test "needsFilter2 rejects edges that exceed the interior limit" {
     for (&plane, 0..) |*pixel, index| pixel.* = @intCast(100 + index * 5);
     try testing.expect(needsFilter2(&plane, 4, 1, 1000, 5));
     try testing.expect(!needsFilter2(&plane, 4, 1, 1000, 4));
+}
+
+fn fillAsymmetricPlane(plane: []u8, stride: usize, rows: usize, cols: usize, seed: u32) void {
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        var x: usize = 0;
+        while (x < cols) : (x += 1) {
+            // Asymmetric in x versus y so a mistaken transpose still fails
+            // even when both axes share similar statistics.
+            const mixed = seed +% @as(u32, @intCast(x)) *% 37 +% @as(u32, @intCast(y)) *% 91 +% @as(u32, @intCast(x * y)) *% 13;
+            plane[y * stride + x] = @truncate(mixed);
+        }
+    }
+}
+
+fn blankMacroblock() modes.Macroblock {
+    return .{
+        .segment_id = 0,
+        .skip = false,
+        .luma_mode = .dc,
+        .chroma_mode = .dc,
+        .subblock_modes = @splat(.dc),
+    };
+}
+
+fn strengthsFor(level: u8, sharpness: u8) Strengths {
+    var header: frame_header.Header = undefined;
+    header.segmentation = frame_header.Segmentation.disabled;
+    header.loop_filter = .{
+        .simple = false,
+        .level = level,
+        .sharpness = sharpness,
+        .delta_enabled = false,
+        .ref_frame_deltas = @splat(0),
+        .mode_deltas = @splat(0),
+    };
+    return computeStrengths(&header);
+}
+
+fn expectPlanesEqual(a: []const u8, b: []const u8) !void {
+    try testing.expectEqual(a.len, b.len);
+    try testing.expectEqualSlices(u8, a, b);
+}
+
+fn runEquivalenceCase(
+    columns: u32,
+    rows: u32,
+    filter_type: Type,
+    level: u8,
+    sharpness: u8,
+    inner: bool,
+    seed: u32,
+) !void {
+    const y_stride: usize = columns * 16;
+    const uv_stride: usize = columns * 8;
+    const y_rows: usize = rows * 16;
+    const uv_rows: usize = rows * 8;
+    const y_len = y_stride * y_rows;
+    const uv_len = uv_stride * uv_rows;
+
+    const luma_s = try testing.allocator.alloc(u8, y_len);
+    defer testing.allocator.free(luma_s);
+    const luma_v = try testing.allocator.alloc(u8, y_len);
+    defer testing.allocator.free(luma_v);
+    const u_s = try testing.allocator.alloc(u8, uv_len);
+    defer testing.allocator.free(u_s);
+    const u_v = try testing.allocator.alloc(u8, uv_len);
+    defer testing.allocator.free(u_v);
+    const v_s = try testing.allocator.alloc(u8, uv_len);
+    defer testing.allocator.free(v_s);
+    const v_v = try testing.allocator.alloc(u8, uv_len);
+    defer testing.allocator.free(v_v);
+
+    fillAsymmetricPlane(luma_s, y_stride, y_rows, y_stride, seed);
+    fillAsymmetricPlane(u_s, uv_stride, uv_rows, uv_stride, seed ^ 0xa5a5a5a5);
+    fillAsymmetricPlane(v_s, uv_stride, uv_rows, uv_stride, seed ^ 0x5a5a5a5a);
+    @memcpy(luma_v, luma_s);
+    @memcpy(u_v, u_s);
+    @memcpy(v_v, v_s);
+
+    const mb_count = columns * rows;
+    const macroblocks = try testing.allocator.alloc(modes.Macroblock, mb_count);
+    defer testing.allocator.free(macroblocks);
+    const has_nonzero = try testing.allocator.alloc(bool, mb_count);
+    defer testing.allocator.free(has_nonzero);
+
+    for (macroblocks, has_nonzero) |*mb, *nz| {
+        mb.* = blankMacroblock();
+        if (inner) {
+            // B_PRED forces inner edges via resolveInfo; nonzero residue also
+            // ORs the per-MB inner flag in applyFrame.
+            mb.luma_mode = .subblocks;
+            nz.* = true;
+        } else {
+            nz.* = false;
+        }
+    }
+
+    const grid: modes.MacroblockGrid = .{ .columns = columns, .rows = rows };
+    const strengths = strengthsFor(level, sharpness);
+
+    applyFrameScalar(.{
+        .luma = luma_s,
+        .chroma_u = u_s,
+        .chroma_v = v_s,
+        .luma_stride = y_stride,
+        .chroma_stride = uv_stride,
+    }, grid, macroblocks, has_nonzero, &strengths, filter_type);
+
+    applyFrame(.{
+        .luma = luma_v,
+        .chroma_u = u_v,
+        .chroma_v = v_v,
+        .luma_stride = y_stride,
+        .chroma_stride = uv_stride,
+    }, grid, macroblocks, has_nonzero, &strengths, filter_type);
+
+    try expectPlanesEqual(luma_s, luma_v);
+    try expectPlanesEqual(u_s, u_v);
+    try expectPlanesEqual(v_s, v_v);
+}
+
+test "SIMD horizontal edges match scalar on randomized asymmetric frames" {
+    const levels = [_]u8{ 10, 25, 63 };
+    const sharpnesses = [_]u8{ 0, 4, 7 };
+    const types = [_]Type{ .simple, .complex };
+    var seed: u32 = 0x0246_8ace;
+
+    // 2x2 exercises left/top neighbors plus inner macroblock edges.
+    for (types) |filter_type| {
+        for (levels) |level| {
+            for (sharpnesses) |sharpness| {
+                for ([_]bool{ false, true }) |inner| {
+                    try runEquivalenceCase(2, 2, filter_type, level, sharpness, inner, seed);
+                    seed +%= 0x9e3779b9;
+                }
+            }
+        }
+    }
+}
+
+test "SIMD horizontal edges honor boundary macroblock guards" {
+    // 1x1: no left/top neighbors — only possible edges are inner ones.
+    // 2x1: left neighbor on the second MB, still no top neighbor.
+    const levels = [_]u8{ 10, 25, 63 };
+    const sharpnesses = [_]u8{ 0, 4, 7 };
+    var seed: u32 = 0x1357_9bdf;
+
+    for ([_]Type{ .simple, .complex }) |filter_type| {
+        for (levels) |level| {
+            for (sharpnesses) |sharpness| {
+                for ([_]bool{ false, true }) |inner| {
+                    try runEquivalenceCase(1, 1, filter_type, level, sharpness, inner, seed);
+                    seed +%= 0x7f4a7c15;
+                    try runEquivalenceCase(2, 1, filter_type, level, sharpness, inner, seed);
+                    seed +%= 0x9e3779b9;
+                }
+            }
+        }
+    }
 }
