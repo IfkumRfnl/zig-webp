@@ -37,12 +37,44 @@ fn mulSin(a: i32) i32 {
     return (a *% sinpi8_sqrt2) >> 16;
 }
 
-/// Inverse 4x4 DCT of `coefficients` (raster order) added into the 4x4
-/// pixel region at `destination[0..]` with row `stride`, clamping each sum
-/// to [0, 255]. The region must already hold the prediction pixels.
-/// Always running the full transform is bit-identical to libwebp's
-/// DC-only/AC3 fast paths, so no dispatch is needed for correctness.
-pub fn addInverseDct(
+const IdctVec = @Vector(4, i32);
+const idct_shift16: @Vector(4, u5) = @splat(16);
+const idct_shift3: @Vector(4, u5) = @splat(3);
+
+fn mulCosVec(a: IdctVec) IdctVec {
+    return ((a *% @as(IdctVec, @splat(cospi8_sqrt2_minus1))) >> idct_shift16) +% a;
+}
+
+fn mulSinVec(a: IdctVec) IdctVec {
+    return (a *% @as(IdctVec, @splat(sinpi8_sqrt2))) >> idct_shift16;
+}
+
+/// Transpose four `@Vector(4, i32)` rows into four column-as-row vectors.
+fn transpose4x4(r0: IdctVec, r1: IdctVec, r2: IdctVec, r3: IdctVec) [4]IdctVec {
+    return .{
+        .{ r0[0], r1[0], r2[0], r3[0] },
+        .{ r0[1], r1[1], r2[1], r3[1] },
+        .{ r0[2], r1[2], r2[2], r3[2] },
+        .{ r0[3], r1[3], r2[3], r3[3] },
+    };
+}
+
+fn addClamped(pixel: *u8, residual: i32) void {
+    const sum = @as(i32, pixel.*) +% residual;
+    pixel.* = @intCast(std.math.clamp(sum, 0, 255));
+}
+
+fn addClampedVec(dest: *[4]u8, residual: IdctVec) void {
+    const pixels: IdctVec = .{ dest[0], dest[1], dest[2], dest[3] };
+    const sum = pixels +% residual;
+    const clamped = @min(@max(sum, @as(IdctVec, @splat(0))), @as(IdctVec, @splat(255)));
+    inline for (0..4) |k| {
+        dest[k] = @intCast(clamped[k]);
+    }
+}
+
+/// Scalar reference inverse 4x4 DCT (kept compiled for equivalence tests).
+pub fn addInverseDctScalar(
     coefficients: *const [coefficient_count]i16,
     destination: []u8,
     stride: u32,
@@ -85,9 +117,62 @@ pub fn addInverseDct(
     }
 }
 
-fn addClamped(pixel: *u8, residual: i32) void {
-    const sum = @as(i32, pixel.*) +% residual;
-    pixel.* = @intCast(std.math.clamp(sum, 0, 255));
+/// Inverse 4x4 DCT of `coefficients` (raster order) added into the 4x4
+/// pixel region at `destination[0..]` with row `stride`, clamping each sum
+/// to [0, 255]. The region must already hold the prediction pixels.
+/// Always running the full transform is bit-identical to libwebp's
+/// DC-only/AC3 fast paths, so no dispatch is needed for correctness.
+/// Production path is an unconditional `@Vector(4, i32)` implementation;
+/// `addInverseDctScalar` remains the bit-exact reference.
+pub fn addInverseDct(
+    coefficients: *const [coefficient_count]i16,
+    destination: []u8,
+    stride: u32,
+) void {
+    assert(stride >= block_edge_pixels);
+    assert(destination.len >= 3 * stride + block_edge_pixels);
+
+    // Pass 1: four coefficient columns as vector lanes (lane i = column i).
+    const row0: IdctVec = .{ coefficients[0], coefficients[1], coefficients[2], coefficients[3] };
+    const row1: IdctVec = .{ coefficients[4], coefficients[5], coefficients[6], coefficients[7] };
+    const row2: IdctVec = .{ coefficients[8], coefficients[9], coefficients[10], coefficients[11] };
+    const row3: IdctVec = .{ coefficients[12], coefficients[13], coefficients[14], coefficients[15] };
+
+    const a = row0 +% row2;
+    const b = row0 -% row2;
+    const c = mulSinVec(row1) -% mulCosVec(row3);
+    const d = mulCosVec(row1) +% mulSinVec(row3);
+    // Lane i holds column i's butterfly outputs (A=a+d, B=b+c, C=b-c, D=a-d).
+    const t0 = a +% d;
+    const t1 = b +% c;
+    const t2 = b -% c;
+    const t3 = a -% d;
+
+    // Required inter-pass transpose: convert column-lane outputs into the
+    // pass-2 input rows matching scalar `transposed[4 * i + …]` gathers
+    // vectorized over i (in0[i]=transposed[i], in1[i]=transposed[4+i], …).
+    const pass2_in = transpose4x4(t0, t1, t2, t3);
+    const in0 = pass2_in[0];
+    const in1 = pass2_in[1];
+    const in2 = pass2_in[2];
+    const in3 = pass2_in[3];
+
+    const dc = in0 +% @as(IdctVec, @splat(4));
+    const a2 = dc +% in2;
+    const b2 = dc -% in2;
+    const c2 = mulSinVec(in1) -% mulCosVec(in3);
+    const d2 = mulCosVec(in1) +% mulSinVec(in3);
+
+    const o0 = (a2 +% d2) >> idct_shift3;
+    const o1 = (b2 +% c2) >> idct_shift3;
+    const o2 = (b2 -% c2) >> idct_shift3;
+    const o3 = (a2 -% d2) >> idct_shift3;
+    // o*[lane] is destination column *; transpose to contiguous output rows.
+    const out_rows = transpose4x4(o0, o1, o2, o3);
+
+    inline for (0..4) |i| {
+        addClampedVec(destination[i * stride ..][0..4], out_rows[i]);
+    }
 }
 
 /// Inverse 4x4 Walsh-Hadamard transform of the dequantized Y2 block
@@ -272,4 +357,78 @@ test "transforms tolerate extreme wrapped coefficients without panicking" {
     addInverseDct(&extreme, &pixels, 16);
     var out: [coefficient_count]i16 = undefined;
     inverseWalshHadamard(&extreme, &out);
+}
+
+test "vector inverse DCT matches scalar on fixed-seed random coefficients" {
+    var prng: std.Random.DefaultPrng = .init(0x0241_d17_51_ed);
+    const random = prng.random();
+    var coefficients: [coefficient_count]i16 = undefined;
+    var scalar_pixels: [4 * 16]u8 = undefined;
+    var vector_pixels: [4 * 16]u8 = undefined;
+
+    for (0..256) |_| {
+        for (&coefficients) |*coefficient| {
+            coefficient.* = random.int(i16);
+        }
+        for (&scalar_pixels, 0..) |*pixel, index| pixel.* = @truncate(index *% 37);
+        @memcpy(&vector_pixels, &scalar_pixels);
+        addInverseDctScalar(&coefficients, &scalar_pixels, 16);
+        addInverseDct(&coefficients, &vector_pixels, 16);
+        try std.testing.expectEqualSlices(u8, &scalar_pixels, &vector_pixels);
+    }
+
+    // i16 extremes / wrap-tolerance case from the hostile-stream contract.
+    const extremes = [_]i16{
+        std.math.minInt(i16),
+        std.math.maxInt(i16),
+        -1,
+        1,
+        0,
+        -2048,
+        2047,
+        -32767,
+        32767,
+        -12345,
+        12345,
+        -7,
+        42,
+        -9001,
+        9001,
+        -256,
+    };
+    @memcpy(&coefficients, &extremes);
+    for (&scalar_pixels, 0..) |*pixel, index| pixel.* = @truncate(index *% 13 +% 17);
+    @memcpy(&vector_pixels, &scalar_pixels);
+    addInverseDctScalar(&coefficients, &scalar_pixels, 16);
+    addInverseDct(&coefficients, &vector_pixels, 16);
+    try std.testing.expectEqualSlices(u8, &scalar_pixels, &vector_pixels);
+
+    const all_min: [coefficient_count]i16 = @splat(std.math.minInt(i16));
+    const all_max: [coefficient_count]i16 = @splat(std.math.maxInt(i16));
+    for ([_]*const [coefficient_count]i16{ &all_min, &all_max }) |block| {
+        scalar_pixels = @splat(128);
+        vector_pixels = @splat(128);
+        addInverseDctScalar(block, &scalar_pixels, 16);
+        addInverseDct(block, &vector_pixels, 16);
+        try std.testing.expectEqualSlices(u8, &scalar_pixels, &vector_pixels);
+    }
+}
+
+test "vector inverse DCT matches scalar at stride boundaries" {
+    var coefficients: [coefficient_count]i16 = .{
+        40, -28, 11, 0,
+        23, -1,  0,  0,
+        -7, 5,   0,  0,
+        0,  0,   0,  0,
+    };
+    // Stride 4: tightly packed rows; stride 7: odd non-power-of-two gap.
+    for ([_]u32{ 4, 7, 16 }) |stride| {
+        var scalar_pixels: [4 * 16]u8 = undefined;
+        var vector_pixels: [4 * 16]u8 = undefined;
+        for (&scalar_pixels, 0..) |*pixel, index| pixel.* = @truncate(200 -% index);
+        @memcpy(&vector_pixels, &scalar_pixels);
+        addInverseDctScalar(&coefficients, scalar_pixels[0 .. 3 * stride + 4], stride);
+        addInverseDct(&coefficients, vector_pixels[0 .. 3 * stride + 4], stride);
+        try std.testing.expectEqualSlices(u8, &scalar_pixels, &vector_pixels);
+    }
 }
