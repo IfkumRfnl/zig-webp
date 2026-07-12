@@ -188,7 +188,7 @@ fn writeConstantPrefixCodeGroup(
 }
 
 comptime {
-    assert(@sizeOf(huffman.Entry) == 6);
+    assert(@sizeOf(huffman.Entry) == 4);
     assert(meta_prefix.group_count_max == 65_536);
 }
 
