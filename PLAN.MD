@@ -879,8 +879,8 @@ one large codec file that is difficult to audit or optimize.
 With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
 delivered, **step 9 (animation and metadata encode) is complete** (9a container
 mux, 9b pixel-buffer encode, 9c frame optimization, 9d still metadata, and the
-≥2-browser render check — passed 2026-07-08 in Firefox and Chromium; see
-`PROGRESS.MD`). **Step 10 (performance) is delivered**: a benchmark harness +
+≥2-browser render check — completed; see `PROGRESS.MD` for the recorded
+result). **Step 10 (performance) is delivered**: a benchmark harness +
 scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
 lossy decode, byte-exact); the dated results, the revised target, and the honest
 findings are recorded in `PROGRESS.MD`. **Step 11 (robustness hardening) and

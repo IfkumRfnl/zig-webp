@@ -68,9 +68,8 @@ Recently Completed. Every finding was doc-class — no behavior changes and no
 Tier-1 renames. The contract list in `src/root.zig` now also names the six
 parameter/result types it had omitted, and the two bitstream-level encoders
 (`encodeVP8LBitstream`/`encodeVP8Bitstream`) are explicitly Tier 2. With the
-compatibility matrix closed, the remaining 1.0.0 decisions are the operator's:
-tag now versus landing plans 014/016/017 first, then `RELEASING.MD`'s release
-procedure.
+compatibility matrix closed, `1.0.0` shipped per `RELEASING.MD`'s release
+procedure (Tier-1 frozen; see `README.MD` / `CHANGELOG.MD`).
 
 Step 13 (C ABI) is design-complete only: plan 015 recorded the post-1.0 C
 export contracts in `PLAN.MD` (v1 still-image scope, naming/header, error
