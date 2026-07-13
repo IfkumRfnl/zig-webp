@@ -420,8 +420,9 @@ library scaffolding, or CI wiring today.
 
 **Decision.** C ABI v1 exports the still-image Tier-1 core only:
 `isWebP` / `parseHeader` / `parseChunkHeader` / `parseFeatures` analogues,
-`decodeStaticInto` (caller-owned pixels only), `encodeLossless` /
-`encodeLossy` (library-owned output bytes + paired free), and error helpers.
+`decodeStaticInto` (caller-owned writable `zwebp_buffer` pixels only),
+`encodeLossless` / `encodeLossy` (read-only `zwebp_image_view` input;
+library-owned output bytes + paired free), and error helpers.
 No library-allocated pixel decode in v1.
 
 **Rationale.** Still probe/decode/encode covers the common FFI adoption path
@@ -454,8 +455,9 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 | `encodeAnimationMinimized` | **deferred v2** |
 
 Supporting Tier-1 *types* appear in C only as the extern structs / enums
-needed by the classified entry points above (limits, buffers, options,
-feature summary scalars, error codes). Tier-2 Zig exports are C non-goals.
+needed by the classified entry points above (limits, mutable decode
+buffers, const encode image views, options, feature summary scalars,
+error codes). Tier-2 Zig exports are C non-goals.
 
 #### 2. Naming and header
 
@@ -471,7 +473,11 @@ header from Zig `@export` metadata (fragile across toolchain versions).
 
 **Implementation gate (future).** CI must compile the header against the
 exports — e.g. build a tiny C smoke program that `#include`s `zwebp.h` and
-links the static library — so header/export drift fails the build.
+links **every shipped C artifact** (the static archive always; and
+`libzwebp.so` / the platform shared library whenever the optional shared
+build is enabled, exercising dynamic-symbol visibility, export list, and
+soname packaging) — so header/export drift or an unusable shared ABI fails
+the build.
 
 #### 3. Error model
 
@@ -514,7 +520,9 @@ thread-local detail; out-parameters for the code while returning `bool`.
 scratch and encoder output are owned by a process-wide thread-safe Zig
 allocator chosen at implementation time (must be thread-safe and introduce
 no global mutable codec state, matching the library threading stance).
-Decode pixels are always caller-owned via the Into contract. Encoder
+Decode pixels are always caller-owned via the Into contract into a mutable
+`zwebp_buffer`. Encode inputs are a read-only `zwebp_image_view`
+(`const uint8_t* pixels`) so const image memory needs no cast. Encoder
 success fills an owning result (`uint8_t* data; uint64_t len;`) freed with
 `zwebp_free(ptr, len)` — both pointer and length, so size-aware allocators
 remain possible. `ResourceLimits.allocation_bytes_max` remains the caller's
@@ -533,15 +541,39 @@ under decision 10 if freestanding shares this surface).
 
 #### 5. Struct strategy
 
-**Decision.** Extern structs with a leading `uint32_t struct_size` set by
-the matching `zwebp_*_init` defaulting function (callers may instead set
-`struct_size = sizeof(...)` before use). Mirror:
+**Decision.** Extern structs carry a leading `uint32_t struct_size`.
+Callers **must** initialize every option/config/limits struct before use
+by one of:
+
+1. calling the matching `zwebp_*_init` (preferred) — sets `struct_size` to
+   `sizeof(...)` and every documented default; or
+2. explicitly assigning **every** field, including
+   `struct_size = sizeof(...)`.
+
+Setting only `struct_size` on an otherwise indeterminate stack (or heap)
+object is **not** supported: remaining fields (limits, `has_*` flags,
+optionals) would be garbage. Zero-filling alone is also **not**
+sufficient unless the caller then follows (1) or (2), because documented
+init defaults are not all zero-bit patterns.
+
+Mirror:
 
 - `zwebp_limits` — the six `ResourceLimits` integer fields;
-- `zwebp_buffer` — `uint8_t* pixels; uint64_t len; uint32_t width, height,
-  stride; int32_t format;` (pointer+len, not a Zig slice);
+- `zwebp_buffer` — mutable pixel storage for decode-Into outputs:
+  `uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
+  int32_t format;` (pointer+len, not a Zig slice);
+- `zwebp_image_view` — read-only pixel input for encode entry points:
+  `const uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
+  int32_t format;` (same layout as `zwebp_buffer` except `pixels` is
+  const; encode must not cast away const on caller image memory);
 - `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
   as needed by v1 entry points.
+
+Decode-Into takes a `zwebp_buffer*` (writable). `encodeLossless` /
+`encodeLossy` take a `const zwebp_image_view*` (or the view by value).
+Do not share a single mutable `uint8_t* pixels` type for both directions —
+that would force encode callers with read-only image memory to cast away
+const, and fixing it later would be an ABI break.
 
 Zig optionals (`target_size: ?u32`, `target_psnr: ?f32`, metadata slices)
 become value + `bool has_*` (and pointer+length for payloads). Never treat
@@ -566,16 +598,20 @@ fields stay non-breaking):
   not to require old binaries to accept unknown tails.
 - Shrinking or reordering fields inside the recognized prefix is
   C-breaking; appending fields (and bumping the library `sizeof`) is
-  non-breaking for callers that keep setting `struct_size` to their own
-  `sizeof` and for libraries that default the absent tail as above.
+  non-breaking for callers that keep initializing via `zwebp_*_init` (or
+  fully assigning every field) with `struct_size` equal to their own
+  `sizeof`, and for libraries that default the absent tail as above.
 
 **Rationale.** Explicit presence flags avoid sentinel rot (`0` is a legal
 PSNR target). Directional size rules give libwebp-style extensibility
 without the contradiction of "reject smaller sizes" while claiming
 appended fields are non-breaking.
 
-**Rejected.** `0`-as-unset sentinels; requiring C callers to hand-fill Zig
-defaults; packing Zig slices as fat pointers; bidirectional "accept any
+**Rejected.** `0`-as-unset sentinels; omitting `zwebp_*_init` and forcing
+callers to hand-reconstruct Zig defaults with no helper; treating
+`struct_size = sizeof(...)` alone as initialization; a single mutable
+`zwebp_buffer` / `uint8_t* pixels` type for both decode outputs and encode
+inputs; packing Zig slices as fat pointers; bidirectional "accept any
 `sizeof`" (old libraries must not silently ignore unknown trailing
 semantics); rejecting every smaller-than-current struct (would make
 appended fields a breaking change for old callers).
@@ -607,8 +643,12 @@ an adoption layer.
 the C ABI ships):
 
 1. **Header/export consistency** — a C translation unit that includes
-   `zwebp.h` compiles and links against the built library (catches missing
-   exports and signature drift).
+   `zwebp.h` compiles and links against **every shipped C artifact** (the
+   static archive always; and `libzwebp.so` / the platform shared library
+   whenever the optional shared build is enabled), catching missing
+   exports, signature drift, hidden dynamic symbols, export-list mistakes,
+   and soname packaging errors. CI must not pass with a working archive but
+   an unusable dynamic C ABI.
 2. **Behavioral decode gate** — a C smoke program decodes a committed
    corpus still into a caller-owned buffer via the Into analogue and
    byte-compares against Zig `decodeStatic` / corpus hash expectations.
@@ -622,9 +662,12 @@ the C ABI ships):
 5. Wire those checks into `zig build check` or a dedicated step invoked by
    CI.
 
-**Rejected.** Shipping a shared library without the header-drift,
+**Rejected.** Shipping a shared library without linking/`dlsym`-style
+smoke coverage of that shared artifact (or without the header-drift,
 decode-behavior, error-map exhaustiveness, and `struct_size`
-directionality gates; treating header install as documentation-only.
+directionality gates); treating header install as documentation-only;
+gating only the static archive while an optional `libzwebp.so` ships
+untested.
 
 #### 8. ABI stability policy
 
@@ -632,11 +675,17 @@ directionality gates; treating header install as documentation-only.
 1.x package API. The header defines `ZWEBP_ABI_VERSION` (and a query
 function). Shared-library soname follows the C major (e.g. `libzwebp.so.1`);
 soname / C major bumps only on C-breaking changes (removed entry points,
-changed signatures, reused or renumbered published error codes, shrinking/
-reordering a recognized `struct_size` prefix, or changing the directional
-size rules in decision 5). Non-breaking: appending C error codes for newly
-reachable Zig errors; appending struct fields under decision 5's newer-
-library-defaults-absent-tail / older-library-may-reject-larger rules.
+changed signatures, reused or renumbered published error codes, changing
+`zwebp_error_category` or `zwebp_error_name` for a published code,
+shrinking/reordering a recognized `struct_size` prefix, or changing the
+directional size rules in decision 5). Published error metadata is
+ABI-stable: reclassifying a code into a different category string, or
+renaming its stable name string, under the same numeric code is C-breaking
+(callers may switch on category/name, not only on the number).
+Non-breaking: appending C error codes for newly reachable Zig errors
+(with new category/name entries for those new codes only); appending
+struct fields under decision 5's newer-library-defaults-absent-tail /
+older-library-may-reject-larger rules.
 Implementing or evolving the C layer does not silently extend the Zig 1.x
 compatibility promise to an unimplemented surface — C stability starts
 when the C ABI is released.
@@ -744,7 +793,8 @@ metadata), and **step 10 (performance) is now delivered**: a benchmark harness +
 scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
 lossy decode, byte-exact); the dated results, the revised target, and the honest
 findings are recorded in `PROGRESS.MD`. The remaining roadmap is step
-11 (robustness hardening) and step 12 (public API and release criteria); the
+11 (robustness hardening), step 12 (public API and release criteria), and
+post-1.0 step 13 (C ABI design above; implementation still future work); the
 only open step-9 item is the manual ≥2-browser render confirmation, which is set
 up (see below) but intentionally not in CI.
 
