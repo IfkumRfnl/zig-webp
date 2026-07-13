@@ -448,7 +448,7 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 | `encodeLossless` | **v1** |
 | `encodeLossy` | **v1** |
 | `errorCategory` | **v1** (as `zwebp_error_category` / `zwebp_error_name`) |
-| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_free(ptr, len)` → free library-owned encode output (decision 4); `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8) |
+| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_free(ptr, len)` → free library-owned encode output (decision 4); `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8); the size-aware `zwebp_*_init(s, struct_size)` defaulting helpers for every v1 option/config/limits struct (decision 5 — zero-fill is not sufficient, so these are required v1 support symbols) |
 | `decodeStatic` | **non-goal** for C (Into is the C decode shape; no parallel owning-pixel export) |
 | `decodeAnimation` | **deferred v2** (batch owning frames; prefer streaming handle) |
 | `AnimationDecoder` | **deferred v2** (opaque `zwebp_anim_decoder*` handle: create / next / reset / destroy) |
