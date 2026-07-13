@@ -343,7 +343,8 @@ fn bench_one(
     }
 
     let budget = std::time::Duration::from_millis(budget_ms);
-    let want = iters.min(64);
+    // Match zig-webp-bench: --iters 0 normalizes to one timed sample.
+    let want = iters.max(1).min(64);
     let mut samples: Vec<f64> = Vec::with_capacity(want as usize);
     let mut total = std::time::Duration::ZERO;
     while (samples.len() as u32) < want {
@@ -580,27 +581,23 @@ if [ "$all_mode" -eq 1 ]; then
   cat "$part_tsv" >"$zig_raw"
   awk 'BEGIN{p=0} /^file\t/{p=1; next} p && $0 !~ /^#/ {print}' "$part_dig" >>"$digests"
 else
-  # Smoke / explicit files: one deterministic zig build invocation per basename
-  # filter (build graph is cached after the first compile).
+  # Smoke / explicit files: pass each path via --file so Zig times the supplied
+  # path (not a corpus basename filter, which can miss or collide).
+  part_tsv="$work/zig-explicit.tsv"
+  part_dig="$work/dig-explicit.tsv"
+  zig_args=(
+    --iters "$iters"
+    --warmup "$warmup"
+    --budget-ms "$budget_ms"
+    --decode-only
+    --write-digests "$part_dig"
+  )
   for f in "${files[@]}"; do
-    base="$(basename "$f")"
-    part_tsv="$work/zig-$base.tsv"
-    part_dig="$work/dig-$base.tsv"
-    run_zig_bench \
-      --iters "$iters" \
-      --warmup "$warmup" \
-      --budget-ms "$budget_ms" \
-      --decode-only \
-      --filter "$base" \
-      --write-digests "$part_dig" \
-      "$part_tsv"
-    if [ ! -s "$zig_raw" ]; then
-      cat "$part_tsv" >"$zig_raw"
-    else
-      awk 'BEGIN{p=0} /^asset_class\t/{p=1; next} p && $0 !~ /^#/ {print}' "$part_tsv" >>"$zig_raw"
-    fi
-    awk 'BEGIN{p=0} /^file\t/{p=1; next} p && $0 !~ /^#/ {print}' "$part_dig" >>"$digests"
+    zig_args+=(--file "$f")
   done
+  run_zig_bench "${zig_args[@]}" "$part_tsv"
+  cat "$part_tsv" >"$zig_raw"
+  awk 'BEGIN{p=0} /^file\t/{p=1; next} p && $0 !~ /^#/ {print}' "$part_dig" >>"$digests"
 fi
 
 # Keep only candidates for which Zig produced a validated decode-into digest.
@@ -741,8 +738,12 @@ if [ -n "$output" ]; then
     /*) dest="$output" ;;
     *) dest="$root/$output" ;;
   esac
+  # Resolve ".." / redundant components before the prefix allow-list so
+  # paths like ../bench.tsv cannot escape the worktree.
+  root_real="$(realpath -m -- "$root")"
+  dest="$(realpath -m -- "$dest")"
   case "$dest" in
-    "$root/.zig-cache"/*|"$root"/*) ;;
+    "$root_real"/.zig-cache/*|"$root_real"/*) ;;
     *)
       printf 'webp-rust-bench: refusing to write outside the worktree: %s\n' "$dest" >&2
       exit 1

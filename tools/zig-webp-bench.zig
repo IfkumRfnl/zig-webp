@@ -43,7 +43,8 @@
 //! interval.
 //!
 //! Usage: zig-webp-bench [--iters N] [--warmup N] [--budget-ms N]
-//!                       [--filter SUBSTR] [--decode-only|--encode-only]
+//!                       [--filter SUBSTR] [--file PATH]...
+//!                       [--decode-only|--encode-only]
 //!                       [--write-digests PATH] [OUTPUT.tsv]
 //! With no OUTPUT.tsv the report goes to stdout; a one-line summary goes to
 //! stderr either way. `--write-digests` records still `decode-into` SHA-256
@@ -87,6 +88,8 @@ const Config = struct {
     /// multi-second image cannot blow up the run.
     budget_ns: u64 = 1_500 * std.time.ns_per_ms,
     filter: ?[]const u8 = null,
+    /// When non-empty, decode only these paths instead of scanning corpus dirs.
+    explicit_files: []const []const u8 = &.{},
     do_decode: bool = true,
     do_encode: bool = true,
     /// When set, still `decode-into` rows also append digest TSV lines here.
@@ -262,9 +265,34 @@ fn benchDecode(
     config: Config,
     stats: *Stats,
 ) !void {
+    if (config.explicit_files.len != 0) {
+        for (config.explicit_files) |path| {
+            try benchDecodePath(writer, digests_writer, ctx, config, stats, path);
+        }
+        return;
+    }
     try benchDecodeDir(writer, digests_writer, ctx, config, stats, encode_corpus.photos_root_path);
     try benchDecodeDir(writer, digests_writer, ctx, config, stats, corpus.default_root_path);
     try benchDecodeDir(writer, digests_writer, ctx, config, stats, corpus.default_animation_root_path);
+}
+
+/// Times decode of one caller-supplied WebP path (used by `--file`).
+fn benchDecodePath(
+    writer: *std.Io.Writer,
+    digests_writer: ?*std.Io.Writer,
+    ctx: cli.Cli,
+    config: Config,
+    stats: *Stats,
+    path: []const u8,
+) !void {
+    const name = std.fs.path.basename(path);
+    if (config.filter) |needle| {
+        if (std.mem.indexOf(u8, name, needle) == null) return;
+    }
+
+    const bytes = try ctx.readInput(path);
+    defer ctx.gpa.free(bytes);
+    try benchDecodeBytes(writer, digests_writer, ctx, config, stats, name, bytes);
 }
 
 /// Times decode of every `*.webp` under `dir_path`. Missing directories are
@@ -296,56 +324,68 @@ fn benchDecodeDir(
             .limits = bench_limits,
         });
         defer ctx.gpa.free(bytes);
+        try benchDecodeBytes(writer, digests_writer, ctx, config, stats, name, bytes);
+    }
+}
 
-        var parsed = webp.parseWebP(ctx.gpa, bytes, .{ .limits = bench_limits }) catch continue;
-        const features = parsed.features;
-        parsed.deinit();
+/// Shared still/animation decode timing for one in-memory WebP payload.
+fn benchDecodeBytes(
+    writer: *std.Io.Writer,
+    digests_writer: ?*std.Io.Writer,
+    ctx: cli.Cli,
+    config: Config,
+    stats: *Stats,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    var parsed = webp.parseWebP(ctx.gpa, bytes, .{ .limits = bench_limits }) catch return;
+    const features = parsed.features;
+    parsed.deinit();
 
-        const asset_class = classify(features);
-        const width = features.canvas.width;
-        const height = features.canvas.height;
-        const canvas_pixels = @as(u64, width) * height;
+    const asset_class = classify(features);
+    const width = features.canvas.width;
+    const height = features.canvas.height;
+    const canvas_pixels = @as(u64, width) * height;
 
-        if (features.is_animation) {
-            // One untimed decode tells us the frame count for an honest
-            // composited-pixel throughput; it doubles as a warmup.
-            var probe = try webp.decodeAnimation(ctx.gpa, bytes, .{
-                .output_format = .rgba,
-                .limits = bench_limits,
-            });
-            const frame_count = probe.info.frame_count;
-            probe.deinit();
+    if (features.is_animation) {
+        // One untimed decode tells us the frame count for an honest
+        // composited-pixel throughput; it doubles as a warmup.
+        var probe = try webp.decodeAnimation(ctx.gpa, bytes, .{
+            .output_format = .rgba,
+            .limits = bench_limits,
+        });
+        const frame_count = probe.info.frame_count;
+        probe.deinit();
 
-            const measurement = try timeMedian(ctx.io, config, DecodeAnimCtx{ .gpa = ctx.gpa, .bytes = bytes });
-            try writeRow(writer, stats, asset_class, name, "decode", formatName(features.format), features.has_alpha, width, height, canvas_pixels * frame_count, measurement, 0);
-        } else {
-            const measurement = timeMedian(ctx.io, config, DecodeStaticCtx{ .gpa = ctx.gpa, .bytes = bytes }) catch |err| {
-                // A corpus file this build cannot decode is reported as a skip
-                // on stderr rather than aborting the whole run.
-                const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode error: {s})\n", .{ name, @errorName(err) });
-                defer ctx.gpa.free(msg);
-                try ctx.writeStderr(msg);
-                continue;
-            };
-            try writeRow(writer, stats, asset_class, name, "decode", formatName(features.format), features.has_alpha, width, height, canvas_pixels, measurement, 0);
+        const measurement = try timeMedian(ctx.io, config, DecodeAnimCtx{ .gpa = ctx.gpa, .bytes = bytes });
+        try writeRow(writer, stats, asset_class, name, "decode", formatName(features.format), features.has_alpha, width, height, canvas_pixels * frame_count, measurement, 0);
+    } else {
+        const measurement = timeMedian(ctx.io, config, DecodeStaticCtx{ .gpa = ctx.gpa, .bytes = bytes }) catch |err| {
+            // A corpus file this build cannot decode is reported as a skip
+            // on stderr rather than aborting the whole run.
+            const msg = try std.fmt.allocPrint(ctx.gpa, "bench: skip {s} (decode error: {s})\n", .{ name, @errorName(err) });
+            defer ctx.gpa.free(msg);
+            try ctx.writeStderr(msg);
+            return;
+        };
+        try writeRow(writer, stats, asset_class, name, "decode", formatName(features.format), features.has_alpha, width, height, canvas_pixels, measurement, 0);
 
-            // decode-into: reuse a caller-owned buffer (rgb/rgba) allocated
-            // outside timing; validate against allocating decodeStatic first.
-            try benchDecodeStaticInto(
-                writer,
-                digests_writer,
-                ctx,
-                config,
-                stats,
-                asset_class,
-                name,
-                bytes,
-                features,
-                width,
-                height,
-                canvas_pixels,
-            );
-        }
+        // decode-into: reuse a caller-owned buffer (rgb/rgba) allocated
+        // outside timing; validate against allocating decodeStatic first.
+        try benchDecodeStaticInto(
+            writer,
+            digests_writer,
+            ctx,
+            config,
+            stats,
+            asset_class,
+            name,
+            bytes,
+            features,
+            width,
+            height,
+            canvas_pixels,
+        );
     }
 }
 
@@ -571,9 +611,11 @@ fn parseU32(ctx: cli.Cli, value: []const u8, usage_text: []const u8) u32 {
 
 const usage =
     "usage: zig-webp-bench [--iters N] [--warmup N] [--budget-ms N]\n" ++
-    "                      [--filter SUBSTR] [--decode-only|--encode-only]\n" ++
+    "                      [--filter SUBSTR] [--file PATH]...\n" ++
+    "                      [--decode-only|--encode-only]\n" ++
     "                      [--write-digests PATH] [OUTPUT.tsv]\n" ++
-    "Benchmarks this library's decode/encode entry points in memory and writes a TSV.\n";
+    "Benchmarks this library's decode/encode entry points in memory and writes a TSV.\n" ++
+    "`--file` (repeatable) times the supplied path(s) instead of scanning corpus dirs.\n";
 
 pub fn main(init: std.process.Init) !void {
     const ctx = try cli.Cli.init(init);
@@ -586,6 +628,8 @@ pub fn main(init: std.process.Init) !void {
 
     var config = Config{};
     var output_path: ?[]const u8 = null;
+    var explicit_files: std.ArrayList([]const u8) = .empty;
+    defer explicit_files.deinit(ctx.gpa);
 
     var i: usize = 1;
     while (i < ctx.args.len) : (i += 1) {
@@ -606,6 +650,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= ctx.args.len) ctx.usageError(usage);
             config.filter = ctx.args[i];
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            i += 1;
+            if (i >= ctx.args.len) ctx.usageError(usage);
+            try explicit_files.append(ctx.gpa, ctx.args[i]);
         } else if (std.mem.eql(u8, arg, "--decode-only")) {
             config.do_encode = false;
         } else if (std.mem.eql(u8, arg, "--encode-only")) {
@@ -620,6 +668,7 @@ pub fn main(init: std.process.Init) !void {
             ctx.usageError(usage);
         }
     }
+    config.explicit_files = explicit_files.items;
 
     var report: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer report.deinit();
