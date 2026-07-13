@@ -72,6 +72,11 @@ compatibility matrix closed, the remaining 1.0.0 decisions are the operator's:
 tag now versus landing plans 014/016/017 first, then `RELEASING.MD`'s release
 procedure.
 
+Step 13 (C ABI) is design-complete only: plan 015 recorded the post-1.0 C
+export contracts in `PLAN.MD` (v1 still-image scope, naming/header, error
+model, memory ownership, size-aware struct init, acceptance gates, independent
+C ABI versioning). No C header, exports, or shared library ships yet.
+
 ## Cross-Cutting Practices
 
 CI runs on every pull request and push to main
@@ -149,6 +154,43 @@ Validation: exercised against lossless, lossy, alpha, and animation
 fixtures under `testdata/`; `zig build info` with no args exits 2 with
 the usage line. `zig build check` compiles the tool; README lists it
 alongside the other installed CLIs.
+### 2026-07-13 — Plan 015: C-ABI export layer design (PLAN.MD step 13)
+
+Plan 015 is complete as design-only work on branch `c-abi-design` (reviewer-
+verified; not merged). `PLAN.MD` step 13 now records the post-1.0 C ABI
+contracts a later implementation plan must execute. Nothing authorizes
+`src/capi.zig`, an installed header, shared-library scaffolding, or CI wiring
+today — no C header, exports, or compatibility promise ships with this entry.
+
+Recorded decisions (summary; full text in `PLAN.MD`):
+
+- **v1 still-image scope** — probe/decode-Into/encode core only
+  (`isWebP` / `parseHeader` / `parseChunkHeader` / `parseFeatures`,
+  `decodeStaticInto`, `encodeLossless` / `encodeLossy`), plus C-only helpers
+  `zwebp_error_category` / `zwebp_error_name`, `zwebp_free`, and
+  `zwebp_abi_version`. Animation, owning-pixel decode, and mux detail are
+  deferred or non-goals for C v1.
+- **Naming/header** — `zwebp_` prefix; one hand-written installed
+  `include/zwebp.h` (not auto-emitted); CI must compile/link a C smoke
+  against every shipped C artifact.
+- **Error model** — `int32_t` status (`0` / negative appended-only codes for
+  the FFI-reachable subset); `zwebp_error_category` / `zwebp_error_name`;
+  reserved unmapped-error fallback.
+- **Memory ownership** — no allocator object across the boundary; caller-owned
+  decode-Into pixels; read-only encode `zwebp_image_view`; library-owned
+  encode bytes freed via `zwebp_free(ptr, len)`; Zig must gain a const-input
+  encode path before C ships.
+- **Struct strategy** — leading `struct_size` on option/config/limits only;
+  size-aware `zwebp_*_init(void* s, uint32_t struct_size)` (optional
+  `ZWEBP_*_INIT(s)` macro) never writes past the caller's allocation;
+  directional older-prefix / newer-tail rules; fixed carriers unversioned.
+- **Acceptance gates** — header/export consistency on static and shared
+  artifacts; decode-from-C and encode-from-C behavioral smokes (encode frees
+  via `zwebp_free`); error-map exhaustiveness; `struct_size` / init
+  directionality.
+- **Independent C ABI versioning** — `ZWEBP_ABI_VERSION` /
+  `zwebp_abi_version()` and soname follow the C major, not Zig package
+  minors; C stability starts when the C ABI is released.
 
 ### 2026-07-09 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards)
 

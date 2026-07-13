@@ -423,9 +423,10 @@ library scaffolding, or CI wiring today.
 `decodeStaticInto` (caller-owned writable `zwebp_buffer` pixels only),
 `encodeLossless` / `encodeLossy` (read-only `zwebp_image_view` input;
 library-owned output bytes + paired free), and C-only helpers:
-`zwebp_error_category` / `zwebp_error_name`, plus `zwebp_abi_version(void)`
-(runtime ABI version matching `ZWEBP_ABI_VERSION`; see decision 8).
-No library-allocated pixel decode in v1.
+`zwebp_error_category` / `zwebp_error_name`, `zwebp_free(ptr, len)` (paired
+free for library-owned encode output; see decision 4), plus
+`zwebp_abi_version(void)` (runtime ABI version matching `ZWEBP_ABI_VERSION`;
+see decision 8). No library-allocated pixel decode in v1.
 
 **Rationale.** Still probe/decode/encode covers the common FFI adoption path
 without opaque streaming handles or nested animation ownership.
@@ -447,7 +448,7 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 | `encodeLossless` | **v1** |
 | `encodeLossy` | **v1** |
 | `errorCategory` | **v1** (as `zwebp_error_category` / `zwebp_error_name`) |
-| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8) |
+| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_free(ptr, len)` → free library-owned encode output (decision 4); `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8) |
 | `decodeStatic` | **non-goal** for C (Into is the C decode shape; no parallel owning-pixel export) |
 | `decodeAnimation` | **deferred v2** (batch owning frames; prefer streaming handle) |
 | `AnimationDecoder` | **deferred v2** (opaque `zwebp_anim_decoder*` handle: create / next / reset / destroy) |
@@ -568,23 +569,36 @@ versioned via the size mechanism (layout changes there are C-breaking).
 Callers **must** initialize every option/config/limits struct before use
 by one of:
 
-1. calling the matching `zwebp_*_init` (preferred) — sets `struct_size` to
-   `sizeof(...)` and every documented default; or
+1. calling the matching size-aware `zwebp_*_init` (preferred) — the exported
+   form is `zwebp_*_init(void* s, uint32_t struct_size)` (callers pass
+   `sizeof(*s)`). Init writes documented defaults only within the recognized
+   prefix of the caller-provided `struct_size`, sets `s->struct_size =
+   struct_size`, and **never writes past the caller's allocation**. Unknown
+   or too-small sizes fail (same rejection rule as callees: below
+   `min_prefix`, or not an exact supported historical prefix). The header
+   may provide a convenience macro `ZWEBP_*_INIT(s)` that expands to
+   `zwebp_*_init((s), sizeof(*(s)))`; or
 2. explicitly assigning **every** field, including
-   `struct_size = sizeof(...)`.
+   `struct_size = sizeof(...)` (the caller's own `sizeof`, not the
+   library's).
 
 Setting only `struct_size` on an otherwise indeterminate stack (or heap)
 object is **not** supported: remaining fields (limits, `has_*` flags,
 optionals) would be garbage. Zero-filling alone is also **not**
 sufficient unless the caller then follows (1) or (2), because documented
-init defaults are not all zero-bit patterns.
+init defaults are not all zero-bit patterns. A size-unaware
+`zwebp_*_init(struct*)` that applies the library's current `sizeof` is
+**rejected** — a newer shared library must not write past an older, smaller
+caller allocation.
 
 Mirror:
 
 - `zwebp_limits` — the six `ResourceLimits` integer fields, leading
-  `struct_size`, init via `zwebp_limits_init` (or full assignment);
+  `struct_size`, init via size-aware `zwebp_limits_init(void* s,
+  uint32_t struct_size)` / `ZWEBP_LIMITS_INIT(s)` (or full assignment);
 - `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
-  as needed by v1 entry points — same `struct_size` + `zwebp_*_init` rules;
+  as needed by v1 entry points — same `struct_size` + size-aware
+  `zwebp_*_init` / `ZWEBP_*_INIT` rules;
 - `zwebp_buffer` — mutable pixel storage for decode-Into outputs (**no**
   `struct_size`; fixed layout):
   `uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
@@ -624,23 +638,30 @@ fields stay non-breaking on **option/config/limits** structs only):
 
 - Each option/config/limits struct defines a **minimum recognized prefix**
   (the v1 field layout including `struct_size` itself). Callees **never
-  read beyond `min(caller.struct_size, library_sizeof)`** bytes.
+  read beyond `min(caller.struct_size, library_sizeof)`** bytes. Size-aware
+  `zwebp_*_init` likewise **never writes beyond the caller-provided
+  `struct_size`** (and never beyond the recognized prefix of that size).
 - A **newer library** accepting an **older/smaller** caller struct must
   accept `struct_size` values that equal a **supported historical prefix**
   (including the current `library_sizeof`), treat absent trailing fields as
-  init-defaults, and must not read past the caller-provided size. Sizes
+  init-defaults, and must not read or write past the caller-provided size.
+  The same rule applies to size-aware init: an older/smaller caller size is
+  accepted when it is an exact supported prefix; init fills only that
+  prefix and sets `s->struct_size` to the caller-provided size. Sizes
   below `min_prefix`, or sizes that are not an exact supported prefix,
-  are rejected.
+  are rejected (by both callees and init).
 - An **older library** receiving a **newer/larger** caller struct may
   **reject** sizes above the version it understands (it must not guess at
-  trailing fields, and still must not read past `caller.struct_size`).
-  Forward progress for callers is to rebuild against a newer header/soname,
-  not to require old binaries to accept unknown tails.
+  trailing fields, and still must not read or write past
+  `caller.struct_size`). Forward progress for callers is to rebuild against
+  a newer header/soname, not to require old binaries to accept unknown
+  tails.
 - Shrinking or reordering fields inside the recognized prefix is
   C-breaking; appending fields (and bumping the library `sizeof`) is
-  non-breaking for callers that keep initializing via `zwebp_*_init` (or
-  fully assigning every field) with `struct_size` equal to their own
-  `sizeof`, and for libraries that default the absent tail as above.
+  non-breaking for callers that keep initializing via size-aware
+  `zwebp_*_init` / `ZWEBP_*_INIT` (or fully assigning every field) with
+  `struct_size` equal to their own `sizeof`, and for libraries that default
+  the absent tail as above.
 - Fixed-layout carriers (`zwebp_buffer`, `zwebp_image_view`,
   `zwebp_container_header`, `zwebp_chunk_header`, owning encode result,
   `zwebp_features`) do not participate in these rules.
@@ -654,16 +675,19 @@ layouts that start at `pixels` / `data`.
 **Rejected.** Requiring `struct_size` on every extern struct (including
 fixed data carriers); `0`-as-unset sentinels; omitting `zwebp_*_init` and
 forcing callers to hand-reconstruct Zig defaults with no helper; treating
-`struct_size = sizeof(...)` alone as initialization; a single mutable
-`zwebp_buffer` / `uint8_t* pixels` type for both decode outputs and encode
-inputs; `@constCast` (or equivalent) from `zwebp_image_view`'s
-`const uint8_t* pixels` onto Zig `ImageBuffer` / `[]u8`, or a silent
-whole-image copy to obtain mutable encode input (primary requirement: the
-Zig const-input encode path in decision 4); packing Zig slices as fat
-pointers; bidirectional "accept any `sizeof`" (old libraries must not
-silently ignore unknown trailing semantics); rejecting every
-smaller-than-current option/config/limits struct (would make appended
-fields a breaking change for old callers).
+`struct_size = sizeof(...)` alone as initialization; a size-unaware
+`zwebp_*_init(struct*)` that writes defaults using the library's current
+`sizeof` (would overrun an older, smaller caller allocation when a newer
+shared library is loaded — init must take the caller's `struct_size`
+explicitly); a single mutable `zwebp_buffer` / `uint8_t* pixels` type for
+both decode outputs and encode inputs; `@constCast` (or equivalent) from
+`zwebp_image_view`'s `const uint8_t* pixels` onto Zig `ImageBuffer` /
+`[]u8`, or a silent whole-image copy to obtain mutable encode input
+(primary requirement: the Zig const-input encode path in decision 4);
+packing Zig slices as fat pointers; bidirectional "accept any `sizeof`"
+(old libraries must not silently ignore unknown trailing semantics);
+rejecting every smaller-than-current option/config/limits struct (would
+make appended fields a breaking change for old callers).
 
 #### 6. Feature probe result
 
@@ -714,9 +738,13 @@ the C ABI ships):
    wrapper's reachable `errors.Error` set, and a separate case proves the
    reserved unmapped-error fallback code/category/name.
 5. **`struct_size` directionality** (option/config/limits only) — tests
-   cover (a) older/smaller prefix accepted with defaulted tail fields and
+   cover (a) older/smaller prefix accepted with defaulted tail fields,
    (b) oversized/unknown size rejected without reading past the
-   caller-provided bytes.
+   caller-provided bytes, and (c) size-aware `zwebp_*_init(void*,
+   uint32_t)` / `ZWEBP_*_INIT`: writes defaults only within the recognized
+   prefix of the caller-provided size, sets `s->struct_size` to that size,
+   never writes past the caller's allocation, and fails on unknown or
+   too-small sizes.
 6. Wire those checks into `zig build check` or a dedicated step invoked by
    CI.
 
