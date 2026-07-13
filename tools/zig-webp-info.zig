@@ -12,16 +12,20 @@ pub fn main(init: std.process.Init) !void {
     const bytes = try ctx.readInput(input_path);
     defer ctx.gpa.free(bytes);
 
-    var result = try webp.parseWebP(ctx.gpa, bytes, .{});
+    // Match other inspection tools: accept the largest canvas the limits type
+    // can express so large-but-valid stills/animations probe without decoding.
+    var result = try webp.parseWebP(ctx.gpa, bytes, .{
+        .limits = .{
+            .output_pixels_max = std.math.maxInt(u32),
+            .animation_canvas_pixels_max = std.math.maxInt(u32),
+        },
+    });
     defer result.deinit();
 
     var report: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer report.deinit();
 
-    const format_name: []const u8 = if (result.features.format) |format|
-        @tagName(format)
-    else
-        "none";
+    const format_name = formatName(result);
 
     try report.writer.print(
         \\file: {s}
@@ -99,4 +103,26 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try ctx.writeStdout(report.written());
+}
+
+fn formatName(result: webp.DemuxResult) []const u8 {
+    if (result.features.format) |format| return @tagName(format);
+    if (!result.features.is_animation) return "none";
+    return animatedFormatSummary(result.frames);
+}
+
+fn animatedFormatSummary(frames: []const webp.AnimationFrame) []const u8 {
+    var saw_lossy = false;
+    var saw_lossless = false;
+    for (frames) |frame| {
+        const format = frame.format orelse continue;
+        switch (format) {
+            .lossy => saw_lossy = true,
+            .lossless => saw_lossless = true,
+        }
+    }
+    if (saw_lossy and saw_lossless) return "mixed (animated)";
+    if (saw_lossy) return "lossy (animated)";
+    if (saw_lossless) return "lossless (animated)";
+    return "none";
 }

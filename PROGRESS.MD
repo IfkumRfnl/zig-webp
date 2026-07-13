@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-09
+Last updated: 2026-07-13
 
 ## Current Position
 
@@ -129,6 +129,26 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-13 — Plan 017: `zig-webp-info` container-probe CLI
+
+Delivered `tools/zig-webp-info.zig` (`zig build info`, installed as
+`zig-webp-info`): a webpinfo-style container probe built on the public
+`parseWebP` API with no codec or public-API changes. It reports container
+kind, bitstream format, canvas size, alpha/animation/metadata flags, the
+ordered chunk list, unknown chunks, and (for animations) loop count,
+background color, and per-frame rect/duration/dispose/blend details.
+Animated files summarize per-frame bitstream formats as
+`lossy (animated)` / `lossless (animated)` / `mixed (animated)` when
+`features.format` is null by design. The probe relaxes demux canvas
+limits (`output_pixels_max` / `animation_canvas_pixels_max` =
+`maxInt(u32)`, matching other inspection tools) so large-but-valid
+stills and animations can be inspected without decoding pixels.
+
+Validation: exercised against lossless, lossy, alpha, and animation
+fixtures under `testdata/`; `zig build info` with no args exits 2 with
+the usage line. `zig build check` compiles the tool; README lists it
+alongside the other installed CLIs.
 
 ### 2026-07-09 — Plan 019: fast big-endian CI (ReleaseSafe + 4-way shards)
 
