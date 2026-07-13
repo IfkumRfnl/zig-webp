@@ -422,7 +422,9 @@ library scaffolding, or CI wiring today.
 `isWebP` / `parseHeader` / `parseChunkHeader` / `parseFeatures` analogues,
 `decodeStaticInto` (caller-owned writable `zwebp_buffer` pixels only),
 `encodeLossless` / `encodeLossy` (read-only `zwebp_image_view` input;
-library-owned output bytes + paired free), and error helpers.
+library-owned output bytes + paired free), and C-only helpers:
+`zwebp_error_category` / `zwebp_error_name`, plus `zwebp_abi_version(void)`
+(runtime ABI version matching `ZWEBP_ABI_VERSION`; see decision 8).
 No library-allocated pixel decode in v1.
 
 **Rationale.** Still probe/decode/encode covers the common FFI adoption path
@@ -445,6 +447,7 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 | `encodeLossless` | **v1** |
 | `encodeLossy` | **v1** |
 | `errorCategory` | **v1** (as `zwebp_error_category` / `zwebp_error_name`) |
+| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8) |
 | `decodeStatic` | **non-goal** for C (Into is the C decode shape; no parallel owning-pixel export) |
 | `decodeAnimation` | **deferred v2** (batch owning frames; prefer streaming handle) |
 | `AnimationDecoder` | **deferred v2** (opaque `zwebp_anim_decoder*` handle: create / next / reset / destroy) |
@@ -456,8 +459,9 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 
 Supporting Tier-1 *types* appear in C only as the extern structs / enums
 needed by the classified entry points above (limits, mutable decode
-buffers, const encode image views, options, feature summary scalars,
-error codes). Tier-2 Zig exports are C non-goals.
+buffers, const encode image views, `parseHeader` / `parseChunkHeader`
+result carriers `zwebp_container_header` / `zwebp_chunk_header`, options,
+feature summary scalars, error codes). Tier-2 Zig exports are C non-goals.
 
 #### 2. Naming and header
 
@@ -522,11 +526,19 @@ allocator chosen at implementation time (must be thread-safe and introduce
 no global mutable codec state, matching the library threading stance).
 Decode pixels are always caller-owned via the Into contract into a mutable
 `zwebp_buffer`. Encode inputs are a read-only `zwebp_image_view`
-(`const uint8_t* pixels`) so const image memory needs no cast. Encoder
-success fills an owning result (`uint8_t* data; uint64_t len;`) freed with
-`zwebp_free(ptr, len)` — both pointer and length, so size-aware allocators
-remain possible. `ResourceLimits.allocation_bytes_max` remains the caller's
-bound on internal scratch/output exactly as in Zig.
+(`const uint8_t* pixels`). Live Zig `ImageBuffer.pixels` is a mutable `[]u8`,
+so the C wrapper **must not** `@constCast` (or equivalent) into today's
+`encodeLossless` / `encodeLossy`, and **must not** silently copy the whole
+image to obtain mutable pixels. Before the C ABI ships, Zig 1.x must gain an
+additive, non-breaking const-input encode path (a read-only pixel-view entry,
+or an internal encoder entry that accepts const pixels) that the C wrappers
+call; any whole-image copy would need an explicit documented decision with
+its allocation budgeted against `allocation_bytes_max` and is **not** the
+chosen design. Encoder success fills an owning result
+(`uint8_t* data; uint64_t len;`) freed with `zwebp_free(ptr, len)` — both
+pointer and length, so size-aware allocators remain possible.
+`ResourceLimits.allocation_bytes_max` remains the caller's bound on internal
+scratch/output exactly as in Zig.
 
 **Rationale.** Process-wide ownership keeps the C call shape close to
 "buffer in, status out" without a context handle on every call; Into
@@ -537,13 +549,18 @@ already solved decode-side cross-language ownership.
 caller-controlled allocator story). Also rejected for v1: a mandatory
 opaque `zwebp_context*` on every call (better for WASM freestanding and
 allocator-failure injection from C, but heavier than host C needs; revisit
-under decision 10 if freestanding shares this surface).
+under decision 10 if freestanding shares this surface). Also rejected:
+bridging `const zwebp_image_view` / `const uint8_t*` encode inputs via
+`@constCast` onto Zig `ImageBuffer` (`pixels: []u8`), or a silent
+whole-image copy to manufacture mutable pixels (see the const-input Zig
+path requirement above).
 
 #### 5. Struct strategy
 
 **Decision.** Extensible option/config/limits extern structs carry a leading
 `uint32_t struct_size`. Fixed-layout data carriers do **not**:
-`zwebp_buffer`, `zwebp_image_view`, and the owning encode-result
+`zwebp_buffer`, `zwebp_image_view`, `zwebp_container_header`,
+`zwebp_chunk_header`, and the owning encode-result
 (`uint8_t* data; uint64_t len;`) have no `struct_size` field and are not
 versioned via the size mechanism (layout changes there are C-breaking).
 `zwebp_features` is likewise a fixed by-value result (see decision 6).
@@ -576,7 +593,21 @@ Mirror:
   `struct_size`; fixed layout):
   `const uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
   int32_t format;` (same layout as `zwebp_buffer` except `pixels` is
-  const; encode must not cast away const on caller image memory).
+  const). The C wrappers call the Zig const-input encode path required in
+  decision 4 — never `@constCast` onto `ImageBuffer.pixels: []u8`, never a
+  silent whole-image copy.
+- `zwebp_container_header` — by-value / out-param result of the
+  `parseHeader` analogue (**no** `struct_size`; fixed layout), field-for-field
+  from Zig `ContainerHeader`: `uint32_t riff_payload_size;` (Zig
+  `riff_payload_size: u32`). Methods such as `fileSizeBytes` are not
+  exported; callers that need the implied file size compute
+  `riff_payload_size + 8`.
+- `zwebp_chunk_header` — by-value / out-param result of the
+  `parseChunkHeader` analogue (**no** `struct_size`; fixed layout),
+  field-for-field from Zig `ChunkHeader`: `uint8_t tag[4];` (Zig
+  `tag: FourCC` / `bytes: [4]u8` — four raw FourCC bytes, not an enum) and
+  `uint32_t payload_size;` (Zig `payload_size: u32`). Padding /
+  `chunkSizeBytes` helpers are not exported as struct fields.
 
 Decode-Into takes a `zwebp_buffer*` (writable). `encodeLossless` /
 `encodeLossy` take a `const zwebp_image_view*` (or the view by value).
@@ -610,8 +641,9 @@ fields stay non-breaking on **option/config/limits** structs only):
   non-breaking for callers that keep initializing via `zwebp_*_init` (or
   fully assigning every field) with `struct_size` equal to their own
   `sizeof`, and for libraries that default the absent tail as above.
-- Fixed-layout carriers (`zwebp_buffer`, `zwebp_image_view`, owning encode
-  result, `zwebp_features`) do not participate in these rules.
+- Fixed-layout carriers (`zwebp_buffer`, `zwebp_image_view`,
+  `zwebp_container_header`, `zwebp_chunk_header`, owning encode result,
+  `zwebp_features`) do not participate in these rules.
 
 **Rationale.** Explicit presence flags avoid sentinel rot (`0` is a legal
 PSNR target). Directional size rules give libwebp-style extensibility for
@@ -624,10 +656,14 @@ fixed data carriers); `0`-as-unset sentinels; omitting `zwebp_*_init` and
 forcing callers to hand-reconstruct Zig defaults with no helper; treating
 `struct_size = sizeof(...)` alone as initialization; a single mutable
 `zwebp_buffer` / `uint8_t* pixels` type for both decode outputs and encode
-inputs; packing Zig slices as fat pointers; bidirectional "accept any
-`sizeof`" (old libraries must not silently ignore unknown trailing
-semantics); rejecting every smaller-than-current option/config/limits
-struct (would make appended fields a breaking change for old callers).
+inputs; `@constCast` (or equivalent) from `zwebp_image_view`'s
+`const uint8_t* pixels` onto Zig `ImageBuffer` / `[]u8`, or a silent
+whole-image copy to obtain mutable encode input (primary requirement: the
+Zig const-input encode path in decision 4); packing Zig slices as fat
+pointers; bidirectional "accept any `sizeof`" (old libraries must not
+silently ignore unknown trailing semantics); rejecting every
+smaller-than-current option/config/limits struct (would make appended
+fields a breaking change for old callers).
 
 #### 6. Feature probe result
 
@@ -665,13 +701,14 @@ the C ABI ships):
 2. **Behavioral decode gate** — a C smoke program decodes a committed
    corpus still into a caller-owned buffer via the Into analogue and
    byte-compares against Zig `decodeStatic` / corpus hash expectations.
-3. **Behavioral encode gate** — a C smoke program encodes from a
+3. **Behavioral encode gate** — presupposes the Zig const-input encode
+   path from decision 4. A C smoke program encodes from a
    `const zwebp_image_view` (lossless and/or lossy), validates the returned
    library-owned bytes (e.g. decode them / byte-check, or at minimum confirm
    a parseable WebP with the expected dimensions), and frees the output via
    `zwebp_free`. This gate must catch const-input mishandling (writing through
-   or casting away const on caller pixels), wrong result lengths, and
-   missing or mismatched paired freeing.
+   or casting away const on caller pixels; `@constCast` bridges are out of
+   policy), wrong result lengths, and missing or mismatched paired freeing.
 4. **Error-map exhaustiveness** — for each exported C wrapper, a test
    (comptime preference, else unit) proves the Zig→C status map covers that
    wrapper's reachable `errors.Error` set, and a separate case proves the
@@ -695,8 +732,10 @@ contract) remain unexercised from C.
 #### 8. ABI stability policy
 
 **Decision.** The C ABI versions independently of the already-stable Zig
-1.x package API. The header defines `ZWEBP_ABI_VERSION` (and a query
-function). Shared-library soname follows the C major (e.g. `libzwebp.so.1`);
+1.x package API. The header defines `ZWEBP_ABI_VERSION`, and v1 exports
+`uint32_t zwebp_abi_version(void)` returning that same runtime C ABI
+version (in scope with the other C-only helpers; see decision 1).
+Shared-library soname follows the C major (e.g. `libzwebp.so.1`);
 soname / C major bumps only on C-breaking changes (removed entry points,
 changed signatures, reused or renumbered published error codes, changing
 `zwebp_error_category` or `zwebp_error_name` for a published code,
