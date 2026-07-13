@@ -728,7 +728,8 @@ the C ABI ships):
    whenever the optional shared build is enabled), and **references every
    exported v1 symbol** (takes the address of or calls each declared entry
    point — probes, decode, both encoders, error helpers, `zwebp_free`,
-   `zwebp_abi_version`), with an equivalent `dlsym`-style presence check
+   `zwebp_abi_version`, and every size-aware `zwebp_*_init` helper),
+   with an equivalent `dlsym`-style presence check
    for the shared artifact, catching missing
    exports, signature drift, hidden dynamic symbols, export-list mistakes,
    and soname packaging errors. An entry point the smoke never references
