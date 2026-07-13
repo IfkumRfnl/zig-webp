@@ -170,10 +170,12 @@ positions are given; deviate only with a written reason:
 7. **Artifact & build**: `build.zig` gains a `capi` module rooted at a new
    `src/capi.zig` (Tier-2 internal), built into the existing static lib plus
    an optional shared lib step; header installed via `b.installFile`. State
-   the acceptance gate for the future implementation plan: a C smoke test
-   (compile a small `.c` against the header, link the static lib, decode a
-   corpus file into a caller buffer, byte-compare against `decodeStatic`)
-   wired into `zig build check` or a dedicated step.
+   the acceptance gate for the future implementation plan: C smoke tests
+   (compile small `.c` programs against the header, link the static lib;
+   decode a corpus file into a caller buffer and byte-compare against
+   `decodeStatic`; encode from a const image view, validate the returned
+   WebP bytes, and free via `zwebp_free`) wired into `zig build check` or
+   a dedicated step.
 8. **ABI stability policy**: the C ABI versions with the library (no
    independent soname games pre-1.0); the header carries
    `ZWEBP_ABI_VERSION`; appended-only enums/structs (via struct_size).
@@ -210,18 +212,19 @@ accidental stray edit).
 ## Test plan
 
 None — documentation deliverable. The design itself specifies the future
-implementation plan's test gates (C smoke test, header-drift check).
+implementation plan's test gates (C decode + encode smoke tests,
+header-drift check).
 
 ## Done criteria
 
 Machine-checkable. ALL must hold:
 
-- [ ] `PLAN.MD` contains the new C-ABI design section answering all ten
+- [x] `PLAN.MD` contains the new C-ABI design section answering all ten
       numbered items (each present as a heading or bolded lead-in).
-- [ ] The `PLAN.MD:32` non-goal line now references the design section.
-- [ ] No `.zig`, `build.zig`, or CI files modified (`git status`).
-- [ ] `zig build ci` exits 0.
-- [ ] `plans/README.md` status row updated.
+- [x] The `PLAN.MD:32` non-goal line now references the design section.
+- [x] No `.zig`, `build.zig`, or CI files modified (`git status`).
+- [x] `zig build ci` exits 0.
+- [x] `plans/README.md` status row updated.
 
 ## STOP conditions
 

@@ -541,7 +541,13 @@ under decision 10 if freestanding shares this surface).
 
 #### 5. Struct strategy
 
-**Decision.** Extern structs carry a leading `uint32_t struct_size`.
+**Decision.** Extensible option/config/limits extern structs carry a leading
+`uint32_t struct_size`. Fixed-layout data carriers do **not**:
+`zwebp_buffer`, `zwebp_image_view`, and the owning encode-result
+(`uint8_t* data; uint64_t len;`) have no `struct_size` field and are not
+versioned via the size mechanism (layout changes there are C-breaking).
+`zwebp_features` is likewise a fixed by-value result (see decision 6).
+
 Callers **must** initialize every option/config/limits struct before use
 by one of:
 
@@ -558,16 +564,19 @@ init defaults are not all zero-bit patterns.
 
 Mirror:
 
-- `zwebp_limits` — the six `ResourceLimits` integer fields;
-- `zwebp_buffer` — mutable pixel storage for decode-Into outputs:
+- `zwebp_limits` — the six `ResourceLimits` integer fields, leading
+  `struct_size`, init via `zwebp_limits_init` (or full assignment);
+- `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
+  as needed by v1 entry points — same `struct_size` + `zwebp_*_init` rules;
+- `zwebp_buffer` — mutable pixel storage for decode-Into outputs (**no**
+  `struct_size`; fixed layout):
   `uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
   int32_t format;` (pointer+len, not a Zig slice);
-- `zwebp_image_view` — read-only pixel input for encode entry points:
+- `zwebp_image_view` — read-only pixel input for encode entry points (**no**
+  `struct_size`; fixed layout):
   `const uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
   int32_t format;` (same layout as `zwebp_buffer` except `pixels` is
-  const; encode must not cast away const on caller image memory);
-- `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
-  as needed by v1 entry points.
+  const; encode must not cast away const on caller image memory).
 
 Decode-Into takes a `zwebp_buffer*` (writable). `encodeLossless` /
 `encodeLossy` take a `const zwebp_image_view*` (or the view by value).
@@ -580,11 +589,11 @@ become value + `bool has_*` (and pointer+length for payloads). Never treat
 `0` as unset.
 
 **Directional `struct_size` compatibility** (precise; this is how appended
-fields stay non-breaking):
+fields stay non-breaking on **option/config/limits** structs only):
 
-- Each option/config struct defines a **minimum recognized prefix** (the
-  v1 field layout including `struct_size` itself). Callees **never read
-  beyond `min(caller.struct_size, library_sizeof)`** bytes.
+- Each option/config/limits struct defines a **minimum recognized prefix**
+  (the v1 field layout including `struct_size` itself). Callees **never
+  read beyond `min(caller.struct_size, library_sizeof)`** bytes.
 - A **newer library** accepting an **older/smaller** caller struct must
   accept `struct_size` values that equal a **supported historical prefix**
   (including the current `library_sizeof`), treat absent trailing fields as
@@ -601,20 +610,24 @@ fields stay non-breaking):
   non-breaking for callers that keep initializing via `zwebp_*_init` (or
   fully assigning every field) with `struct_size` equal to their own
   `sizeof`, and for libraries that default the absent tail as above.
+- Fixed-layout carriers (`zwebp_buffer`, `zwebp_image_view`, owning encode
+  result, `zwebp_features`) do not participate in these rules.
 
 **Rationale.** Explicit presence flags avoid sentinel rot (`0` is a legal
-PSNR target). Directional size rules give libwebp-style extensibility
-without the contradiction of "reject smaller sizes" while claiming
-appended fields are non-breaking.
+PSNR target). Directional size rules give libwebp-style extensibility for
+options without pretending pixel buffers and encode results are extensible
+the same way. That avoids the contradiction of requiring `struct_size` on
+layouts that start at `pixels` / `data`.
 
-**Rejected.** `0`-as-unset sentinels; omitting `zwebp_*_init` and forcing
-callers to hand-reconstruct Zig defaults with no helper; treating
+**Rejected.** Requiring `struct_size` on every extern struct (including
+fixed data carriers); `0`-as-unset sentinels; omitting `zwebp_*_init` and
+forcing callers to hand-reconstruct Zig defaults with no helper; treating
 `struct_size = sizeof(...)` alone as initialization; a single mutable
 `zwebp_buffer` / `uint8_t* pixels` type for both decode outputs and encode
 inputs; packing Zig slices as fat pointers; bidirectional "accept any
 `sizeof`" (old libraries must not silently ignore unknown trailing
-semantics); rejecting every smaller-than-current struct (would make
-appended fields a breaking change for old callers).
+semantics); rejecting every smaller-than-current option/config/limits
+struct (would make appended fields a breaking change for old callers).
 
 #### 6. Feature probe result
 
@@ -652,22 +665,32 @@ the C ABI ships):
 2. **Behavioral decode gate** — a C smoke program decodes a committed
    corpus still into a caller-owned buffer via the Into analogue and
    byte-compares against Zig `decodeStatic` / corpus hash expectations.
-3. **Error-map exhaustiveness** — for each exported C wrapper, a test
+3. **Behavioral encode gate** — a C smoke program encodes from a
+   `const zwebp_image_view` (lossless and/or lossy), validates the returned
+   library-owned bytes (e.g. decode them / byte-check, or at minimum confirm
+   a parseable WebP with the expected dimensions), and frees the output via
+   `zwebp_free`. This gate must catch const-input mishandling (writing through
+   or casting away const on caller pixels), wrong result lengths, and
+   missing or mismatched paired freeing.
+4. **Error-map exhaustiveness** — for each exported C wrapper, a test
    (comptime preference, else unit) proves the Zig→C status map covers that
    wrapper's reachable `errors.Error` set, and a separate case proves the
    reserved unmapped-error fallback code/category/name.
-4. **`struct_size` directionality** — tests cover (a) older/smaller prefix
-   accepted with defaulted tail fields and (b) oversized/unknown size
-   rejected without reading past the caller-provided bytes.
-5. Wire those checks into `zig build check` or a dedicated step invoked by
+5. **`struct_size` directionality** (option/config/limits only) — tests
+   cover (a) older/smaller prefix accepted with defaulted tail fields and
+   (b) oversized/unknown size rejected without reading past the
+   caller-provided bytes.
+6. Wire those checks into `zig build check` or a dedicated step invoked by
    CI.
 
 **Rejected.** Shipping a shared library without linking/`dlsym`-style
 smoke coverage of that shared artifact (or without the header-drift,
-decode-behavior, error-map exhaustiveness, and `struct_size`
+decode- and encode-behavior, error-map exhaustiveness, and `struct_size`
 directionality gates); treating header install as documentation-only;
 gating only the static archive while an optional `libzwebp.so` ships
-untested.
+untested; claiming the C ABI complete with decode-only behavioral coverage
+while `encodeLossless` / `encodeLossy` (and their C ownership/`zwebp_free`
+contract) remain unexercised from C.
 
 #### 8. ABI stability policy
 
@@ -677,8 +700,8 @@ function). Shared-library soname follows the C major (e.g. `libzwebp.so.1`);
 soname / C major bumps only on C-breaking changes (removed entry points,
 changed signatures, reused or renumbered published error codes, changing
 `zwebp_error_category` or `zwebp_error_name` for a published code,
-shrinking/reordering a recognized `struct_size` prefix, or changing the
-directional size rules in decision 5). Published error metadata is
+shrinking/reordering a recognized option/config/limits `struct_size`
+prefix, or changing the directional size rules in decision 5). Published error metadata is
 ABI-stable: reclassifying a code into a different category string, or
 renaming its stable name string, under the same numeric code is C-breaking
 (callers may switch on category/name, not only on the number).
@@ -787,16 +810,17 @@ This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
 
 With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
-delivered, **step 9 (animation and metadata encode) is now feature-complete**
-(9a container mux, 9b pixel-buffer encode, 9c frame optimization, 9d still
-metadata), and **step 10 (performance) is now delivered**: a benchmark harness +
+delivered, **step 9 (animation and metadata encode) is complete** (9a container
+mux, 9b pixel-buffer encode, 9c frame optimization, 9d still metadata, and the
+≥2-browser render check — passed 2026-07-08 in Firefox and Chromium; see
+`PROGRESS.MD`). **Step 10 (performance) is delivered**: a benchmark harness +
 scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
 lossy decode, byte-exact); the dated results, the revised target, and the honest
-findings are recorded in `PROGRESS.MD`. The remaining roadmap is step
-11 (robustness hardening), step 12 (public API and release criteria), and
-post-1.0 step 13 (C ABI design above; implementation still future work); the
-only open step-9 item is the manual ≥2-browser render confirmation, which is set
-up (see below) but intentionally not in CI.
+findings are recorded in `PROGRESS.MD`. **Step 11 (robustness hardening) and
+step 12 (public API and release criteria) are complete**, and **`1.0.0` has
+shipped** (Tier-1 frozen; see `README.MD` / `CHANGELOG.MD`). The remaining
+roadmap is post-1.0 **step 13** (C ABI): the design is recorded above (this PR);
+implementation remains future work.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
@@ -859,12 +883,12 @@ then pixels, then quality):
    `AnimationImage.metadata` (and 9b's `AnimationEncodeOptions.metadata`), so 9d
    does not duplicate it.
 
-**Browser-render check (step-9 completion gate):** set up, not closed. 9c
-generates two minimized sample animations under `testdata/animation/`
+**Browser-render check (step-9 completion gate):** closed. 9c generated two
+minimized sample animations under `testdata/animation/`
 (`anim_minimized_lossless.webp`, `anim_minimized_lossy.webp` — a textured
-background with a moving sub-region) for manual inspection. Both pass `anim_dump`
-parity and `webpinfo` cleanly. The full "renders in ≥2 major browsers" gate is
-manual and intentionally **not** wired into CI: open the two samples in two
-browsers and confirm the moving region animates correctly. Everything that can
-be automated (byte-exact lossless round-trip, `anim_dump` parity, `webpinfo`) is
-gated; the cross-browser confirmation is the only remaining manual step.
+background with a moving sub-region). Both pass `anim_dump` parity and
+`webpinfo` cleanly. The "renders in ≥2 major browsers" gate is manual and
+intentionally **not** wired into CI; it passed on 2026-07-08 in Firefox and
+Chromium (operator-run; recorded in `PROGRESS.MD`). Everything that can be
+automated (byte-exact lossless round-trip, `anim_dump` parity, `webpinfo`)
+remains gated.
