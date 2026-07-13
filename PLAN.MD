@@ -858,7 +858,7 @@ lossy decode, byte-exact); the dated results, the revised target, and the honest
 findings are recorded in `PROGRESS.MD`. **Step 11 (robustness hardening) and
 step 12 (public API and release criteria) are complete**, and **`1.0.0` has
 shipped** (Tier-1 frozen; see `README.MD` / `CHANGELOG.MD`). The remaining
-roadmap is post-1.0 **step 13** (C ABI): the design is recorded above (this PR);
+roadmap is post-1.0 **step 13** (C ABI): the design is recorded above;
 implementation remains future work.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
@@ -927,7 +927,7 @@ minimized sample animations under `testdata/animation/`
 (`anim_minimized_lossless.webp`, `anim_minimized_lossy.webp` — a textured
 background with a moving sub-region). Both pass `anim_dump` parity and
 `webpinfo` cleanly. The "renders in ≥2 major browsers" gate is manual and
-intentionally **not** wired into CI; it passed on 2026-07-08 in Firefox and
-Chromium (operator-run; recorded in `PROGRESS.MD`). Everything that can be
+intentionally **not** wired into CI; the operator-run result is recorded in
+`PROGRESS.MD`. Everything that can be
 automated (byte-exact lossless round-trip, `anim_dump` parity, `webpinfo`)
 remains gated.
