@@ -155,8 +155,8 @@ the usage line. `zig build check` compiles the tool; README lists it
 alongside the other installed CLIs.
 ### 2026-07-13 — Plan 015: C-ABI export layer design (PLAN.MD step 13)
 
-Plan 015 is complete as design-only work on branch `c-abi-design` (reviewer-
-verified; not merged). `PLAN.MD` step 13 now records the post-1.0 C ABI
+Plan 015 is complete as design-only work, reviewer-verified and delivered via
+PR #102 (branch `c-abi-design`). `PLAN.MD` step 13 now records the post-1.0 C ABI
 contracts a later implementation plan must execute. Nothing authorizes
 `src/capi.zig`, an installed header, shared-library scaffolding, or CI wiring
 today — no C header, exports, or compatibility promise ships with this entry.

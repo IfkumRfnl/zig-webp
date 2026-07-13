@@ -602,11 +602,18 @@ Mirror:
 - `zwebp_buffer` — mutable pixel storage for decode-Into outputs (**no**
   `struct_size`; fixed layout):
   `uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
-  int32_t format;` (pointer+len, not a Zig slice);
+  int32_t format;` (pointer+len, not a Zig slice). `format` values are
+  the explicit header constants `ZWEBP_FORMAT_RGB = 0`,
+  `ZWEBP_FORMAT_RGBA = 1`, `ZWEBP_FORMAT_BGRA = 2`, `ZWEBP_FORMAT_ARGB = 3`
+  — fixed in `zwebp.h`, never derived from Zig `PixelFormat` enum
+  ordinals (a Zig enum reorder/insertion must not change C byte-order
+  semantics); a unit test pins the C-constant → Zig `PixelFormat`
+  mapping;
 - `zwebp_image_view` — read-only pixel input for encode entry points (**no**
   `struct_size`; fixed layout):
   `const uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
-  int32_t format;` (same layout as `zwebp_buffer` except `pixels` is
+  int32_t format;` (same layout and `ZWEBP_FORMAT_*` constants as
+  `zwebp_buffer` except `pixels` is
   const). The C wrappers call the Zig const-input encode path required in
   decision 4 — never `@constCast` onto `ImageBuffer.pixels: []u8`, never a
   silent whole-image copy.
@@ -718,21 +725,30 @@ the C ABI ships):
 1. **Header/export consistency** — a C translation unit that includes
    `zwebp.h` compiles and links against **every shipped C artifact** (the
    static archive always; and `libzwebp.so` / the platform shared library
-   whenever the optional shared build is enabled), catching missing
+   whenever the optional shared build is enabled), and **references every
+   exported v1 symbol** (takes the address of or calls each declared entry
+   point — probes, decode, both encoders, error helpers, `zwebp_free`,
+   `zwebp_abi_version`), with an equivalent `dlsym`-style presence check
+   for the shared artifact, catching missing
    exports, signature drift, hidden dynamic symbols, export-list mistakes,
-   and soname packaging errors. CI must not pass with a working archive but
-   an unusable dynamic C ABI.
+   and soname packaging errors. An entry point the smoke never references
+   must not be able to ship missing or hidden. CI must not pass with a
+   working archive but an unusable dynamic C ABI.
 2. **Behavioral decode gate** — a C smoke program decodes a committed
    corpus still into a caller-owned buffer via the Into analogue and
    byte-compares against Zig `decodeStatic` / corpus hash expectations.
 3. **Behavioral encode gate** — presupposes the Zig const-input encode
-   path from decision 4. A C smoke program encodes from a
-   `const zwebp_image_view` (lossless and/or lossy), validates the returned
+   path from decision 4. C smoke programs encode from a
+   `const zwebp_image_view` through **each encoder exported in v1** —
+   separate coverage for `encodeLossless` and `encodeLossy` analogues,
+   since they drive different codec paths and option handling — validate
+   the returned
    library-owned bytes (e.g. decode them / byte-check, or at minimum confirm
-   a parseable WebP with the expected dimensions), and frees the output via
+   a parseable WebP with the expected dimensions), and free the output via
    `zwebp_free`. This gate must catch const-input mishandling (writing through
    or casting away const on caller pixels; `@constCast` bridges are out of
-   policy), wrong result lengths, and missing or mismatched paired freeing.
+   policy), wrong result lengths, and missing or mismatched paired freeing
+   in **either** encoder.
 4. **Error-map exhaustiveness** — for each exported C wrapper, a test
    (comptime preference, else unit) proves the Zig→C status map covers that
    wrapper's reachable `errors.Error` set, and a separate case proves the
