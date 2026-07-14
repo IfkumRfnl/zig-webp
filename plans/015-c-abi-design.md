@@ -25,6 +25,13 @@
   plans/013-one-oh-stability-contract-and-compat-matrix.md
 - **Category**: direction
 - **Planned at**: commit `4c5572a`, 2026-07-07
+- **Execution status**: DONE — design recorded in `PLAN.MD` step 13 via
+  PR #102 (branch `c-abi-design`). The Approach / step text below is the
+  original design prompt; where review evolved the contracts (fixed
+  `zwebp_limits`, status-returning size-aware `zwebp_*_init`, call-based
+  every-symbol C smoke, stable `ZWEBP_*` constants, FFI pointer/discriminant
+  validation, encoder defaults without a C codec discriminator, PLAN vs
+  PROGRESS placement), **`PLAN.MD` step 13 is authoritative**.
 
 ## Why this matters
 

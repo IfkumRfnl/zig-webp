@@ -492,18 +492,35 @@ exported C surface** (today: the v1 wrappers around `isWebP` /
 `encodeLossless` / `encodeLossy`, plus the error helpers). Codes are
 numbered explicitly in `include/zwebp.h` / the future `src/capi.zig` map
 and are **appended-only**: new reachable Zig errors get new negative
-codes; never reuse or renumber. Provide `zwebp_error_category(int32_t)`
-mirroring `errors.category` for known codes (`container`,
-`resource_limit`, `unsupported`, `bitstream`, `allocation`) and
-`zwebp_error_name(int32_t)` returning a static NUL-terminated string.
+codes; never reuse or renumber. Provide `int32_t zwebp_error_category(int32_t code)` returning a
+**stable integer category** (not a string, not a Zig enum ordinal) for
+known codes, and `const char* zwebp_error_name(int32_t code)` returning a
+static NUL-terminated string. Category return values are the explicit
+header constants — fixed in `zwebp.h`, never derived from Zig
+`errors.Category` ordinals (a Zig enum reorder/insertion must not change
+C category numbers); a unit test pins the C-constant → Zig `Category`
+mapping:
+
+- `ZWEBP_ERROR_CATEGORY_CONTAINER = 0`
+- `ZWEBP_ERROR_CATEGORY_RESOURCE_LIMIT = 1`
+- `ZWEBP_ERROR_CATEGORY_UNSUPPORTED = 2`
+- `ZWEBP_ERROR_CATEGORY_BITSTREAM = 3`
+- `ZWEBP_ERROR_CATEGORY_ALLOCATION = 4`
+
+Unknown / unmapped status codes (including the reserved
+`ZWEBP_ERROR_INTERNAL` fallback when its documented category is
+`unsupported`) must still return one of these published constants — never
+an ad-hoc number. `zwebp_error_name` remains the string helper; category
+branching uses the integer constants above.
 
 Do **not** stabilize corpus/testing-only or other Zig errors that no
 exported C entry point can return (e.g. `CorpusUnavailable`,
 `InvalidCorpusPath`). If a wrapper ever observes an unmapped Zig error,
 translate it to a single reserved deterministic fallback code (e.g.
-`ZWEBP_ERROR_INTERNAL`) whose category is `unsupported` (or a documented
-fixed category) and whose name is a static string — never invent
-ad-hoc numbers at runtime. C-surface validation that never becomes a Zig
+`ZWEBP_ERROR_INTERNAL`) whose `zwebp_error_category` is
+`ZWEBP_ERROR_CATEGORY_UNSUPPORTED` (or another single documented published
+category constant) and whose `zwebp_error_name` is a static string — never
+invent ad-hoc status or category numbers at runtime. C-surface validation that never becomes a Zig
 `errors.Error` also uses published stable codes: at least
 `ZWEBP_ERROR_BAD_STRUCT_SIZE` (unknown/too-small option/config
 `struct_size` on size-aware init or callees) and
@@ -865,17 +882,45 @@ struct (would make appended fields a breaking change for old callers).
 #### 6. Feature probe result
 
 **Decision.** `zwebp_features` is a by-value extern struct of Summary
-*scalars* only: file kind, format presence + kind, width, height,
-`has_alpha`, `is_animation`, metadata presence bits (ICCP/EXIF/XMP), and
-`chunk_count`. No pointers, no `ChunkLocation` fields, nothing to free.
-Frame count is not part of `features.Summary` today and is not invented
-here — animation frame counts arrive with deferred animation/demux APIs.
+*scalars* only (**no** `struct_size`; fixed layout). No pointers, no
+`ChunkLocation` fields, nothing to free. Frame count is not part of
+`features.Summary` today and is not invented here — animation frame counts
+arrive with deferred animation/demux APIs. Fields, in order:
+
+- `int32_t file_kind;` — Zig `file_kind: FileKind`. Values are the explicit
+  header constants `ZWEBP_FILE_KIND_SIMPLE = 0`,
+  `ZWEBP_FILE_KIND_EXTENDED = 1` — fixed in `zwebp.h`, never derived from
+  Zig `FileKind` ordinals; a unit test pins the C-constant → Zig mapping;
+- `bool has_format;` + `int32_t format_kind;` — Zig `format: ?FormatKind`.
+  When `has_format` is clear, `format_kind` is ignored. When set, values are
+  `ZWEBP_FORMAT_KIND_LOSSY = 0`, `ZWEBP_FORMAT_KIND_LOSSLESS = 1` — fixed
+  in `zwebp.h`, never derived from Zig `FormatKind` ordinals; a unit test
+  pins the mapping. These are **bitstream** kind constants, distinct from
+  the pixel-order `ZWEBP_FORMAT_*` constants on `zwebp_buffer` /
+  `zwebp_image_view` (no shared namespace / no `ZWEBP_CODEC_*` alias);
+- `uint32_t width; uint32_t height;` — Zig `canvas` dimensions;
+- `bool has_alpha;` / `bool is_animation;` — Zig flags;
+- metadata presence bits mirroring `metadata.Presence` (ICCP/EXIF/XMP) as
+  individual `bool` fields or an explicit bitset published in the header
+  (implementation picks one shape and freezes it; either way the bit
+  meanings are appended-only);
+- `uint32_t chunk_count;` — Zig `chunk_count: u32`.
+
+Invalid `file_kind` / `format_kind` discriminants on **inputs** that accept
+these enums follow decision 4's enum-validation rule
+(`ZWEBP_ERROR_INVALID_ARGUMENT`). As a probe **result**, the library only
+writes published constants.
 
 **Rationale.** Matches the Zig probe's "by value, nothing to free"
 contract and stays honest about what `parseFeatures` actually returns.
+Pinning `ZWEBP_FILE_KIND_*` / `ZWEBP_FORMAT_KIND_*` separately from pixel
+`ZWEBP_FORMAT_*` keeps C callers stable across Zig enum churn without
+colliding byte-order constants.
 
 **Rejected.** Exporting chunk offsets in the probe result (that is demux
-detail; see decision 10).
+detail; see decision 10). Deriving feature file/format kind numbers from
+Zig enum ordinals. Reusing pixel `ZWEBP_FORMAT_*` or encoder
+`ZWEBP_CODEC_*` names for bitstream format kind.
 
 #### 7. Artifact and build
 
@@ -934,7 +979,11 @@ the C ABI ships):
 4. **Error-map exhaustiveness** — for each exported C wrapper, a test
    (comptime preference, else unit) proves the Zig→C status map covers that
    wrapper's reachable `errors.Error` set, and a separate case proves the
-   reserved unmapped-error fallback code/category/name.
+   reserved unmapped-error fallback code/category/name. The same gate (or a
+   sibling unit test) pins the published C-constant → Zig mappings for
+   `ZWEBP_ERROR_CATEGORY_*`, `ZWEBP_FORMAT_*` (pixel), `ZWEBP_FILE_KIND_*`,
+   and `ZWEBP_FORMAT_KIND_*` (bitstream) so Zig enum reorder cannot silently
+   change C numbers.
 5. **`struct_size` directionality** (option/config only; `zwebp_limits` is
    fixed and out of scope) — tests cover (a) older/smaller prefix accepted
    with defaulted tail fields, (b) oversized/unknown size rejected without
@@ -968,15 +1017,18 @@ soname / C major bumps only on C-breaking changes (removed entry points,
 changed signatures, reused or renumbered published error codes, changing
 `zwebp_error_category` or `zwebp_error_name` for a published code,
 shrinking/reordering a recognized option/config `struct_size`
-prefix, changing the fixed `zwebp_limits` layout, or changing the
-directional size / nested-limits rules in decision 5). Published error metadata is
-ABI-stable: reclassifying a code into a different category string, or
-renaming its stable name string, under the same numeric code is C-breaking
-(callers may switch on category/name, not only on the number).
-Non-breaking: appending C error codes for newly reachable Zig errors
-(with new category/name entries for those new codes only); appending
-struct fields under decision 5's newer-library-defaults-absent-tail /
-older-library-may-reject-larger rules.
+prefix, changing the fixed `zwebp_limits` or `zwebp_features` layout, or changing the
+directional size / nested-limits rules in decision 5). Published error metadata is ABI-stable: reclassifying a code into a
+different `ZWEBP_ERROR_CATEGORY_*` value, or renaming its stable
+`zwebp_error_name` string, under the same numeric status code is
+C-breaking (callers may switch on category/name, not only on the status
+number). Likewise, renumbering or reusing `ZWEBP_ERROR_CATEGORY_*`,
+`ZWEBP_FORMAT_*`, `ZWEBP_FILE_KIND_*`, or `ZWEBP_FORMAT_KIND_*` constants
+is C-breaking. Non-breaking: appending C error codes for newly reachable
+Zig errors (with category/name entries for those new codes only);
+appending new category or enum constants only when paired with new
+codes/fields that need them; appending struct fields under decision 5's
+newer-library-defaults-absent-tail / older-library-may-reject-larger rules.
 Implementing or evolving the C layer does not silently extend the Zig 1.x
 compatibility promise to an unimplemented surface — C stability starts
 when the C ABI is released.
