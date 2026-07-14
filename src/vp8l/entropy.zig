@@ -128,30 +128,6 @@ fn decodeImage(
 const PrefixCodeSelector = union(enum) {
     single: image_data.PrefixCodeGroup,
     spatial: SpatialPrefixCodeSelector,
-
-    fn group(
-        self: PrefixCodeSelector,
-        dimensions: image.Dimensions,
-        output_index: usize,
-    ) errors.Error!image_data.PrefixCodeGroup {
-        assert(output_index < try dimensions.pixelCount());
-
-        return switch (self) {
-            .single => |prefix_codes| prefix_codes,
-            .spatial => |spatial| {
-                const width: usize = @intCast(dimensions.width);
-                const x: u32 = @intCast(output_index % width);
-                const y: u32 = @intCast(output_index / width);
-
-                return spatial.store.groupForPixel(
-                    spatial.meta_prefix_info,
-                    spatial.entropy_image,
-                    x,
-                    y,
-                );
-            },
-        };
-    }
 };
 
 const SpatialPrefixCodeSelector = struct {
@@ -169,6 +145,30 @@ fn decodeImageWithSelector(
 ) errors.Error!DecodeSummary {
     assert(output.len == try dimensions.pixelCount());
 
+    return switch (selector) {
+        .single => |prefix_codes| if (cache) |color_cache_pointer|
+            decodeLoop(true, false, reader, dimensions, color_cache_pointer, prefix_codes, undefined, output)
+        else
+            decodeLoop(false, false, reader, dimensions, {}, prefix_codes, undefined, output),
+        .spatial => |spatial| if (cache) |color_cache_pointer|
+            decodeLoop(true, true, reader, dimensions, color_cache_pointer, undefined, spatial, output)
+        else
+            decodeLoop(false, true, reader, dimensions, {}, undefined, spatial, output),
+    };
+}
+
+fn decodeLoop(
+    comptime has_cache: bool,
+    comptime spatial: bool,
+    reader: *bit_reader.BitReader,
+    dimensions: image.Dimensions,
+    cache: if (has_cache) *color_cache.Cache else void,
+    single_codes: if (spatial) void else image_data.PrefixCodeGroup,
+    spatial_selector: if (spatial) SpatialPrefixCodeSelector else void,
+    output: []pixel.Pixel,
+) errors.Error!DecodeSummary {
+    assert(output.len == try dimensions.pixelCount());
+
     var summary = DecodeSummary{
         .pixel_count = 0,
         .literal_count = 0,
@@ -176,19 +176,39 @@ fn decodeImageWithSelector(
         .color_cache_count = 0,
     };
 
+    const width: u32 = dimensions.width;
+    var prefix_codes: image_data.PrefixCodeGroup = if (spatial) undefined else single_codes;
+    var run_remaining: u32 = 0;
+
     var output_index: usize = 0;
     while (output_index < output.len) {
-        const prefix_codes = try selector.group(dimensions, output_index);
+        if (spatial and run_remaining == 0) {
+            const x: u32 = @intCast(output_index % @as(usize, width));
+            const y: u32 = @intCast(output_index / @as(usize, width));
+            prefix_codes = try spatial_selector.store.groupForPixel(
+                spatial_selector.meta_prefix_info,
+                spatial_selector.entropy_image,
+                x,
+                y,
+            );
+            const block_size = spatial_selector.meta_prefix_info.block_size;
+            const into_tile = x & (block_size - 1);
+            run_remaining = @min(block_size - into_tile, width - x);
+            assert(run_remaining > 0);
+        }
+
         const green_symbol = try prefix_codes.green.decode(reader);
         if (green_symbol < huffman.literal_alphabet_size) {
             const value = try readLiteral(reader, prefix_codes, green_symbol);
             output[output_index] = value;
-            if (cache) |color_cache_pointer| color_cache_pointer.insert(value);
+            if (has_cache) cache.insert(value);
 
             output_index += 1;
+            if (spatial) run_remaining -= 1;
             summary.literal_count += 1;
         } else if (green_symbol < huffman.literal_alphabet_size + huffman.length_code_count) {
             output_index = try copyBackwardReference(
+                has_cache,
                 reader,
                 dimensions,
                 prefix_codes,
@@ -197,12 +217,15 @@ fn decodeImageWithSelector(
                 output_index,
                 green_symbol,
             );
+            if (spatial) run_remaining = 0;
             summary.copy_count += 1;
         } else {
+            if (!has_cache) return error.InvalidVP8LImageData;
             const value = try readColorCachePixel(green_symbol, cache);
             output[output_index] = value;
 
             output_index += 1;
+            if (spatial) run_remaining -= 1;
             summary.color_cache_count += 1;
         }
     }
@@ -239,10 +262,11 @@ fn readChannel(
 }
 
 fn copyBackwardReference(
+    comptime has_cache: bool,
     reader: *bit_reader.BitReader,
     dimensions: image.Dimensions,
     prefix_codes: image_data.PrefixCodeGroup,
-    cache: ?*color_cache.Cache,
+    cache: if (has_cache) *color_cache.Cache else void,
     output: []pixel.Pixel,
     output_index_start: usize,
     green_symbol: u16,
@@ -266,31 +290,59 @@ fn copyBackwardReference(
     if (distance > output_index_start) return error.InvalidVP8LImageData;
 
     const distance_pixels: usize = @intCast(distance);
+    const length_pixels: usize = @intCast(length);
     assert(distance_pixels > 0);
     assert(distance_pixels <= output_index_start);
+    assert(length_pixels > 0);
+    assert(output_index_start + length_pixels <= output.len);
 
-    var output_index = output_index_start;
-    var copied_count: u32 = 0;
-    while (copied_count < length) : (copied_count += 1) {
-        const value = output[output_index - distance_pixels];
-        output[output_index] = value;
-        if (cache) |color_cache_pointer| color_cache_pointer.insert(value);
-        output_index += 1;
+    if (has_cache) {
+        var output_index = output_index_start;
+        var copied_count: usize = 0;
+        while (copied_count < length_pixels) : (copied_count += 1) {
+            const value = output[output_index - distance_pixels];
+            output[output_index] = value;
+            cache.insert(value);
+            output_index += 1;
+        }
+        return output_index;
     }
 
-    return output_index;
+    const dst = output[output_index_start..][0..length_pixels];
+    if (distance_pixels == 1) {
+        @memset(dst, output[output_index_start - 1]);
+    } else if (distance_pixels >= length_pixels) {
+        const src = output[output_index_start - distance_pixels ..][0..length_pixels];
+        // Validated distance/length guarantee the ranges are disjoint (adjacent at most).
+        assert(output_index_start - distance_pixels + length_pixels <= output_index_start);
+        @memcpy(dst, src);
+    } else {
+        var remaining = length_pixels;
+        var output_index = output_index_start;
+        while (remaining > 0) {
+            const chunk = @min(distance_pixels, remaining);
+            const src = output[output_index - distance_pixels ..][0..chunk];
+            const chunk_dst = output[output_index..][0..chunk];
+            // Each chunk length is <= distance, so source ends at or before dest start.
+            assert(output_index - distance_pixels + chunk <= output_index);
+            @memcpy(chunk_dst, src);
+            output_index += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    return output_index_start + length_pixels;
 }
 
 fn readColorCachePixel(
     green_symbol: u16,
-    cache: ?*color_cache.Cache,
+    cache: *color_cache.Cache,
 ) errors.Error!pixel.Pixel {
-    const color_cache_pointer = cache orelse return error.InvalidVP8LImageData;
     const cache_index: u16 = green_symbol -
         huffman.literal_alphabet_size -
         huffman.length_code_count;
 
-    return color_cache_pointer.lookup(cache_index);
+    return cache.lookup(cache_index);
 }
 
 fn writeSimplePrefixCode(writer: *bit_writer.BitWriter, symbol: u8) errors.Error!void {
@@ -345,6 +397,26 @@ fn twoSymbolTable(
         .{0} ** huffman.green_alphabet_size_max;
     code_lengths[symbol0] = 1;
     code_lengths[symbol1] = 1;
+
+    return huffman.SymbolTable.build(entries, code_lengths[0..alphabet_size]);
+}
+
+fn threeSymbolTable(
+    entries: []huffman.Entry,
+    symbol0: u16,
+    symbol1: u16,
+    symbol2: u16,
+    alphabet_size: u16,
+) errors.Error!huffman.SymbolTable {
+    assert(symbol0 < symbol1);
+    assert(symbol1 < symbol2);
+    assert(symbol2 < alphabet_size);
+
+    var code_lengths: [huffman.green_alphabet_size_max]u8 =
+        .{0} ** huffman.green_alphabet_size_max;
+    code_lengths[symbol0] = 1;
+    code_lengths[symbol1] = 2;
+    code_lengths[symbol2] = 2;
 
     return huffman.SymbolTable.build(entries, code_lengths[0..alphabet_size]);
 }
@@ -567,4 +639,384 @@ test "VP8L entropy rejects meta-prefix groups that were not read" {
             &output,
         ),
     );
+}
+
+fn cloneSymbolTable(
+    gpa: std.mem.Allocator,
+    table: huffman.SymbolTable,
+) errors.Error!huffman.SymbolTable {
+    const entries = try gpa.alloc(huffman.Entry, table.entries.len);
+    errdefer gpa.free(entries);
+    @memcpy(entries, table.entries);
+    return .{
+        .entries = entries,
+        .single_symbol = table.single_symbol,
+    };
+}
+
+fn clonePrefixCodeGroup(
+    gpa: std.mem.Allocator,
+    group: image_data.PrefixCodeGroup,
+) errors.Error!image_data.PrefixCodeGroup {
+    var copied: image_data.PrefixCodeGroup = undefined;
+    copied.green = try cloneSymbolTable(gpa, group.green);
+    errdefer gpa.free(copied.green.entries);
+    copied.red = try cloneSymbolTable(gpa, group.red);
+    errdefer gpa.free(copied.red.entries);
+    copied.blue = try cloneSymbolTable(gpa, group.blue);
+    errdefer gpa.free(copied.blue.entries);
+    copied.alpha = try cloneSymbolTable(gpa, group.alpha);
+    errdefer gpa.free(copied.alpha.entries);
+    copied.distance = try cloneSymbolTable(gpa, group.distance);
+    return copied;
+}
+
+fn testGroupStore(
+    gpa: std.mem.Allocator,
+    groups: []const image_data.PrefixCodeGroup,
+) errors.Error!prefix_groups.Store {
+    const owned = try gpa.alloc(image_data.PrefixCodeGroup, groups.len);
+    errdefer gpa.free(owned);
+
+    var store = prefix_groups.Store{
+        .gpa = gpa,
+        .groups = owned,
+        .initialized_count = 0,
+    };
+    errdefer store.deinit();
+
+    for (groups, 0..) |group, index| {
+        store.groups[index] = try clonePrefixCodeGroup(gpa, group);
+        store.initialized_count += 1;
+    }
+
+    return store;
+}
+
+test "VP8L entropy no-cache distance-one copy fills a run" {
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try twoSymbolTable(
+            &buffers.green_entries,
+            7,
+            huffman.literal_alphabet_size + 2,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 2, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 3, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 4, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            1,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    var encoded: [1]u8 = undefined;
+    var writer = bit_writer.BitWriter.init(&encoded);
+    try writer.writeBit(0);
+    try writer.writeBit(1);
+
+    var reader = bit_reader.BitReader.init(try writer.finish());
+    var output: [4]pixel.Pixel = undefined;
+    const summary = try decodeWithPrefixCodes(
+        &reader,
+        try image.Dimensions.init(4, 1),
+        null,
+        prefix_codes,
+        &output,
+    );
+
+    const expected = pixel.fromChannels(4, 2, 7, 3);
+    try std.testing.expectEqual(@as(u64, 4), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.copy_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.color_cache_count);
+    for (output) |value| {
+        try std.testing.expectEqual(expected, value);
+    }
+}
+
+test "VP8L entropy no-cache overlapping copy repeats prior pixels" {
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try threeSymbolTable(
+            &buffers.green_entries,
+            5,
+            7,
+            huffman.literal_alphabet_size + 3,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 2, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 3, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 4, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            4,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    // Green codes: 5=0, 7=01, length=11; distance prefix 4 + extra 1 => distance 2.
+    var encoded: [1]u8 = undefined;
+    var writer = bit_writer.BitWriter.init(&encoded);
+    try writer.writeBit(0); // literal A (green 5)
+    try writer.writeBit(1); // literal B (green 7)
+    try writer.writeBit(0);
+    try writer.writeBit(1); // length 4
+    try writer.writeBit(1);
+    try writer.writeBit(1); // distance_code 6 -> distance 2
+
+    var reader = bit_reader.BitReader.init(try writer.finish());
+    var output: [6]pixel.Pixel = undefined;
+    const summary = try decodeWithPrefixCodes(
+        &reader,
+        try image.Dimensions.init(6, 1),
+        null,
+        prefix_codes,
+        &output,
+    );
+
+    const expected_a = pixel.fromChannels(4, 2, 5, 3);
+    const expected_b = pixel.fromChannels(4, 2, 7, 3);
+    try std.testing.expectEqual(@as(u64, 6), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.copy_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.color_cache_count);
+    try std.testing.expectEqual(expected_a, output[0]);
+    try std.testing.expectEqual(expected_b, output[1]);
+    try std.testing.expectEqual(expected_a, output[2]);
+    try std.testing.expectEqual(expected_b, output[3]);
+    try std.testing.expectEqual(expected_a, output[4]);
+    try std.testing.expectEqual(expected_b, output[5]);
+}
+
+test "VP8L entropy no-cache disjoint copy memcpy reproduces source pixels" {
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try threeSymbolTable(
+            &buffers.green_entries,
+            5,
+            7,
+            huffman.literal_alphabet_size + 1,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 2, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 3, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 4, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            4,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    // Green codes: 5=0, 7=01, length=11; distance prefix 4 + extra 1 => distance 2 (>= length 2).
+    var encoded: [1]u8 = undefined;
+    var writer = bit_writer.BitWriter.init(&encoded);
+    try writer.writeBit(0); // literal A (green 5)
+    try writer.writeBit(1); // literal B (green 7)
+    try writer.writeBit(0);
+    try writer.writeBit(1); // length 2
+    try writer.writeBit(1);
+    try writer.writeBit(1); // distance 2 >= length 2
+
+    var reader = bit_reader.BitReader.init(try writer.finish());
+    var output: [4]pixel.Pixel = undefined;
+    const summary = try decodeWithPrefixCodes(
+        &reader,
+        try image.Dimensions.init(4, 1),
+        null,
+        prefix_codes,
+        &output,
+    );
+
+    const expected_a = pixel.fromChannels(4, 2, 5, 3);
+    const expected_b = pixel.fromChannels(4, 2, 7, 3);
+    try std.testing.expectEqual(@as(u64, 4), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.copy_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.color_cache_count);
+    try std.testing.expectEqual(expected_a, output[0]);
+    try std.testing.expectEqual(expected_b, output[1]);
+    try std.testing.expectEqual(expected_a, output[2]);
+    try std.testing.expectEqual(expected_b, output[3]);
+}
+
+test "VP8L entropy no-cache rejects color-cache symbols" {
+    const cache_symbol = huffman.literal_alphabet_size + huffman.length_code_count;
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(
+            &buffers.green_entries,
+            cache_symbol,
+            huffman.literal_alphabet_size + huffman.length_code_count + 1,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 0, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 0, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 0, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            0,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    var reader = bit_reader.BitReader.init(&.{});
+    var output: [1]pixel.Pixel = undefined;
+    try std.testing.expectError(
+        error.InvalidVP8LImageData,
+        decodeWithPrefixCodes(
+            &reader,
+            try image.Dimensions.init(1, 1),
+            null,
+            prefix_codes,
+            &output,
+        ),
+    );
+}
+
+test "VP8L entropy spatial decode switches groups at tile boundaries" {
+    var buffers0: image_data.PrefixCodeGroupBuffers = .{};
+    var buffers1: image_data.PrefixCodeGroupBuffers = .{};
+    const group0 = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(&buffers0.green_entries, 0, huffman.literal_alphabet_size + huffman.length_code_count),
+        .red = try singleSymbolTable(&buffers0.red_entries, 0, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers0.blue_entries, 0, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers0.alpha_entries, 0, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(&buffers0.distance_entries, 0, huffman.distance_alphabet_size),
+    };
+    const group1 = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(&buffers1.green_entries, 1, huffman.literal_alphabet_size + huffman.length_code_count),
+        .red = try singleSymbolTable(&buffers1.red_entries, 0, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers1.blue_entries, 0, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers1.alpha_entries, 0, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(&buffers1.distance_entries, 0, huffman.distance_alphabet_size),
+    };
+
+    var store = try testGroupStore(std.testing.allocator, &.{ group0, group1 });
+    defer store.deinit();
+
+    const info = meta_prefix.Info{
+        .prefix_bits = 2,
+        .block_size = 4,
+        .image_dimensions = try image.Dimensions.init(8, 1),
+        .entropy_dimensions = try image.Dimensions.init(2, 1),
+        .group_count = 2,
+    };
+    const entropy_image = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 0, 0),
+        pixel.fromChannels(0, 0, 1, 0),
+    };
+
+    var image_reader = bit_reader.BitReader.init(&.{});
+    var output: [8]pixel.Pixel = undefined;
+    const summary = try decodeWithGroupStore(
+        &image_reader,
+        try image.Dimensions.init(8, 1),
+        null,
+        store,
+        info,
+        &entropy_image,
+        &output,
+    );
+
+    try std.testing.expectEqual(@as(u64, 8), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 8), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.copy_count);
+    for (output[0..4]) |value| {
+        try std.testing.expectEqual(pixel.fromChannels(0, 0, 0, 0), value);
+    }
+    for (output[4..8]) |value| {
+        try std.testing.expectEqual(pixel.fromChannels(0, 0, 1, 0), value);
+    }
+}
+
+test "VP8L entropy spatial decode refetches after a cross-row copy" {
+    var buffers0: image_data.PrefixCodeGroupBuffers = .{};
+    var buffers1: image_data.PrefixCodeGroupBuffers = .{};
+    const group0 = image_data.PrefixCodeGroup{
+        .green = try twoSymbolTable(
+            &buffers0.green_entries,
+            5,
+            huffman.literal_alphabet_size + 2,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers0.red_entries, 1, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers0.blue_entries, 2, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers0.alpha_entries, 3, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers0.distance_entries,
+            1,
+            huffman.distance_alphabet_size,
+        ),
+    };
+    const group1 = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(
+            &buffers1.green_entries,
+            9,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers1.red_entries, 4, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers1.blue_entries, 5, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers1.alpha_entries, 6, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers1.distance_entries,
+            0,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    var store = try testGroupStore(std.testing.allocator, &.{ group0, group1 });
+    defer store.deinit();
+
+    // block_size 4 needs height > 4 for a second entropy row. Rows 0..3 use group 0;
+    // row 4 uses group 1.
+    const info = meta_prefix.Info{
+        .prefix_bits = 2,
+        .block_size = 4,
+        .image_dimensions = try image.Dimensions.init(4, 5),
+        .entropy_dimensions = try image.Dimensions.init(1, 2),
+        .group_count = 2,
+    };
+    const entropy_image = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 0, 0),
+        pixel.fromChannels(0, 0, 1, 0),
+    };
+
+    // 15 literals fill indices 0..14; a length-3 distance-1 copy starts at the last
+    // pixel of tile-row 3 (index 15) and continues into row 4. Remaining row-4 pixels
+    // are literals from group 1, proving the post-copy refetch.
+    var encoded: [2]u8 = undefined;
+    var writer = bit_writer.BitWriter.init(&encoded);
+    var literal_index: usize = 0;
+    while (literal_index < 15) : (literal_index += 1) {
+        try writer.writeBit(0);
+    }
+    try writer.writeBit(1);
+
+    var image_reader = bit_reader.BitReader.init(try writer.finish());
+    var output: [20]pixel.Pixel = undefined;
+    const summary = try decodeWithGroupStore(
+        &image_reader,
+        try image.Dimensions.init(4, 5),
+        null,
+        store,
+        info,
+        &entropy_image,
+        &output,
+    );
+
+    const from_group0 = pixel.fromChannels(3, 1, 5, 2);
+    const from_group1 = pixel.fromChannels(6, 4, 9, 5);
+    try std.testing.expectEqual(@as(u64, 20), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 17), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.copy_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.color_cache_count);
+
+    for (output[0..18]) |value| {
+        try std.testing.expectEqual(from_group0, value);
+    }
+    try std.testing.expectEqual(from_group1, output[18]);
+    try std.testing.expectEqual(from_group1, output[19]);
 }
