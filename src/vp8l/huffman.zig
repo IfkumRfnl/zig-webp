@@ -634,3 +634,55 @@ test "VP8L Huffman table reports bounded table buffers and truncated input" {
     var empty = bit_reader.BitReader.init(&.{});
     try std.testing.expectEqual(@as(u16, 2), try single.decode(&empty));
 }
+
+test "VP8L Huffman compact Entry keeps distinct absolute subtable offsets" {
+    // Goal: after packing symbol/subtable into one u16 payload, two root
+    // `.table` entries must carry different absolute offsets. A tree with
+    // 254 length-8 symbols and 4 length-9 symbols is complete (Kraft = 1)
+    // and spreads the long codes across at least two root prefixes.
+    const bit_writer = @import("../bit_writer.zig");
+
+    var code_lengths: [258]u8 = undefined;
+    @memset(code_lengths[0..254], 8);
+    @memset(code_lengths[254..], 9);
+
+    var entries: [SymbolTable.entry_count_limit]Entry = undefined;
+    const table = try SymbolTable.build(&entries, &code_lengths);
+
+    var offsets: [8]u16 = undefined;
+    var offset_count: usize = 0;
+    for (table.entries[0..SymbolTable.root_entry_count_max]) |root_entry| {
+        if (root_entry.op != .table) continue;
+
+        const offset = root_entry.tableOffset();
+        try std.testing.expect(offset >= SymbolTable.root_entry_count_max);
+        try std.testing.expect(root_entry.bits > 0);
+
+        var seen = false;
+        for (offsets[0..offset_count]) |existing| {
+            if (existing == offset) seen = true;
+        }
+        if (!seen) {
+            try std.testing.expect(offset_count < offsets.len);
+            offsets[offset_count] = offset;
+            offset_count += 1;
+        }
+    }
+    try std.testing.expect(offset_count >= 2);
+    try std.testing.expect(offsets[0] != offsets[1]);
+
+    // Every length-9 symbol must decode from a second-level table.
+    var found = [_]bool{false} ** 4;
+    var pattern: u32 = 0;
+    while (pattern < 512) : (pattern += 1) {
+        var encoded: [2]u8 = undefined;
+        var writer = bit_writer.BitWriter.init(&encoded);
+        try writer.writeBits(pattern, 9);
+        var reader = bit_reader.BitReader.init(try writer.finish());
+        const symbol = table.decode(&reader) catch continue;
+        if (symbol >= 254 and symbol <= 257) {
+            found[symbol - 254] = true;
+        }
+    }
+    try std.testing.expect(found[0] and found[1] and found[2] and found[3]);
+}

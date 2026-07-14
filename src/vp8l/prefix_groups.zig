@@ -280,6 +280,19 @@ test "VP8L prefix group store enforces group and allocation limits" {
     );
 }
 
+test "VP8L compact Huffman Entry allocation charges four bytes per entry" {
+    // Contract after Entry 6→4 densification: one 8-bit root table is 1KB,
+    // and allocationBytes must track that size (not the former 1536).
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(huffman.Entry));
+    try std.testing.expectEqual(
+        @as(usize, 1024),
+        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max,
+    );
+    try std.testing.expect(
+        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max < 1536,
+    );
+}
+
 test "VP8L prefix group store cleans up partial group copies on limit failure" {
     var encoded: [16]u8 = undefined;
     var writer = bit_writer.BitWriter.init(&encoded);

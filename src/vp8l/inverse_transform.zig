@@ -1114,6 +1114,46 @@ test "VP8L inverse predictor transform catches right-edge top-right tile errors"
     try expectPixelsEqual(&reference, &optimized);
 }
 
+test "VP8L inverse transforms match reference at max block_bits with partial tiles" {
+    // Format allows block_bits up to 9 (block_size 512). Pin the large-shift
+    // tile-run path for both predictor and color when the image is smaller
+    // than one tile (width/height not multiples of block_size).
+    var prng = std.Random.DefaultPrng.init(0x626c6b39);
+    const random = prng.random();
+
+    const width: u32 = 17;
+    const height: u32 = 9;
+    const block_bits: u4 = transform.block_bits_max;
+    const dimensions = try image.Dimensions.init(width, height);
+    const block_transform = try makeBlockTransform(width, height, block_bits);
+    try std.testing.expectEqual(@as(u32, 1), block_transform.image.width);
+    try std.testing.expectEqual(@as(u32, 1), block_transform.image.height);
+
+    const pixel_count = try dimensions.pixelCount();
+    var residual: [17 * 9]pixel.Pixel = undefined;
+    var optimized: [17 * 9]pixel.Pixel = undefined;
+    var reference: [17 * 9]pixel.Pixel = undefined;
+    fillRandomPixels(random, residual[0..pixel_count]);
+
+    var mode: u8 = 0;
+    while (mode < predictor_mode_count) : (mode += 1) {
+        const predictor_data = [_]pixel.Pixel{pixel.fromChannels(0, 0, mode, 0)};
+        @memcpy(optimized[0..pixel_count], residual[0..pixel_count]);
+        @memcpy(reference[0..pixel_count], residual[0..pixel_count]);
+        try applyPredictorTransform(block_transform, &predictor_data, dimensions, optimized[0..pixel_count]);
+        try applyPredictorTransformReference(block_transform, &predictor_data, dimensions, reference[0..pixel_count]);
+        try expectPixelsEqual(reference[0..pixel_count], optimized[0..pixel_count]);
+    }
+
+    var color_data = [_]pixel.Pixel{undefined};
+    fillRandomPixels(random, &color_data);
+    @memcpy(optimized[0..pixel_count], residual[0..pixel_count]);
+    @memcpy(reference[0..pixel_count], residual[0..pixel_count]);
+    try applyColorTransform(block_transform, &color_data, dimensions, optimized[0..pixel_count]);
+    try applyColorTransformReference(block_transform, &color_data, dimensions, reference[0..pixel_count]);
+    try expectPixelsEqual(reference[0..pixel_count], optimized[0..pixel_count]);
+}
+
 test "VP8L inverse color transform matches reference across tiles and odd widths" {
     var prng = std.Random.DefaultPrng.init(0x434f4c52);
     const random = prng.random();
