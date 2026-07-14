@@ -54,7 +54,7 @@ below and can be turned into plans on request.
 | 021 | VP8L bit reader: bulk 64-bit refill + unchecked fast path, byte-exact | P1 | M | 020 (soft) | TODO |
 | 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft) | TODO |
 | 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | TODO |
-| 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | TODO |
+| 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | REJECTED for merge — all-lossy 1.0287×–1.0375× straddles 1.03×; IDCT omitted on draft `perf/vp8-idct-prediction-simd`; prediction untouched |
 | 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
 | 026 | Luma SSIM column in the lossy encode report | P3 | S | — | TODO |
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
@@ -62,6 +62,30 @@ below and can be turned into plans on request.
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-14** — Cumulative draft PR #103 rebased onto main after #100/#101
+  squash-merges. Conservative cut through compact Huffman `fbe738c`: plan
+  **024** vector IDCT (`e9254a3`) omitted because all-lossy
+  **1.0287×–1.0375×** straddled the 1.03× gate. Focused Huffman
+  multi-subtable / 4-byte allocation and max-`block_bits` tile-run
+  equivalence tests retained on the draft head.
+
+- **2026-07-11** — Compact VP8L Huffman `Entry` accepted at `fbe738c`
+  (`Entry` **6→4** bytes, **33%** denser; 8-bit root **1.5KB→1KB**). Two
+  serial 135-file ReleaseFast comparisons vs `e45fafd` base: lossless
+  opaque **1.0908×**/**1.0935×**, lossless alpha **1.3504×**/**1.3627×**,
+  lossy opaque **0.9911×**/**0.9897×** (noise), lossy alpha
+  **1.1011×**/**1.1170×** (ALPH uses VP8L). **135** validated; focused
+  **11+5**; root compile; CI; wasm. Gains are a **small-heavy aggregate**;
+  large-file variance exists (`photo_foliage` ~**0.99×**,
+  `lossless_big_random_alpha` **0.985–1.070×**). Rejected 10-bit root
+  experiment `391f449` (+**3072** bytes/non-single table, +**15360**
+  five-table scratch): lossless opaque **0.9620×**, alpha **0.9261×** vs
+  accepted 8-bit compact base → **reject / no merge**; tests **481** pass.
+  No general `image-webp` beat; accepted draft production cut is compact
+  Huffman `fbe738c` (tile-run transforms retained). Plan **024** IDCT was
+  omitted from the cumulative draft because all-lossy straddled the 1.03×
+  gate.
 
 - **2026-07-09** — Plan 014 (wasm32 build spike) executed on branch
   `wasm32-spike`. Drift vs `4c5572a`: `ci.yml` gained plan-013 BE/macOS

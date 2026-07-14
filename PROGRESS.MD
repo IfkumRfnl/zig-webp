@@ -134,6 +134,74 @@ Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms`
 
 ## Recently Completed
 
+### 2026-07-14 — Plan 024 IDCT omitted from cumulative draft (conservative cut)
+
+Plan 024 measured an attribution-gated `@Vector(4, i32)` inverse DCT on
+`e9254a3` after plan 023. Coarse ReleaseFast stage profile: inverse
+**7.7%**, prediction **5.8%**, combined **13.5%** → gate PROCEED; named
+predictors stayed below the ~2% vectorize threshold so prediction was left
+scalar. Two serial all-lossy orderings vs `fbe738c` were **1.0375×** then
+**1.0287×**, straddling the plan's **1.03×** default-merge gate (lossy alpha
+**1.0184×–1.0256×** below gate in both orderings).
+
+Draft PR #103 therefore takes the **conservative production cut through
+`fbe738c`**: vector IDCT is not retained on this rebased head, so production
+`addInverseDct` remains the scalar path. The spike measurements stay on
+record below; the vector implementation is omitted from this draft.
+
+### 2026-07-11 — Compact VP8L Huffman `Entry` (accepted) + rejected 10-bit root
+
+Accepted compact Huffman payload at `fbe738c` (base of the plan-024 stack):
+`Entry` **6→4** bytes (**33%** denser; 8-bit root table **1.5KB→1KB**) by
+packing symbol / subtable offset into one `u16` discriminated by `op`, without
+changing table geometry. Rejected follow-on experiment `391f449` (branch
+`perf/vp8l-huffman-root10`) widened the primary root to **10** bits (+**3072**
+bytes per non-single table; +**15360** five-table scratch) but lost speed vs
+the accepted 8-bit compact base → **reject / no merge**. Accepted production cut for the cumulative draft is compact Huffman
+`fbe738c` (tile-run transforms retained; plan-024 IDCT `e9254a3` omitted);
+**no** general `image-webp` beat claimed.
+
+- **Correctness (accepted `fbe738c`).** **135/135** decode-into validated;
+  focused Huffman **11+5**; root compile; `zig build ci`;
+  `zig build wasm-check`; byte-exact corpus hashes.
+- **Speed (accepted `fbe738c`; ReleaseFast, AMD EPYC 7663, single thread;
+  two serial 135-file orderings of direct Zig medians vs `e45fafd` /
+  tile-run base; `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque
+  **1.0908×** / **1.0935×**; lossless alpha **1.3504×** / **1.3627×**;
+  lossy opaque **0.9911×** / **0.9897×** (noise); lossy alpha **1.1011×** /
+  **1.1170×** (ALPH uses VP8L). Gains are a **small-heavy aggregate**;
+  large-file variance exists (`photo_foliage.webp` ~**0.99×**,
+  `lossless_big_random_alpha.webp` **0.985×–1.070×**).
+- **Rejected `391f449`.** vs accepted 8-bit compact base: lossless opaque
+  **0.9620×**, lossless alpha **0.9261×** → slower; tests **481** pass;
+  **not** merged.
+
+### 2026-07-11 — VP8L predictor/color inverse transforms around tile runs
+
+Tile-run rewrite of predictor and color inverse transforms in
+`src/vp8l/inverse_transform.zig` (commit `1c97839`): hoist per-tile mode /
+color lookup across horizontal runs, comptime-specialize predictor modes
+0–13, keep scalar helpers as equivalence authority, and preserve
+right-edge top-right wrapping. Color-indexing left unchanged.
+
+- **Profiler attribution (base, temporary stage timers; profiler worktree
+  clean / no commit).** Entropy remains dominant at about **66%–95%** of
+  VP8L decode. When present, predictor is about **5.8%–16%** and color
+  about **4.3%–12.7%**; transforms are absent on small vec / one-color
+  files.
+- **Correctness.** Focused inverse-transform equivalence tests pass;
+  **135/135** decode-into validation; byte-exact corpus hashes;
+  `zig build ci`; `zig build wasm-check`.
+- **Speed (ReleaseFast, AMD EPYC 7663, single thread; two serial orderings
+  of direct Zig medians vs the plan-022 / constant-base reverse TSV;
+  `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque about
+  **1.046×–1.065×**; lossless alpha about **1.015×–1.031×**.
+  Representatives: `photo_foliage.webp` ~**1.04×–1.05×**,
+  `photo_portrait.webp` ~**1.12×–1.13×**,
+  `lossless_big_random_alpha.webp` ~**1.09×–1.17×**,
+  `lossless1.webp` ~**1.016×**. Entropy remains the bottleneck; this is
+  **not** a general codec speed claim.
+
 ### 2026-07-13 — Plan 017: `zig-webp-info` container-probe CLI
 
 Delivered `tools/zig-webp-info.zig` (`zig build info`, installed as
@@ -1362,6 +1430,9 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-06-26 | VP8 boolean-reader renormalization (slice 10c): 1.20× lossy decode, byte-exact | Replaces the VP8 bool reader's one-shift-at-a-time renormalization loop with a compile-time 128-entry shift-count table plus one bulk shift/load step. The arithmetic split and lazy truncation behavior are unchanged; this only removes per-bit loop overhead in the entropy hot path used by mode parsing and coefficient token decode. **Bit-exact (CI gate, `zig build test`):** the full suite and committed corpus-hash regression pass. **Speed (local, ReleaseFast, single thread, same benchmark harness):** aggregate lossy decode **1.20×** (699.5→583.3 ms over 88 lossy stills on this machine), `bryce` **563.1→475.5 ms** (local ratio vs `dwebp -pam` ≈1.96×→≈1.65×), `vp80-00-comprehensive-008` **10.03→8.84 ms**, `lossy_extreme_probabilities` **15.6→9.8 ms**. Lossless decode is unchanged in substance because VP8L does not use this reader. Rejected in the same investigation: scalar loop-filter index reshaping (byte-exact, no measurable win) and a dedicated probability-128 `readBit` path (slightly slower). Remaining lossy levers are loop-filter SIMD/lookup tables, row-pipeline locality, and threading. |
 | 2026-07-11 | Optional `image-webp` decode-into bench + plan 022 specialized VP8L loop (plan 021 rejected) | Optional local `tools/webp-rust-bench.sh` compares Zig `decode-into` to a caller-owned `image-webp` adapter under `.zig-cache/` (SKIP when `cargo`/`references/image-webp` absent). Full still set: **135 validated, 0 skips**. Plan 021 bulk-refill measured ~**1.011×** aggregate lossless and was **not** included. Plan 022 specializes `src/vp8l/entropy.zig` (hoisted tile-run group lookup, comptime cache/selector variants, no-cache LZ77 `@memset`/`@memcpy`/chunked copies). **Bit-exact gates unchanged** (corpus hashes / focused entropy tests). **Speed (ReleaseFast, AMD EPYC 7663, single thread, interleaved A/B vs harness-only base `7f6fd22`, `--iters 5 --warmup 1 --budget-ms 500`):** lossless aggregate ~**1.05×–1.08×**, opaque ~**1.08×–1.11×**, alpha ~**1.01×–1.05×**; lossy ~flat. **Zig/`image-webp` geomean (after):** lossless opaque ~**4.0×**, lossless alpha ~**31.8×**, lossy opaque ~**1.18×**, lossy alpha ~**2.4×**. Environment-dependent; not a CI gate; not a general-win claim. |
 | 2026-07-11 | Horizontal VP8 loop-filter SIMD (plan 023; vertical left scalar) | Contiguous-lane `@Vector` horizontal edges in `src/vp8/loop_filter.zig` (comptime 8/16 lanes; scalar `doFilter2`/`4`/`6` retained). Vertical gather/transpose deliberately left scalar pending evidence. **Correctness:** asymmetric + smooth-ramp (low-HEV filter4/6) scalar-vs-SIMD equivalence tests; `zig build test` **472/472**; `zig build ci`; `zig build wasm-check`; byte-exact corpus hashes. **Speed (ReleaseFast, AMD EPYC 7663, single thread; direct Zig medians vs plan-022 base reverse TSV; `--iters 5 --warmup 1 --budget-ms 500`):** lossy opaque **1.0738×** (n=70), lossy alpha **1.0334×** (n=18), aggregate lossy **1.0654×** (n=88); `lossy_q0_f100.webp` **1.3367×**, `bryce.webp` **1.1032×**, `lossy_extreme_probabilities.webp` ~**1.0007×**. **135/135** `image-webp` comparison; remaining Zig/`image-webp` geomean ~**1.10×** lossy opaque, ~**2.39×** lossy alpha. Environment-dependent; not a CI gate; not a general-win claim. |
+| 2026-07-11 | VP8L predictor/color inverse transforms around tile runs | Tile-run rewrite of predictor/color inverse transforms in `src/vp8l/inverse_transform.zig` (commit `1c97839`; color-indexing unchanged; scalar helpers remain authority). **Profiler attribution (base, temporary stage timers; profiler worktree clean / no commit):** entropy **66%–95%**; when present predictor **5.8%–16%**, color **4.3%–12.7%**; transforms absent on small vec / one-color. **Correctness:** focused inverse-transform equivalence tests; **135/135** decode-into; byte-exact corpus hashes; `zig build ci`; `zig build wasm-check`. **Speed (ReleaseFast, AMD EPYC 7663, single thread; two serial orderings of direct Zig medians vs plan-022 / constant-base reverse TSV; `--iters 5 --warmup 1 --budget-ms 500`):** lossless opaque ~**1.046×–1.065×**, lossless alpha ~**1.015×–1.031×**; `photo_foliage` ~**1.04×–1.05×**, `photo_portrait` ~**1.12×–1.13×**, `lossless_big_random_alpha` ~**1.09×–1.17×**, `lossless1` ~**1.016×**. Entropy remains the bottleneck; environment-dependent; not a CI gate; not a general-win claim. |
+| 2026-07-14 | Plan 024 IDCT omitted from cumulative draft (conservative cut) | Spike on `e9254a3` measured all-lossy **1.0375×**/**1.0287×** vs `fbe738c` (straddles 1.03×; lossy alpha below gate). Draft PR #103 omits vector IDCT and keeps production `addInverseDct` scalar through compact Huffman `fbe738c` + tile-run transforms. Prediction untouched. Spike numbers retained in the 2026-07-11/14 narrative; no general beat. |
+| 2026-07-11 | Compact VP8L Huffman `Entry` accepted (`fbe738c`); 10-bit root rejected (`391f449`) | Accepted: `Entry` **6→4** bytes (**33%** denser; root **1.5KB→1KB**). **Correctness:** **135** validated; focused **11+5**; root compile; CI; wasm. **Speed (ReleaseFast, AMD EPYC 7663; two serial 135-file orderings vs `e45fafd`):** lossless opaque **1.0908×**/**1.0935×**, lossless alpha **1.3504×**/**1.3627×**, lossy opaque **0.9911×**/**0.9897×** (noise), lossy alpha **1.1011×**/**1.1170×** (ALPH→VP8L). Small-heavy aggregate; large-file variance (`photo_foliage` ~**0.99×**, `lossless_big_random_alpha` **0.985–1.070×**). Rejected `391f449`: +**3072** bytes/non-single table, +**15360** five-table scratch; vs accepted 8-bit base lossless opaque **0.9620×**, alpha **0.9261×** → reject/no merge; tests **481** pass. Accepted draft cut remains `fbe738c` (IDCT omitted); no general beat. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
