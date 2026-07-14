@@ -81,7 +81,8 @@ encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). Step 9 is
 complete: the manual ≥2-browser render check of the two sample animations under
 `testdata/animation/` passed in Firefox and Chromium (2026-07-08, recorded in
 `PROGRESS.MD`). The installed `zig-webp-encode` tool re-encodes a still WebP as
-lossy `VP8 `.
+lossy `VP8 `. The installed `zig-webp-info` tool prints WebP container structure
+and features without decoding pixels.
 
 Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered:
 lossy decode gained a vectorized YUV→RGB conversion and a table-driven VP8
