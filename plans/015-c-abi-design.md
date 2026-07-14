@@ -28,10 +28,12 @@
 - **Execution status**: DONE — design recorded in `PLAN.MD` step 13 via
   PR #102 (branch `c-abi-design`). The Approach / step text below is the
   original design prompt; where review evolved the contracts (fixed
-  `zwebp_limits`, status-returning size-aware `zwebp_*_init`, call-based
-  every-symbol C smoke, stable `ZWEBP_*` constants, FFI pointer/discriminant
-  validation, encoder defaults without a C codec discriminator, PLAN vs
-  PROGRESS placement), **`PLAN.MD` step 13 is authoritative**.
+  `zwebp_limits`, status-returning size-aware `zwebp_*_init` and
+  `zwebp_limits_init`, frozen `zwebp_features` metadata `bool has_*` fields,
+  call-based every-symbol C smoke, stable `ZWEBP_*` constants, FFI
+  pointer/discriminant validation, encoder defaults without a C codec
+  discriminator, PLAN vs PROGRESS placement), **`PLAN.MD` step 13 is
+  authoritative**.
 
 ## Why this matters
 
@@ -172,7 +174,7 @@ positions are given; deviate only with a written reason:
    version-check field (the libwebp trick) — decide and justify.
 6. **Feature probe result**: by-value extern struct mirroring
    `features.Summary`'s scalar fields (kind, format, width, height,
-   has_alpha, is_animation, metadata presence bits, chunk/frame counts) —
+   has_alpha, is_animation, metadata presence bools, chunk/frame counts) —
    no pointers, nothing to free.
 7. **Artifact & build**: `build.zig` gains a `capi` module rooted at a new
    `src/capi.zig` (Tier-2 internal), built into the existing static lib plus

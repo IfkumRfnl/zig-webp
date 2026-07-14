@@ -183,11 +183,14 @@ Recorded decisions (summary; full text in `PLAN.MD`):
   encode path before C ships.
 - **Struct strategy** — `struct_size` + status-returning size-aware init for
   option/config structs only; `zwebp_limits` is fixed-layout (no
-  `struct_size`; non-size-aware `zwebp_limits_init`); nested limits stay
-  fixed so option field offsets never shift; size-aware
+  `struct_size`; status-returning `int32_t zwebp_limits_init` /
+  `ZWEBP_LIMITS_INIT`, NULL → `ZWEBP_ERROR_INVALID_ARGUMENT`); nested
+  limits stay fixed so option field offsets never shift; size-aware
   `int32_t zwebp_*_init(void* s, uint32_t struct_size)` (optional
   `ZWEBP_*_INIT(s)` macro) never writes past the caller's allocation;
-  directional older-prefix / newer-tail rules; fixed carriers unversioned.
+  directional older-prefix / newer-tail rules; fixed carriers unversioned;
+  fixed `zwebp_features` metadata presence is three `bool` fields
+  (`has_color_profile` / `has_exif` / `has_xmp`), not a bitset.
 - **FFI validation / constants** — required-pointer NULL checks, pointer/length
   `SIZE_MAX` checks, and enum-discriminant checks return
   `ZWEBP_ERROR_INVALID_ARGUMENT`; stable `ZWEBP_FORMAT_*` (pixel),
@@ -196,10 +199,11 @@ Recorded decisions (summary; full text in `PLAN.MD`):
   encoder codec selected by entry point (no C `ZWEBP_CODEC_*` options field);
   Into decode has no duplicate `output_format` knob.
 - **Acceptance gates** — call-based header/export smoke on static and shared
-  artifacts (every v1 symbol, including init helpers); decode-from-C and
-  both-encoder encode-from-C smokes (encode frees via `zwebp_free`);
-  error-map / constant-mapping exhaustiveness; `struct_size` / init
-  directionality.
+  artifacts (every v1 symbol, including status-returning init helpers);
+  decode-from-C and both-encoder encode-from-C smokes (encode frees via
+  `zwebp_free`; NULL `zwebp_limits_init` covered); error-map /
+  constant-mapping exhaustiveness (including `zwebp_features` metadata
+  `has_*` → `Presence` pins); `struct_size` / init directionality.
 - **Independent C ABI versioning** — `ZWEBP_ABI_VERSION` /
   `zwebp_abi_version()` and soname follow the C major, not Zig package
   minors; C stability starts when the C ABI is released.

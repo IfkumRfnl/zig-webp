@@ -447,7 +447,7 @@ that forces cross-language pixel ownership the Into path was added to avoid.
 | `encodeLossless` | **v1** |
 | `encodeLossy` | **v1** |
 | `errorCategory` | **v1** (as `zwebp_error_category` / `zwebp_error_name`) |
-| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_free(ptr, len)` → free library-owned encode output (decision 4); `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8); size-aware `int32_t zwebp_*_init(void* s, uint32_t struct_size)` defaulting helpers for every v1 **option/config** struct (decision 5 — return `0` on success or a published error such as `ZWEBP_ERROR_BAD_STRUCT_SIZE`; zero-fill is not sufficient, so these are required v1 support symbols); fixed-layout `zwebp_limits_init(zwebp_limits* s)` (no `struct_size`; decision 5) |
+| *(no Zig Tier-1 analogue)* | **v1** C-only: `zwebp_free(ptr, len)` → free library-owned encode output (decision 4); `zwebp_abi_version(void)` → runtime C ABI version (`ZWEBP_ABI_VERSION`; decision 8); size-aware `int32_t zwebp_*_init(void* s, uint32_t struct_size)` defaulting helpers for every v1 **option/config** struct (decision 5 — return `0` on success or a published error such as `ZWEBP_ERROR_BAD_STRUCT_SIZE`; zero-fill is not sufficient, so these are required v1 support symbols); fixed-layout `int32_t zwebp_limits_init(zwebp_limits* s)` (no `struct_size`; returns `0` or `ZWEBP_ERROR_INVALID_ARGUMENT` on NULL; decision 5) |
 | `decodeStatic` | **non-goal** for C (Into is the C decode shape; no parallel owning-pixel export) |
 | `decodeAnimation` | **deferred v2** (batch owning frames; prefer streaming handle) |
 | `AnimationDecoder` | **deferred v2** (opaque `zwebp_anim_decoder*` handle: create / next / reset / destroy) |
@@ -657,9 +657,13 @@ Callers **must** initialize every option/config struct before use by one of:
    `struct_size = sizeof(...)` (the caller's own `sizeof`, not the
    library's).
 
-Fixed `zwebp_limits` is initialized by `zwebp_limits_init(zwebp_limits* s)` /
-`ZWEBP_LIMITS_INIT(s)` (fills the six documented defaults; not size-aware)
-or by full field assignment — including when nested inside an option/config
+Fixed `zwebp_limits` is initialized by `int32_t zwebp_limits_init(zwebp_limits* s)` /
+`ZWEBP_LIMITS_INIT(s)` (fills the six documented defaults; not size-aware).
+On success the helper returns `0` and writes the defaults; a NULL `s`
+returns `ZWEBP_ERROR_INVALID_ARGUMENT` and must not write (decision 4).
+The header macro `ZWEBP_LIMITS_INIT(s)` expands to `zwebp_limits_init(s)`
+and **yields that `int32_t` status**; callers **must** check it. Full field
+assignment remains allowed — including when nested inside an option/config
 struct whose size-aware init fills the nested limits with those same
 defaults.
 
@@ -677,9 +681,10 @@ Mirror:
 - `zwebp_limits` — fixed-layout mirror of Zig `ResourceLimits`
   (`src/limits.zig`): the **six** integer fields only (`file_size_max` is
   the default for `input_bytes_max`, not a separate C field). **No**
-  `struct_size`; not size-extensible in C v1. Init via
-  `zwebp_limits_init(zwebp_limits* s)` / `ZWEBP_LIMITS_INIT(s)` (or full
-  assignment). Fields, in order (defaults match `ResourceLimits{}`):
+  `struct_size`; not size-extensible in C v1. Init via status-returning
+  `int32_t zwebp_limits_init(zwebp_limits* s)` / `ZWEBP_LIMITS_INIT(s)`
+  (status-yielding; callers must check; or full assignment). Fields, in
+  order (defaults match `ResourceLimits{}`):
   `uint64_t input_bytes_max` (default `0xfffffffe` / `container.file_size_max`);
   `uint64_t output_pixels_max` (default `16777216`);
   `uint64_t allocation_bytes_max` (default `268435456` / `256 * 1024 * 1024`);
@@ -865,7 +870,9 @@ option/config `zwebp_*_init(struct*)` that writes defaults using the
 library's current `sizeof` (would overrun an older, smaller caller
 allocation when a newer shared library is loaded — init must take the
 caller's `struct_size` explicitly and return status); a void/status-less
-size-aware init that cannot report bad `struct_size`; a single mutable
+size-aware init that cannot report bad `struct_size`; a void/status-less
+`zwebp_limits_init` / `ZWEBP_LIMITS_INIT` that cannot report NULL via
+`ZWEBP_ERROR_INVALID_ARGUMENT`; a single mutable
 `zwebp_buffer` / `uint8_t* pixels` type for both decode outputs and encode
 inputs; `@constCast` (or equivalent) from `zwebp_image_view`'s
 `const uint8_t* pixels` onto Zig `ImageBuffer` / `[]u8`, or a silent
@@ -900,10 +907,13 @@ arrive with deferred animation/demux APIs. Fields, in order:
   `zwebp_image_view` (no shared namespace / no `ZWEBP_CODEC_*` alias);
 - `uint32_t width; uint32_t height;` — Zig `canvas` dimensions;
 - `bool has_alpha;` / `bool is_animation;` — Zig flags;
-- metadata presence bits mirroring `metadata.Presence` (ICCP/EXIF/XMP) as
-  individual `bool` fields or an explicit bitset published in the header
-  (implementation picks one shape and freezes it; either way the bit
-  meanings are appended-only);
+- `bool has_color_profile;` / `bool has_exif;` / `bool has_xmp;` — fixed
+  individual presence flags mirroring `metadata.Presence` field-for-field
+  (`color_profile`, `exif`, `xmp` in that order). Clear means absent; set
+  means present. Same naming as the encoder-options `has_*` payload flags;
+  **not** a packed bitset / flags word. New metadata kinds, if ever needed,
+  append additional `bool has_*` fields (layout-breaking for this fixed
+  result — C major bump per decision 8), never reuse or repack these three;
 - `uint32_t chunk_count;` — Zig `chunk_count: u32`.
 
 Invalid `file_kind` / `format_kind` discriminants on **inputs** that accept
@@ -915,12 +925,18 @@ writes published constants.
 contract and stays honest about what `parseFeatures` actually returns.
 Pinning `ZWEBP_FILE_KIND_*` / `ZWEBP_FORMAT_KIND_*` separately from pixel
 `ZWEBP_FORMAT_*` keeps C callers stable across Zig enum churn without
-colliding byte-order constants.
+colliding byte-order constants. Individual `bool has_*` metadata flags
+mirror Zig `metadata.Presence` and the encoder-options presence style
+without inventing a parallel bit-numbering ABI.
 
 **Rejected.** Exporting chunk offsets in the probe result (that is demux
 detail; see decision 10). Deriving feature file/format kind numbers from
 Zig enum ordinals. Reusing pixel `ZWEBP_FORMAT_*` or encoder
-`ZWEBP_CODEC_*` names for bitstream format kind.
+`ZWEBP_CODEC_*` names for bitstream format kind. Leaving metadata presence
+as an implementation choice between `bool` fields and a bitset; packing
+presence into a `uint32_t` bitset / flags word with `ZWEBP_METADATA_*`
+masks (would fork from the `bool has_*` style used elsewhere and still
+need a frozen layout — pick the bools once).
 
 #### 7. Artifact and build
 
@@ -941,7 +957,8 @@ the C ABI ships):
    inputs — not address-only references — so parameter/return ABI drift
    fails at compile or run time (probes, decode, both encoders, error
    helpers, `zwebp_free`, `zwebp_abi_version`, every size-aware
-   `zwebp_*_init` helper, and `zwebp_limits_init`). Address-of-only smoke is
+   `zwebp_*_init` helper, and status-returning `zwebp_limits_init`).
+   Address-of-only smoke is
    insufficient. An equivalent `dlsym`-style presence check for the shared
    artifact remains **additional**, not a substitute for the call smoke,
    catching missing exports, hidden dynamic symbols, export-list mistakes,
@@ -954,8 +971,11 @@ the C ABI ships):
    Behavioral coverage also includes decision 4's FFI invalid-argument
    rule: at least one NULL and one oversized-`len` rejection case on a
    decode output buffer and/or input byte stream; at least one NULL
-   required-pointer case (options struct, `zwebp_buffer*`, or a
-   parse-result out-param); and at least one invalid enum-discriminant
+   required-pointer case (options struct, `zwebp_buffer*`, a
+   parse-result out-param, or `zwebp_limits_init(NULL)` /
+   `ZWEBP_LIMITS_INIT` with a null operand — each must observe
+   `ZWEBP_ERROR_INVALID_ARGUMENT` via the returned `int32_t` status);
+   and at least one invalid enum-discriminant
    case (e.g. unknown `ZWEBP_FORMAT_*` on a `zwebp_buffer`), each
    returning `ZWEBP_ERROR_INVALID_ARGUMENT` (no trap / no truncate / no
    unchecked `@enumFromInt`).
@@ -983,17 +1003,23 @@ the C ABI ships):
    sibling unit test) pins the published C-constant → Zig mappings for
    `ZWEBP_ERROR_CATEGORY_*`, `ZWEBP_FORMAT_*` (pixel), `ZWEBP_FILE_KIND_*`,
    and `ZWEBP_FORMAT_KIND_*` (bitstream) so Zig enum reorder cannot silently
-   change C numbers.
+   change C numbers. The same gate (or sibling) also pins
+   `zwebp_features.has_color_profile` / `has_exif` / `has_xmp` →
+   `metadata.Presence.color_profile` / `.exif` / `.xmp` (field order and
+   meaning; not a bitset).
 5. **`struct_size` directionality** (option/config only; `zwebp_limits` is
-   fixed and out of scope) — tests cover (a) older/smaller prefix accepted
-   with defaulted tail fields, (b) oversized/unknown size rejected without
-   reading past the caller-provided bytes, and (c) size-aware
-   `int32_t zwebp_*_init(void*, uint32_t)` / `ZWEBP_*_INIT`: writes
-   defaults only within the recognized prefix of the caller-provided size,
-   sets `s->struct_size` to that size, never writes past the caller's
+   fixed and out of scope for size rules) — tests cover (a) older/smaller
+   prefix accepted with defaulted tail fields, (b) oversized/unknown size
+   rejected without reading past the caller-provided bytes, and (c)
+   size-aware `int32_t zwebp_*_init(void*, uint32_t)` / `ZWEBP_*_INIT`:
+   writes defaults only within the recognized prefix of the caller-provided
+   size, sets `s->struct_size` to that size, never writes past the caller's
    allocation, and **rejects bad sizes via the returned status**
    (`ZWEBP_ERROR_BAD_STRUCT_SIZE` or the published equivalent; a test proves
-   callers observe that status).
+   callers observe that status). Separately, `int32_t zwebp_limits_init` /
+   `ZWEBP_LIMITS_INIT` status is covered by gate 2's NULL required-pointer
+   case (and the call smoke in gate 1): success returns `0`, NULL returns
+   `ZWEBP_ERROR_INVALID_ARGUMENT` without writing.
 6. Wire those checks into `zig build check` or a dedicated step invoked by
    CI.
 
