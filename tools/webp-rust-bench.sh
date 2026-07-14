@@ -569,15 +569,20 @@ printf 'file\tsha256\tformat\talpha\twidth\theight\n' >>"$digests"
 if [ "$all_mode" -eq 1 ]; then
   # One ReleaseFast decode-only pass over the committed still dirs (+ animation
   # decode rows, which produce no digests). Digests gate the Rust side.
+  # Forward --filter so Zig times the same basename subset as the candidate list.
   part_tsv="$work/zig-all.tsv"
   part_dig="$work/dig-all.tsv"
-  run_zig_bench \
-    --iters "$iters" \
-    --warmup "$warmup" \
-    --budget-ms "$budget_ms" \
-    --decode-only \
-    --write-digests "$part_dig" \
-    "$part_tsv"
+  zig_all_args=(
+    --iters "$iters"
+    --warmup "$warmup"
+    --budget-ms "$budget_ms"
+    --decode-only
+    --write-digests "$part_dig"
+  )
+  if [ -n "$filter" ]; then
+    zig_all_args+=(--filter "$filter")
+  fi
+  run_zig_bench "${zig_all_args[@]}" "$part_tsv"
   cat "$part_tsv" >"$zig_raw"
   awk 'BEGIN{p=0} /^file\t/{p=1; next} p && $0 !~ /^#/ {print}' "$part_dig" >>"$digests"
 else
