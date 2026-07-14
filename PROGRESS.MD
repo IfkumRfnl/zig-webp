@@ -412,11 +412,11 @@ Every `RELEASING.MD` gate holds:
   2026-07-08 (Firefox + Chromium, both minimized samples animate correctly);
   Windows recorded-deferred with reason.
 
-The remaining decisions are the operator's: (1) tag 1.0.0 now versus landing
-any of plans 014 (WASM spike), 016 (m5/6 measurement), or 017 (info CLI)
-first — all additive and non-breaking; and (2) executing `RELEASING.MD`'s
-release procedure (version bump in `build.zig.zon`, dated `CHANGELOG.MD`
-entry, release PR, tag after merge).
+The operator chose to ship: `1.0.0` was tagged on 2026-07-08 per
+`RELEASING.MD`'s release procedure (version bump in `build.zig.zon`, dated
+`CHANGELOG.MD` entry, release PR, tag after merge). Plans 014 (WASM spike),
+016 (m5/6 measurement), and 017 (info CLI) remain additive post-1.0
+follow-ups — they were not release blockers.
 
 ### Step 12 — Release criteria (1.0 stability contract + compatibility matrix)
 

@@ -411,10 +411,9 @@ input.
 
 ### 13. C ABI (post-1.0)
 
-Forward-looking design only. Version 1.0.0 shipped the Zig Tier-1 surface;
-this step records the C export contracts a later implementation plan must
-execute. Nothing here authorizes `src/capi.zig`, an installed header, shared
-library scaffolding, or CI wiring today.
+Forward-looking design only. This step records the C export contracts a later
+implementation plan must execute. Nothing here authorizes `src/capi.zig`, an
+installed header, shared library scaffolding, or CI wiring today.
 
 #### 1. Scope of the exported surface (v1)
 
@@ -593,12 +592,77 @@ caller allocation.
 
 Mirror:
 
-- `zwebp_limits` — the six `ResourceLimits` integer fields, leading
-  `struct_size`, init via size-aware `zwebp_limits_init(void* s,
-  uint32_t struct_size)` / `ZWEBP_LIMITS_INIT(s)` (or full assignment);
-- `zwebp_decoder_options` / `zwebp_encoder_options` / demux-option mirrors
-  as needed by v1 entry points — same `struct_size` + size-aware
-  `zwebp_*_init` / `ZWEBP_*_INIT` rules;
+- `zwebp_limits` — mirror of Zig `ResourceLimits` (`src/limits.zig`),
+  leading `struct_size`; init via size-aware `zwebp_limits_init(void* s,
+  uint32_t struct_size)` / `ZWEBP_LIMITS_INIT(s)` (or full assignment).
+  Fields, in order (defaults match `ResourceLimits{}`):
+  `uint64_t input_bytes_max` (default `0xfffffffe` / `container.file_size_max`);
+  `uint64_t output_pixels_max` (default `16777216`);
+  `uint64_t allocation_bytes_max` (default `268435456` / `256 * 1024 * 1024`);
+  `uint32_t frame_count_max` (default `4096`);
+  `uint64_t animation_canvas_pixels_max` (default `16777216`);
+  `uint32_t chunk_count_max` (default `65536`);
+- `zwebp_decoder_options` — v1 options for `decodeStaticInto` (Zig
+  `DecoderOptions` in `src/options.zig`). Leading `struct_size`; init via
+  size-aware `zwebp_decoder_options_init(void* s, uint32_t struct_size)` /
+  `ZWEBP_DECODER_OPTIONS_INIT(s)` (or full assignment). Fields, in order:
+  - `zwebp_limits limits;` — nested by value (Zig `limits: ResourceLimits =
+    .{}`); `*_init` fills it with the same defaults as `zwebp_limits_init`
+    and sets `limits.struct_size` to `sizeof(zwebp_limits)` within the
+    recognized prefix;
+  - `int32_t output_format;` — Zig `output_format: PixelFormat = .rgba`;
+    values are the existing `ZWEBP_FORMAT_*` constants (`ZWEBP_FORMAT_RGBA`
+    default);
+  - `bool preserve_metadata;` — Zig `preserve_metadata: bool = true`
+    (reserved/no-effect today; default `true`);
+  - `bool decode_animation;` — Zig `decode_animation: bool = true`
+    (reserved/no-effect on still decode; default `true`).
+- `zwebp_encoder_options` — v1 options for `encodeLossless` / `encodeLossy`
+  (Zig `EncoderOptions` in `src/options.zig`). Leading `struct_size`; init
+  via size-aware `zwebp_encoder_options_init(void* s, uint32_t struct_size)` /
+  `ZWEBP_ENCODER_OPTIONS_INIT(s)` (or full assignment). Fields, in order:
+  - `zwebp_limits limits;` — nested by value (Zig `limits: ResourceLimits =
+    .{}`); same nested-init rule as decoder options;
+  - `int32_t format;` — Zig `format: FormatKind = .lossless`; fixed header
+    constants `ZWEBP_CODEC_LOSSY = 0`, `ZWEBP_CODEC_LOSSLESS = 1` (not
+    `ZWEBP_FORMAT_*` pixel-order values; a unit test pins the mapping).
+    Default `ZWEBP_CODEC_LOSSLESS`. `encodeLossless` requires lossless;
+    `encodeLossy` requires lossy (same gate as Zig);
+  - `uint8_t quality;` — Zig `quality: u8 = 75`; default `75`;
+  - `bool preserve_metadata;` — Zig `preserve_metadata: bool = true`
+    (reserved/no-effect; default `true`);
+  - `uint8_t method;` — Zig `method: u8 = 4`; default `4`;
+  - `bool has_target_size;` + `uint32_t target_size;` — Zig
+    `target_size: ?u32 = null`; init clears the flag (unset); never treat
+    `0` as unset;
+  - `bool has_target_psnr;` + `float target_psnr;` — Zig
+    `target_psnr: ?f32 = null`; init clears the flag (unset); `float` is
+    IEEE-754 binary32; mutually exclusive with `has_target_size` when both
+    set (same `InvalidEncodeOptions` rule);
+  - `uint8_t alpha_quality;` — Zig `alpha_quality: u8 = 100`; default
+    `100`;
+  - `bool use_sharp_yuv;` — Zig `use_sharp_yuv: bool = false`; default
+    `false`;
+  - metadata payloads (Zig `metadata: RawPayloads = .{}`) as three optional
+    slices, each `bool has_*` + `const uint8_t* *_data` + `uint64_t *_len`:
+    `has_color_profile` / `color_profile_data` / `color_profile_len`,
+    `has_exif` / `exif_data` / `exif_len`, `has_xmp` / `xmp_data` / `xmp_len`.
+    Init clears every `has_*` and nulls every pointer/length (Zig default
+    all-null). Caller owns the pointed-to bytes; they must outlive the
+    encode call.
+- `zwebp_demux_options` — v1 options for `parseFeatures` (Zig `DemuxOptions`
+  / `demux.Options` in `src/demux.zig`). Leading `struct_size`; init via
+  size-aware `zwebp_demux_options_init(void* s, uint32_t struct_size)` /
+  `ZWEBP_DEMUX_OPTIONS_INIT(s)` (or full assignment). Fields, in order:
+  - `zwebp_limits limits;` — nested by value (Zig `limits: ResourceLimits =
+    .{}`); same nested-init rule as decoder options;
+  - `bool allow_trailing_data;` — Zig `allow_trailing_data: bool = false`;
+    default `false`;
+  - `bool strict_padding;` — Zig `strict_padding: bool = true`; default
+    `true`.
+  A fuller demux-result options bag beyond this probe surface is deferred
+  with `parseWebP` (decision 1 / decision 10); v1 does not invent extra
+  demux knobs.
 - `zwebp_buffer` — mutable pixel storage for decode-Into outputs (**no**
   `struct_size`; fixed layout):
   `uint8_t* pixels; uint64_t len; uint32_t width, height, stride;
@@ -893,18 +957,9 @@ auditable:
 This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
 
-With step 8c delivered, the VP8 lossy encoder is feature-complete, and with 9c
-delivered, **step 9 (animation and metadata encode) is complete** (9a container
-mux, 9b pixel-buffer encode, 9c frame optimization, 9d still metadata, and the
-≥2-browser render check — completed; see `PROGRESS.MD` for the recorded
-result). **Step 10 (performance) is delivered**: a benchmark harness +
-scalar baseline and a vectorized YUV→RGB color-conversion decode path (≈1.11×
-lossy decode, byte-exact); the dated results, the revised target, and the honest
-findings are recorded in `PROGRESS.MD`. **Step 11 (robustness hardening) and
-step 12 (public API and release criteria) are complete**, and **`1.0.0` has
-shipped** (Tier-1 frozen; see `README.MD` / `CHANGELOG.MD`). The remaining
-roadmap is post-1.0 **step 13** (C ABI): the design is recorded above;
-implementation remains future work.
+Completed step status and the 1.0.0 release history live in `PROGRESS.MD`.
+The remaining roadmap is post-1.0 **step 13** (C ABI): the design is recorded
+above; implementation remains future work.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
