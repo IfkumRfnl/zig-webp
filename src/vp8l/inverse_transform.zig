@@ -1129,7 +1129,7 @@ test "VP8L inverse transforms match reference at max block_bits with partial til
     try std.testing.expectEqual(@as(u32, 1), block_transform.image.width);
     try std.testing.expectEqual(@as(u32, 1), block_transform.image.height);
 
-    const pixel_count = try dimensions.pixelCount();
+    const pixel_count: usize = @intCast(try dimensions.pixelCount());
     var residual: [17 * 9]pixel.Pixel = undefined;
     var optimized: [17 * 9]pixel.Pixel = undefined;
     var reference: [17 * 9]pixel.Pixel = undefined;
