@@ -21,6 +21,9 @@
 #   --warmup N            untimed warmups (default 2)
 #   --budget-ms N         per-file time budget (default 1500)
 #   --filter SUBSTR       keep only file names containing SUBSTR
+#                         Explicit FILE args are keyed by normalized path
+#                         (repo-relative when under the worktree) so duplicate
+#                         basenames do not collide; --all still keys by basename.
 #   --all                 photos + committed static corpus (testdata/photos and
 #                         testdata/libwebp-test-data). Benchmarks exactly the
 #                         files for which Zig produced validated decode-into
@@ -280,6 +283,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn resolve_expect<'a>(
+    path: &Path,
+    expects: &'a HashMap<String, Expect>,
+) -> Result<(&'a Expect, String), String> {
+    // Prefer the path string as supplied (explicit mode keys digests by
+    // normalized path). Fall back to basename for --all corpus digests.
+    if let Some(s) = path.to_str() {
+        if let Some(expect) = expects.get(s) {
+            return Ok((expect, s.to_string()));
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("invalid path {}", path.display()))?
+        .to_string();
+    if let Some(expect) = expects.get(&file_name) {
+        return Ok((expect, file_name));
+    }
+    Err(format!(
+        "no Zig digest for {}; refusing to time an unchecked file",
+        path.display()
+    ))
+}
+
 fn bench_one(
     out: &mut dyn Write,
     path: &Path,
@@ -289,14 +317,7 @@ fn bench_one(
     budget_ms: u64,
     identity: &str,
 ) -> Result<(), String> {
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("invalid path {}", path.display()))?
-        .to_string();
-    let expect = expects.get(&file_name).ok_or_else(|| {
-        format!("no Zig digest for {file_name}; refusing to time an unchecked file")
-    })?;
+    let (expect, file_name) = resolve_expect(path, expects)?;
 
     let input = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
@@ -527,6 +548,26 @@ for f in "${files[@]}"; do
   fi
 done
 
+# Explicit inputs: normalize to a stable path identity. Prefer repo-relative
+# labels under the worktree (readable); fall back to absolute realpath.
+# --all keeps caller paths and basename keys (corpus basenames are unique).
+root_real="$(realpath -m -- "$root")"
+normalize_file_id() {
+  local abs
+  abs="$(realpath -m -- "$1")"
+  case "$abs" in
+    "$root_real"/*) printf '%s\n' "${abs#"$root_real"/}" ;;
+    *) printf '%s\n' "$abs" ;;
+  esac
+}
+if [ "$all_mode" -eq 0 ]; then
+  normalized=()
+  for f in "${files[@]}"; do
+    normalized+=("$(normalize_file_id "$f")")
+  done
+  files=("${normalized[@]}")
+fi
+
 zig_identity="zig $(zig version) ReleaseFast"
 rustc_version="$(rustc -V 2>/dev/null | awk '{print $2}')"
 rust_identity="rustc ${rustc_version:-unknown} release"
@@ -552,7 +593,13 @@ candidates_list="$work/candidates.txt"
 
 : >"$candidates_list"
 for f in "${files[@]}"; do
-  printf '%s\t%s\n' "$(basename "$f")" "$f" >>"$candidates_list"
+  if [ "$all_mode" -eq 1 ]; then
+    # Corpus scan digests are basename-keyed (unique within the still corpus).
+    printf '%s\t%s\n' "$(basename "$f")" "$f" >>"$candidates_list"
+  else
+    # Explicit mode: Zig --file digests key by the supplied/normalized path.
+    printf '%s\t%s\n' "$f" "$f" >>"$candidates_list"
+  fi
 done
 
 run_zig_bench() {
@@ -608,11 +655,11 @@ fi
 # Keep only candidates for which Zig produced a validated decode-into digest.
 validated=()
 skip_count=0
-while IFS=$'\t' read -r base path; do
-  if awk -F '\t' -v b="$base" '$0 !~ /^#/ && $1 != "file" && $1 == b { found=1; exit } END { exit !found }' "$digests"; then
+while IFS=$'\t' read -r ident path; do
+  if awk -F '\t' -v b="$ident" '$0 !~ /^#/ && $1 != "file" && $1 == b { found=1; exit } END { exit !found }' "$digests"; then
     validated+=("$path")
   else
-    printf 'SKIP: %s (no Zig decode-into digest; unsupported, invalid, animated, or decode-into failed)\n' "$base" >&2
+    printf 'SKIP: %s (no Zig decode-into digest; unsupported, invalid, animated, or decode-into failed)\n' "$ident" >&2
     skip_count=$((skip_count + 1))
   fi
 done <"$candidates_list"
@@ -633,11 +680,16 @@ printf 'webp-rust-bench: comparing %d validated still(s) (%d skipped)\n' "${#val
   -o "$rust_raw" \
   "${validated[@]}"
 
-# Basename allow-list for joining (only validated candidates).
+# Identity allow-list for joining (only validated candidates).
+# --all: basename (matches corpus-scan digests). Explicit: normalized path.
 allow="$work/allow.txt"
 : >"$allow"
 for f in "${validated[@]}"; do
-  basename "$f" >>"$allow"
+  if [ "$all_mode" -eq 1 ]; then
+    basename "$f" >>"$allow"
+  else
+    printf '%s\n' "$f" >>"$allow"
+  fi
 done
 
 # Normalize Zig decode-into rows into the joinable unified schema and append Rust.

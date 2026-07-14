@@ -48,7 +48,8 @@
 //!                       [--write-digests PATH] [OUTPUT.tsv]
 //! With no OUTPUT.tsv the report goes to stdout; a one-line summary goes to
 //! stderr either way. `--write-digests` records still `decode-into` SHA-256
-//! digests (file, sha256, format, alpha, width, height) for the Rust driver.
+//! digests (file/path identity, sha256, format, alpha, width, height) for the Rust driver.
+//! Corpus scans still key by basename; `--file` keys by the supplied path.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -277,6 +278,8 @@ fn benchDecode(
 }
 
 /// Times decode of one caller-supplied WebP path (used by `--file`).
+/// Report/digest identity is the supplied path (not basename) so two explicit
+/// inputs that share a basename stay distinct end-to-end.
 fn benchDecodePath(
     writer: *std.Io.Writer,
     digests_writer: ?*std.Io.Writer,
@@ -285,14 +288,14 @@ fn benchDecodePath(
     stats: *Stats,
     path: []const u8,
 ) !void {
-    const name = std.fs.path.basename(path);
+    const base = std.fs.path.basename(path);
     if (config.filter) |needle| {
-        if (std.mem.indexOf(u8, name, needle) == null) return;
+        if (std.mem.indexOf(u8, base, needle) == null) return;
     }
 
     const bytes = try ctx.readInput(path);
     defer ctx.gpa.free(bytes);
-    try benchDecodeBytes(writer, digests_writer, ctx, config, stats, name, bytes);
+    try benchDecodeBytes(writer, digests_writer, ctx, config, stats, path, bytes);
 }
 
 /// Times decode of every `*.webp` under `dir_path`. Missing directories are
