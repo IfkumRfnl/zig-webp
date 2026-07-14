@@ -45,9 +45,9 @@ below and can be turned into plans on request.
 | 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — merged as PR #90 (merge commit `772485e`; implementation commit `5843be4`; codex review green on first pass) |
 | 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | DONE — merged as PR #92 (merge commit `753b6e7`; first `big-endian` CI run green: full 464-test suite on powerpc64 under QEMU, no endianness bugs; `macos` job green after an operator-authorized setup-zig key-mapping fix, commit `c7b03da`; browser check remains a pre-tag manual gate) |
 | 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | DONE — branch `wasm32-spike`; `wasm-check` + full wasm32-wasi suite under wasmtime in CI; 32-bit Huffman shift fix landed |
-| 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | TODO |
+| 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | DONE — PR #102 (branch `c-abi-design`); `PLAN.MD` step-13 section only; follow-up implementation post-1.0 |
 | 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
-| 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | TODO |
+| 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | DONE — PR #99; `zig build info` / `tools/zig-webp-info.zig` container probe on public `parseWebP` |
 | 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — executed on branch `step-12-tier1-audit` (worktree `/home/hayk/zig-webp-exec-018`, HEAD `131efd0`); reviewer-verified, not merged (no PR per instructions) |
 | 019 | Big-endian CI job to ~3 min: ReleaseSafe + 4-way sharded QEMU run | P1 | M | — | DONE — PR #97 CI green; full 464-test powerpc64 ReleaseSafe suite passed in 3m9s with 4 QEMU shards (run `28993818050`) |
 | 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | DONE — branch `bench-dwebp-internal-timing` |

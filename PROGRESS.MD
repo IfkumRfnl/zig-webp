@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Current Position
 
@@ -68,9 +68,13 @@ Recently Completed. Every finding was doc-class — no behavior changes and no
 Tier-1 renames. The contract list in `src/root.zig` now also names the six
 parameter/result types it had omitted, and the two bitstream-level encoders
 (`encodeVP8LBitstream`/`encodeVP8Bitstream`) are explicitly Tier 2. With the
-compatibility matrix closed, the remaining 1.0.0 decisions are the operator's:
-tag now versus landing plans 014/016/017 first, then `RELEASING.MD`'s release
-procedure.
+compatibility matrix closed, `1.0.0` shipped per `RELEASING.MD`'s release
+procedure (Tier-1 frozen; see `README.MD` / `CHANGELOG.MD`).
+
+Step 13 (C ABI) is design-complete only: plan 015 recorded the post-1.0 C
+export contracts in `PLAN.MD` (v1 still-image scope, naming/header, error
+model, memory ownership, size-aware struct init, acceptance gates, independent
+C ABI versioning). No C header, exports, or shared library ships yet.
 
 ## Cross-Cutting Practices
 
@@ -149,6 +153,60 @@ Validation: exercised against lossless, lossy, alpha, and animation
 fixtures under `testdata/`; `zig build info` with no args exits 2 with
 the usage line. `zig build check` compiles the tool; README lists it
 alongside the other installed CLIs.
+### 2026-07-13 — Plan 015: C-ABI export layer design (PLAN.MD step 13)
+
+Plan 015 is complete as design-only work, reviewer-verified and delivered via
+PR #102 (branch `c-abi-design`). `PLAN.MD` step 13 now records the post-1.0 C ABI
+contracts a later implementation plan must execute. Nothing authorizes
+`src/capi.zig`, an installed header, shared-library scaffolding, or CI wiring
+today — no C header, exports, or compatibility promise ships with this entry.
+
+Recorded decisions (summary; full text in `PLAN.MD`):
+
+- **v1 still-image scope** — probe/decode-Into/encode core only
+  (`isWebP` / `parseHeader` / `parseChunkHeader` / `parseFeatures`,
+  `decodeStaticInto`, `encodeLossless` / `encodeLossy`), plus C-only helpers
+  `zwebp_error_category` / `zwebp_error_name`, `zwebp_free`,
+  `zwebp_abi_version`, and the size-aware / limits init helpers.
+  Animation, owning-pixel decode, and mux detail are deferred or non-goals
+  for C v1.
+- **Naming/header** — `zwebp_` prefix; one hand-written installed
+  `include/zwebp.h` (not auto-emitted); CI must compile/link a C smoke
+  against every shipped C artifact.
+- **Error model** — `int32_t` status (`0` / negative appended-only codes for
+  the FFI-reachable subset); `int32_t zwebp_error_category` returning
+  `ZWEBP_ERROR_CATEGORY_*`; `zwebp_error_name` static strings; reserved
+  unmapped-error fallback.
+- **Memory ownership** — no allocator object across the boundary; caller-owned
+  decode-Into pixels; read-only encode `zwebp_image_view`; library-owned
+  encode bytes freed via `zwebp_free(ptr, len)`; Zig must gain a const-input
+  encode path before C ships.
+- **Struct strategy** — `struct_size` + status-returning size-aware init for
+  option/config structs only; `zwebp_limits` is fixed-layout (no
+  `struct_size`; status-returning `int32_t zwebp_limits_init` /
+  `ZWEBP_LIMITS_INIT`, NULL → `ZWEBP_ERROR_INVALID_ARGUMENT`); nested
+  limits stay fixed so option field offsets never shift; size-aware
+  `int32_t zwebp_*_init(void* s, uint32_t struct_size)` (optional
+  `ZWEBP_*_INIT(s)` macro) never writes past the caller's allocation;
+  directional older-prefix / newer-tail rules; fixed carriers unversioned;
+  fixed `zwebp_features` metadata presence is three `bool` fields
+  (`has_color_profile` / `has_exif` / `has_xmp`), not a bitset.
+- **FFI validation / constants** — required-pointer NULL checks, pointer/length
+  `SIZE_MAX` checks, and enum-discriminant checks return
+  `ZWEBP_ERROR_INVALID_ARGUMENT`; stable `ZWEBP_FORMAT_*` (pixel),
+  `ZWEBP_FILE_KIND_*`, `ZWEBP_FORMAT_KIND_*` (bitstream), and
+  `ZWEBP_ERROR_CATEGORY_*` (`int32_t zwebp_error_category`) constants;
+  encoder codec selected by entry point (no C `ZWEBP_CODEC_*` options field);
+  Into decode has no duplicate `output_format` knob.
+- **Acceptance gates** — call-based header/export smoke on static and shared
+  artifacts (every v1 symbol, including status-returning init helpers);
+  decode-from-C and both-encoder encode-from-C smokes (encode frees via
+  `zwebp_free`; NULL `zwebp_limits_init` covered); error-map /
+  constant-mapping exhaustiveness (including `zwebp_features` metadata
+  `has_*` → `Presence` pins); `struct_size` / init directionality.
+- **Independent C ABI versioning** — `ZWEBP_ABI_VERSION` /
+  `zwebp_abi_version()` and soname follow the C major, not Zig package
+  minors; C stability starts when the C ABI is released.
 
 ### 2026-07-11 — Horizontal VP8 loop-filter SIMD (plan 023; vertical left scalar)
 
@@ -425,11 +483,11 @@ Every `RELEASING.MD` gate holds:
   2026-07-08 (Firefox + Chromium, both minimized samples animate correctly);
   Windows recorded-deferred with reason.
 
-The remaining decisions are the operator's: (1) tag 1.0.0 now versus landing
-any of plans 014 (WASM spike), 016 (m5/6 measurement), or 017 (info CLI)
-first — all additive and non-breaking; and (2) executing `RELEASING.MD`'s
-release procedure (version bump in `build.zig.zon`, dated `CHANGELOG.MD`
-entry, release PR, tag after merge).
+The operator chose to ship: `1.0.0` was tagged on 2026-07-08 per
+`RELEASING.MD`'s release procedure (version bump in `build.zig.zon`, dated
+`CHANGELOG.MD` entry, release PR, tag after merge). Plans 014 (WASM spike),
+016 (m5/6 measurement), and 017 (info CLI) remain additive post-1.0
+follow-ups — they were not release blockers.
 
 ### Step 12 — Release criteria (1.0 stability contract + compatibility matrix)
 
