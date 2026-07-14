@@ -46,31 +46,50 @@ pub fn applyPredictorTransform(
     const pixel_count = try dimensions.pixelCount();
     if (pixels.len < pixel_count) return error.OutputTooLarge;
 
+    const image_pixels = pixels[0..@intCast(pixel_count)];
     const width: usize = @intCast(dimensions.width);
     const height: usize = @intCast(dimensions.height);
     const transform_width: usize = @intCast(predictor_transform.image.width);
     const block_bits: u5 = @intCast(predictor_transform.block_bits);
+    const block_size: usize = @as(usize, 1) << block_bits;
 
-    var y: usize = 0;
-    while (y < height) : (y += 1) {
-        var x: usize = 0;
+    if (height == 0 or width == 0) return;
+
+    // First row ignores predictor modes: black at (0,0), then left residuals.
+    image_pixels[0] = addPixelsModulo(image_pixels[0], predictor_black);
+    {
+        var x: usize = 1;
         while (x < width) : (x += 1) {
-            const pixel_index = y * width + x;
+            image_pixels[x] = addPixelsModulo(image_pixels[x], image_pixels[x - 1]);
+        }
+    }
+
+    var y: usize = 1;
+    while (y < height) : (y += 1) {
+        const row_start = y * width;
+        // First column ignores modes and uses the pixel above.
+        image_pixels[row_start] = addPixelsModulo(
+            image_pixels[row_start],
+            image_pixels[row_start - width],
+        );
+
+        const transform_y = y >> block_bits;
+        const transform_row = transform_y * transform_width;
+        var x: usize = 1;
+        while (x < width) {
             const transform_x = x >> block_bits;
-            const transform_y = y >> block_bits;
-            const transform_index = transform_y * transform_width + transform_x;
+            const transform_index = transform_row + transform_x;
             assert(transform_index < predictor_pixels.len);
 
             const mode = pixel.green(predictor_pixels[transform_index]);
             assert(mode < predictor_mode_count);
 
-            const prediction = predictorForPosition(mode, .{
-                .x = x,
-                .y = y,
-                .width = width,
-                .pixels = pixels[0..@intCast(pixel_count)],
-            });
-            pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], prediction);
+            const into_tile = x & (block_size - 1);
+            const run_len = @min(block_size - into_tile, width - x);
+            assert(run_len > 0);
+            const x_end = x + run_len;
+            applyPredictorModeDispatch(mode, image_pixels, width, y, x, x_end);
+            x = x_end;
         }
     }
 }
@@ -104,23 +123,43 @@ pub fn applyColorTransform(
     const pixel_count = try dimensions.pixelCount();
     if (pixels.len < pixel_count) return error.OutputTooLarge;
 
+    const image_pixels = pixels[0..@intCast(pixel_count)];
     const width: usize = @intCast(dimensions.width);
+    const height: usize = @intCast(dimensions.height);
     const transform_width: usize = @intCast(color_transform.image.width);
     const block_bits: u5 = @intCast(color_transform.block_bits);
+    const block_size: usize = @as(usize, 1) << block_bits;
 
-    var pixel_index: usize = 0;
-    while (pixel_index < pixel_count) : (pixel_index += 1) {
-        const x = pixel_index % width;
-        const y = pixel_index / width;
-        const transform_x = x >> block_bits;
-        const transform_y = y >> block_bits;
-        const transform_index = transform_y * transform_width + transform_x;
-        assert(transform_index < color_transform_data.len);
+    if (height == 0 or width == 0) return;
 
-        pixels[pixel_index] = applyColorTransformPixel(
-            color_transform_data[transform_index],
-            pixels[pixel_index],
-        );
+    var y: usize = 0;
+    var transform_row: usize = 0;
+    while (y < height) : (y += 1) {
+        if (y > 0 and (y & (block_size - 1)) == 0) {
+            transform_row += transform_width;
+        }
+
+        var x: usize = 0;
+        var transform_index = transform_row;
+        while (x < width) {
+            assert(transform_index < color_transform_data.len);
+            const color_element = color_transform_data[transform_index];
+            const run_len = @min(block_size, width - x);
+            assert(run_len > 0);
+
+            const row_index = y * width + x;
+            var offset: usize = 0;
+            while (offset < run_len) : (offset += 1) {
+                const pixel_index = row_index + offset;
+                image_pixels[pixel_index] = applyColorTransformPixel(
+                    color_element,
+                    image_pixels[pixel_index],
+                );
+            }
+
+            x += run_len;
+            transform_index += 1;
+        }
     }
 }
 
@@ -279,6 +318,15 @@ fn predictPixel(mode: u8, neighbors: PredictorNeighbors) pixel.Pixel {
     assert(mode < predictor_mode_count);
 
     return switch (mode) {
+        inline 0...13 => |comptime_mode| predictPixelMode(comptime_mode, neighbors),
+        else => unreachable,
+    };
+}
+
+fn predictPixelMode(comptime mode: u8, neighbors: PredictorNeighbors) pixel.Pixel {
+    comptime assert(mode < predictor_mode_count);
+
+    return switch (mode) {
         0 => predictor_black,
         1 => neighbors.left,
         2 => neighbors.top,
@@ -299,8 +347,144 @@ fn predictPixel(mode: u8, neighbors: PredictorNeighbors) pixel.Pixel {
             averagePixels(neighbors.left, neighbors.top),
             neighbors.top_left,
         ),
-        else => unreachable,
+        else => comptime unreachable,
     };
+}
+
+fn applyPredictorModeDispatch(
+    mode: u8,
+    pixels: []pixel.Pixel,
+    width: usize,
+    y: usize,
+    x_start: usize,
+    x_end: usize,
+) void {
+    assert(mode < predictor_mode_count);
+    switch (mode) {
+        inline 0...13 => |comptime_mode| applyPredictorRun(comptime_mode, pixels, width, y, x_start, x_end),
+        else => unreachable,
+    }
+}
+
+fn modeUsesTopRight(comptime mode: u8) bool {
+    return switch (mode) {
+        3, 5, 9, 10 => true,
+        else => false,
+    };
+}
+
+fn applyPredictorRun(
+    comptime mode: u8,
+    pixels: []pixel.Pixel,
+    width: usize,
+    y: usize,
+    x_start: usize,
+    x_end: usize,
+) void {
+    comptime assert(mode < predictor_mode_count);
+    assert(y >= 1);
+    assert(x_start >= 1);
+    assert(x_start < x_end);
+    assert(x_end <= width);
+    assert(width > 0);
+
+    const row_start = y * width;
+    var x = x_start;
+    while (x < x_end) : (x += 1) {
+        const pixel_index = row_start + x;
+        const neighbors = PredictorNeighbors{
+            .left = pixels[pixel_index - 1],
+            .top = pixels[pixel_index - width],
+            .top_right = if (comptime modeUsesTopRight(mode))
+                (if (x + 1 < width) pixels[pixel_index - width + 1] else pixels[row_start])
+            else
+                predictor_black,
+            .top_left = pixels[pixel_index - width - 1],
+        };
+        pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], predictPixelMode(mode, neighbors));
+    }
+}
+
+/// Per-pixel reference application used by equivalence tests.
+fn applyPredictorTransformReference(
+    predictor_transform: transform.BlockTransform,
+    predictor_data: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    pixels: []pixel.Pixel,
+) errors.Error!void {
+    try validateBlockTransform(predictor_transform, dimensions);
+
+    const predictor_pixel_count = try predictor_transform.image.pixelCount();
+    if (predictor_data.len < predictor_pixel_count) return error.InvalidVP8LTransform;
+
+    const predictor_pixels = predictor_data[0..@intCast(predictor_pixel_count)];
+    try validatePredictorModes(predictor_pixels);
+
+    const pixel_count = try dimensions.pixelCount();
+    if (pixels.len < pixel_count) return error.OutputTooLarge;
+
+    const width: usize = @intCast(dimensions.width);
+    const height: usize = @intCast(dimensions.height);
+    const transform_width: usize = @intCast(predictor_transform.image.width);
+    const block_bits: u5 = @intCast(predictor_transform.block_bits);
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            const pixel_index = y * width + x;
+            const transform_x = x >> block_bits;
+            const transform_y = y >> block_bits;
+            const transform_index = transform_y * transform_width + transform_x;
+            assert(transform_index < predictor_pixels.len);
+
+            const mode = pixel.green(predictor_pixels[transform_index]);
+            assert(mode < predictor_mode_count);
+
+            const prediction = predictorForPosition(mode, .{
+                .x = x,
+                .y = y,
+                .width = width,
+                .pixels = pixels[0..@intCast(pixel_count)],
+            });
+            pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], prediction);
+        }
+    }
+}
+
+/// Per-pixel reference application used by equivalence tests.
+fn applyColorTransformReference(
+    color_transform: transform.BlockTransform,
+    color_transform_data: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    pixels: []pixel.Pixel,
+) errors.Error!void {
+    try validateBlockTransform(color_transform, dimensions);
+
+    const transform_pixel_count = try color_transform.image.pixelCount();
+    if (color_transform_data.len < transform_pixel_count) return error.InvalidVP8LTransform;
+
+    const pixel_count = try dimensions.pixelCount();
+    if (pixels.len < pixel_count) return error.OutputTooLarge;
+
+    const width: usize = @intCast(dimensions.width);
+    const block_bits: u5 = @intCast(color_transform.block_bits);
+    const transform_width: usize = @intCast(color_transform.image.width);
+
+    var pixel_index: usize = 0;
+    while (pixel_index < pixel_count) : (pixel_index += 1) {
+        const x = pixel_index % width;
+        const y = pixel_index / width;
+        const transform_x = x >> block_bits;
+        const transform_y = y >> block_bits;
+        const transform_index = transform_y * transform_width + transform_x;
+        assert(transform_index < color_transform_data.len);
+
+        pixels[pixel_index] = applyColorTransformPixel(
+            color_transform_data[transform_index],
+            pixels[pixel_index],
+        );
+    }
 }
 
 fn addPixelsModulo(residual: pixel.Pixel, prediction: pixel.Pixel) pixel.Pixel {
@@ -785,4 +969,237 @@ test "VP8L inverse color indexing validates metadata and buffers" {
             .image_after = try image.Dimensions.init(1, 1),
         }, &color_table, dimensions, &.{}),
     );
+}
+
+fn fillRandomPixels(random: std.Random, pixels: []pixel.Pixel) void {
+    for (pixels) |*value| {
+        value.* = pixel.fromChannels(
+            random.int(u8),
+            random.int(u8),
+            random.int(u8),
+            random.int(u8),
+        );
+    }
+}
+
+fn expectPixelsEqual(expected: []const pixel.Pixel, actual: []const pixel.Pixel) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |want, got, index| {
+        if (want != got) {
+            std.debug.print(
+                "pixel mismatch at {d}: expected {x} got {x}\n",
+                .{ index, want, got },
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+fn makeBlockTransform(width: u32, height: u32, block_bits: u4) !transform.BlockTransform {
+    const block_size = @as(u32, 1) << @as(u5, block_bits);
+    return .{
+        .block_bits = block_bits,
+        .block_size = block_size,
+        .image = try image.Dimensions.init(
+            divRoundUp(width, block_size),
+            divRoundUp(height, block_size),
+        ),
+    };
+}
+
+test "VP8L inverse predictor transform matches reference across modes and tiles" {
+    var prng = std.Random.DefaultPrng.init(0x5650384c);
+    const random = prng.random();
+
+    const widths = [_]u32{ 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17 };
+    const heights = [_]u32{ 1, 2, 3, 4, 5, 8, 9 };
+    const block_bits_values = [_]u4{ 2, 3, 4 };
+
+    var residual_buf: [17 * 9]pixel.Pixel = undefined;
+    var optimized_buf: [17 * 9]pixel.Pixel = undefined;
+    var reference_buf: [17 * 9]pixel.Pixel = undefined;
+    var predictor_buf: [64]pixel.Pixel = undefined;
+
+    for (widths) |width| {
+        for (heights) |height| {
+            for (block_bits_values) |block_bits| {
+                const dimensions = try image.Dimensions.init(width, height);
+                const predictor_transform = try makeBlockTransform(width, height, block_bits);
+                const predictor_count = try predictor_transform.image.pixelCount();
+                assert(predictor_count <= predictor_buf.len);
+
+                const pixel_count = try dimensions.pixelCount();
+                assert(pixel_count <= residual_buf.len);
+
+                // Uniform mode coverage, including right-edge top-right modes.
+                var mode: u8 = 0;
+                while (mode < predictor_mode_count) : (mode += 1) {
+                    @memset(predictor_buf[0..@intCast(predictor_count)], pixel.fromChannels(0, 0, mode, 0));
+                    fillRandomPixels(random, residual_buf[0..@intCast(pixel_count)]);
+                    @memcpy(optimized_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+                    @memcpy(reference_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+
+                    try applyPredictorTransform(
+                        predictor_transform,
+                        predictor_buf[0..@intCast(predictor_count)],
+                        dimensions,
+                        optimized_buf[0..@intCast(pixel_count)],
+                    );
+                    try applyPredictorTransformReference(
+                        predictor_transform,
+                        predictor_buf[0..@intCast(predictor_count)],
+                        dimensions,
+                        reference_buf[0..@intCast(pixel_count)],
+                    );
+                    try expectPixelsEqual(
+                        reference_buf[0..@intCast(pixel_count)],
+                        optimized_buf[0..@intCast(pixel_count)],
+                    );
+                }
+
+                // Mixed tile modes stress tile-boundary mode switches.
+                var predictor_index: usize = 0;
+                while (predictor_index < predictor_count) : (predictor_index += 1) {
+                    const mixed_mode: u8 = @intCast((predictor_index * 3 + width + height) % predictor_mode_count);
+                    predictor_buf[predictor_index] = pixel.fromChannels(0, 0, mixed_mode, 0);
+                }
+                fillRandomPixels(random, residual_buf[0..@intCast(pixel_count)]);
+                @memcpy(optimized_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+                @memcpy(reference_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+
+                try applyPredictorTransform(
+                    predictor_transform,
+                    predictor_buf[0..@intCast(predictor_count)],
+                    dimensions,
+                    optimized_buf[0..@intCast(pixel_count)],
+                );
+                try applyPredictorTransformReference(
+                    predictor_transform,
+                    predictor_buf[0..@intCast(predictor_count)],
+                    dimensions,
+                    reference_buf[0..@intCast(pixel_count)],
+                );
+                try expectPixelsEqual(
+                    reference_buf[0..@intCast(pixel_count)],
+                    optimized_buf[0..@intCast(pixel_count)],
+                );
+            }
+        }
+    }
+}
+
+test "VP8L inverse predictor transform catches right-edge top-right tile errors" {
+    // Width 5 / height 5 with block_bits=2 => 2x2 tiles; partial final tile + mode 3/5/9/10.
+    const dimensions = try image.Dimensions.init(5, 5);
+    const predictor_transform = try makeBlockTransform(5, 5, 2);
+    var predictor_data = [_]pixel.Pixel{
+        pixel.fromChannels(0, 0, 3, 0),
+        pixel.fromChannels(0, 0, 5, 0),
+        pixel.fromChannels(0, 0, 9, 0),
+        pixel.fromChannels(0, 0, 10, 0),
+    };
+    assert(predictor_data.len == try predictor_transform.image.pixelCount());
+
+    var prng = std.Random.DefaultPrng.init(0xe06e0001);
+    const random = prng.random();
+    var residual: [25]pixel.Pixel = undefined;
+    var optimized: [25]pixel.Pixel = undefined;
+    var reference: [25]pixel.Pixel = undefined;
+    fillRandomPixels(random, &residual);
+    @memcpy(&optimized, &residual);
+    @memcpy(&reference, &residual);
+
+    try applyPredictorTransform(predictor_transform, &predictor_data, dimensions, &optimized);
+    try applyPredictorTransformReference(predictor_transform, &predictor_data, dimensions, &reference);
+    try expectPixelsEqual(&reference, &optimized);
+}
+
+test "VP8L inverse transforms match reference at max block_bits with partial tiles" {
+    // Format allows block_bits up to 9 (block_size 512). Pin the large-shift
+    // tile-run path for both predictor and color when the image is smaller
+    // than one tile (width/height not multiples of block_size).
+    var prng = std.Random.DefaultPrng.init(0x626c6b39);
+    const random = prng.random();
+
+    const width: u32 = 17;
+    const height: u32 = 9;
+    const block_bits: u4 = transform.block_bits_max;
+    const dimensions = try image.Dimensions.init(width, height);
+    const block_transform = try makeBlockTransform(width, height, block_bits);
+    try std.testing.expectEqual(@as(u32, 1), block_transform.image.width);
+    try std.testing.expectEqual(@as(u32, 1), block_transform.image.height);
+
+    const pixel_count: usize = @intCast(try dimensions.pixelCount());
+    var residual: [17 * 9]pixel.Pixel = undefined;
+    var optimized: [17 * 9]pixel.Pixel = undefined;
+    var reference: [17 * 9]pixel.Pixel = undefined;
+    fillRandomPixels(random, residual[0..pixel_count]);
+
+    var mode: u8 = 0;
+    while (mode < predictor_mode_count) : (mode += 1) {
+        const predictor_data = [_]pixel.Pixel{pixel.fromChannels(0, 0, mode, 0)};
+        @memcpy(optimized[0..pixel_count], residual[0..pixel_count]);
+        @memcpy(reference[0..pixel_count], residual[0..pixel_count]);
+        try applyPredictorTransform(block_transform, &predictor_data, dimensions, optimized[0..pixel_count]);
+        try applyPredictorTransformReference(block_transform, &predictor_data, dimensions, reference[0..pixel_count]);
+        try expectPixelsEqual(reference[0..pixel_count], optimized[0..pixel_count]);
+    }
+
+    var color_data = [_]pixel.Pixel{undefined};
+    fillRandomPixels(random, &color_data);
+    @memcpy(optimized[0..pixel_count], residual[0..pixel_count]);
+    @memcpy(reference[0..pixel_count], residual[0..pixel_count]);
+    try applyColorTransform(block_transform, &color_data, dimensions, optimized[0..pixel_count]);
+    try applyColorTransformReference(block_transform, &color_data, dimensions, reference[0..pixel_count]);
+    try expectPixelsEqual(reference[0..pixel_count], optimized[0..pixel_count]);
+}
+
+test "VP8L inverse color transform matches reference across tiles and odd widths" {
+    var prng = std.Random.DefaultPrng.init(0x434f4c52);
+    const random = prng.random();
+
+    const widths = [_]u32{ 1, 3, 4, 5, 7, 8, 9, 16, 17 };
+    const heights = [_]u32{ 1, 2, 3, 4, 5, 8 };
+    const block_bits_values = [_]u4{ 2, 3, 4 };
+
+    var residual_buf: [17 * 8]pixel.Pixel = undefined;
+    var optimized_buf: [17 * 8]pixel.Pixel = undefined;
+    var reference_buf: [17 * 8]pixel.Pixel = undefined;
+    var color_buf: [64]pixel.Pixel = undefined;
+
+    for (widths) |width| {
+        for (heights) |height| {
+            for (block_bits_values) |block_bits| {
+                const dimensions = try image.Dimensions.init(width, height);
+                const color_transform = try makeBlockTransform(width, height, block_bits);
+                const transform_count = try color_transform.image.pixelCount();
+                assert(transform_count <= color_buf.len);
+
+                const pixel_count = try dimensions.pixelCount();
+                assert(pixel_count <= residual_buf.len);
+
+                fillRandomPixels(random, color_buf[0..@intCast(transform_count)]);
+                fillRandomPixels(random, residual_buf[0..@intCast(pixel_count)]);
+                @memcpy(optimized_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+                @memcpy(reference_buf[0..@intCast(pixel_count)], residual_buf[0..@intCast(pixel_count)]);
+
+                try applyColorTransform(
+                    color_transform,
+                    color_buf[0..@intCast(transform_count)],
+                    dimensions,
+                    optimized_buf[0..@intCast(pixel_count)],
+                );
+                try applyColorTransformReference(
+                    color_transform,
+                    color_buf[0..@intCast(transform_count)],
+                    dimensions,
+                    reference_buf[0..@intCast(pixel_count)],
+                );
+                try expectPixelsEqual(
+                    reference_buf[0..@intCast(pixel_count)],
+                    optimized_buf[0..@intCast(pixel_count)],
+                );
+            }
+        }
+    }
 }

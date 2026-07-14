@@ -68,15 +68,57 @@ pub const EntryOp = enum(u8) {
     table,
 };
 
+/// Compact Huffman lookup entry.
+///
+/// `payload` is interpreted by `op`:
+/// - `.symbol` → decoded symbol
+/// - `.table` → absolute subtable start index in the entries buffer
+/// - `.invalid` → unused; payload is zero
+///
+/// Prefer the constructors/accessors below rather than reading `payload`
+/// directly, so the symbol/table interpretation stays asserted by `op`.
 pub const Entry = struct {
-    symbol: u16 = 0,
-    offset: u16 = 0,
+    payload: u16 = 0,
     bits: u8 = 0,
     op: EntryOp = .invalid,
+
+    pub fn invalid() Entry {
+        return .{};
+    }
+
+    pub fn symbol(symbol_value: u16, bits: u8) Entry {
+        return .{
+            .payload = symbol_value,
+            .bits = bits,
+            .op = .symbol,
+        };
+    }
+
+    pub fn table(offset: u16, bits: u8) Entry {
+        assert(bits > 0);
+
+        return .{
+            .payload = offset,
+            .bits = bits,
+            .op = .table,
+        };
+    }
+
+    pub fn symbolValue(self: Entry) u16 {
+        assert(self.op == .symbol);
+
+        return self.payload;
+    }
+
+    pub fn tableOffset(self: Entry) u16 {
+        assert(self.op == .table);
+
+        return self.payload;
+    }
 };
 
 comptime {
-    assert(@sizeOf(Entry) == 6);
+    assert(@sizeOf(Entry) == 4);
     assert(code_length_code_order.len == code_length_code_count);
     assert(code_length_code_bits_max < max_code_bits);
     assert(distance_alphabet_size < literal_alphabet_size);
@@ -143,7 +185,7 @@ pub fn Table(comptime options: TableOptions) type {
                 // The VP8L single-leaf exception is encoded with length 1.
                 if (code_lengths[@intCast(last_symbol)] != 1) return error.InvalidHuffmanTree;
 
-                @memset(entries_buffer[0..root_entry_count], symbolEntry(last_symbol, 0));
+                @memset(entries_buffer[0..root_entry_count], Entry.symbol(last_symbol, 0));
 
                 return .{
                     .entries = entries_buffer[0..root_entry_count],
@@ -170,7 +212,7 @@ pub fn Table(comptime options: TableOptions) type {
                 }
             }
 
-            @memset(entries_buffer[0..root_entry_count], invalidEntry());
+            @memset(entries_buffer[0..root_entry_count], Entry.invalid());
 
             var entry_count = root_entry_count;
             var subtable_offsets: [root_entry_count]u16 = .{0} ** root_entry_count;
@@ -184,10 +226,10 @@ pub fn Table(comptime options: TableOptions) type {
 
                 const offset: u16 = @intCast(entry_count);
                 const end = entry_count + subtable_entry_count;
-                @memset(entries_buffer[entry_count..end], invalidEntry());
+                @memset(entries_buffer[entry_count..end], Entry.invalid());
 
                 subtable_offsets[root_index] = offset;
-                entries_buffer[root_index] = tableEntry(offset, extra_bits);
+                entries_buffer[root_index] = Entry.table(offset, extra_bits);
                 entry_count = end;
             }
 
@@ -233,7 +275,7 @@ pub fn Table(comptime options: TableOptions) type {
                 .symbol => {
                     try reader.dropBits(@intCast(root_entry.bits));
 
-                    return root_entry.symbol;
+                    return root_entry.symbolValue();
                 },
                 .table => {
                     const subtable_bits: u6 = @intCast(root_entry.bits);
@@ -244,14 +286,14 @@ pub fn Table(comptime options: TableOptions) type {
 
                     const value = try reader.peekBits(total_bits);
                     const subtable_mask = maskBits(subtable_bits);
-                    const subtable_index: usize = @as(usize, root_entry.offset) +
+                    const subtable_index: usize = @as(usize, root_entry.tableOffset()) +
                         @as(usize, @intCast((value >> root_bits) & subtable_mask));
                     const subtable_entry = self.entries[subtable_index];
                     if (subtable_entry.op != .symbol) return error.InvalidHuffmanCode;
 
                     try reader.dropBits(root_bits_u6 + @as(u6, @intCast(subtable_entry.bits)));
 
-                    return subtable_entry.symbol;
+                    return subtable_entry.symbolValue();
                 },
             }
         }
@@ -279,7 +321,7 @@ pub fn Table(comptime options: TableOptions) type {
             if (length <= root_bits_u6) {
                 const root_index: usize = @intCast(code);
                 const entry = self.entries[root_index];
-                if (entry.op == .symbol and entry.bits == length) return entry.symbol;
+                if (entry.op == .symbol and entry.bits == length) return entry.symbolValue();
 
                 return null;
             }
@@ -291,10 +333,10 @@ pub fn Table(comptime options: TableOptions) type {
             const extra_bits = length - root_bits_u6;
             if (extra_bits > root_entry.bits) return null;
 
-            const subtable_index: usize = @as(usize, root_entry.offset) +
+            const subtable_index: usize = @as(usize, root_entry.tableOffset()) +
                 @as(usize, @intCast((code >> root_bits) & maskBits(extra_bits)));
             const entry = self.entries[subtable_index];
-            if (entry.op == .symbol and entry.bits == extra_bits) return entry.symbol;
+            if (entry.op == .symbol and entry.bits == extra_bits) return entry.symbolValue();
 
             return null;
         }
@@ -313,7 +355,7 @@ pub fn Table(comptime options: TableOptions) type {
             var index: usize = @intCast(reversed);
             while (index < root_entry_count) : (index += stride) {
                 if (entries[index].op != .invalid) return error.InvalidHuffmanTree;
-                entries[index] = symbolEntry(symbol, length);
+                entries[index] = Entry.symbol(symbol, length);
             }
         }
 
@@ -331,7 +373,7 @@ pub fn Table(comptime options: TableOptions) type {
             const root_index: usize = @intCast(reversed & root_mask_u32);
             const root_entry = entries[root_index];
             if (root_entry.op != .table) return error.InvalidHuffmanTree;
-            assert(subtable_offsets[root_index] == root_entry.offset);
+            assert(subtable_offsets[root_index] == root_entry.tableOffset());
 
             const extra_bits = length - root_bits;
             assert(extra_bits <= root_entry.bits);
@@ -341,10 +383,10 @@ pub fn Table(comptime options: TableOptions) type {
             const stride = @as(usize, 1) << @intCast(extra_bits);
             var index: usize = @intCast(subtable_code);
             while (index < subtable_entry_count) : (index += stride) {
-                const entry_index = @as(usize, root_entry.offset) + index;
+                const entry_index = @as(usize, root_entry.tableOffset()) + index;
                 assert(entry_index < entries.len);
                 if (entries[entry_index].op != .invalid) return error.InvalidHuffmanTree;
-                entries[entry_index] = symbolEntry(symbol, extra_bits);
+                entries[entry_index] = Entry.symbol(symbol, extra_bits);
             }
         }
 
@@ -357,7 +399,7 @@ pub fn Table(comptime options: TableOptions) type {
                     .invalid => return error.InvalidHuffmanTree,
                     .symbol => {},
                     .table => {
-                        const subtable_start = @as(usize, root_entry.offset);
+                        const subtable_start = @as(usize, root_entry.tableOffset());
                         const subtable_len = @as(usize, 1) << @intCast(root_entry.bits);
                         const subtable_end = subtable_start + subtable_len;
                         if (subtable_start < root_entry_count) return error.InvalidHuffmanTree;
@@ -422,28 +464,6 @@ fn maskBits(bits: u6) u32 {
     return (@as(u32, 1) << @as(u5, @intCast(bits))) - 1;
 }
 
-fn invalidEntry() Entry {
-    return .{};
-}
-
-fn symbolEntry(symbol: u16, bits: u8) Entry {
-    return .{
-        .symbol = symbol,
-        .bits = bits,
-        .op = .symbol,
-    };
-}
-
-fn tableEntry(offset: u16, bits: u8) Entry {
-    assert(bits > 0);
-
-    return .{
-        .offset = offset,
-        .bits = bits,
-        .op = .table,
-    };
-}
-
 comptime {
     assert(SymbolTable.root_entry_count_max == 256);
     assert(SymbolTable.entry_count_limit == 33024);
@@ -456,6 +476,30 @@ test "VP8L Huffman table constants match format limits" {
     try std.testing.expectEqual(@as(u16, 2328), green_alphabet_size_max);
     try std.testing.expectEqual(@as(usize, 33024), SymbolTable.entry_count_limit);
     try std.testing.expectEqual(@as(usize, 160), CodeLengthTable.entry_count_limit);
+}
+
+test "VP8L Huffman Entry is exactly four bytes" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Entry));
+    try std.testing.expectEqual(@as(usize, 2), @alignOf(Entry));
+}
+
+test "VP8L Huffman Entry constructors and accessors respect op" {
+    const invalid = Entry.invalid();
+    try std.testing.expectEqual(EntryOp.invalid, invalid.op);
+    try std.testing.expectEqual(@as(u16, 0), invalid.payload);
+    try std.testing.expectEqual(@as(u8, 0), invalid.bits);
+
+    const symbol = Entry.symbol(42, 3);
+    try std.testing.expectEqual(EntryOp.symbol, symbol.op);
+    try std.testing.expectEqual(@as(u16, 42), symbol.payload);
+    try std.testing.expectEqual(@as(u8, 3), symbol.bits);
+    try std.testing.expectEqual(@as(u16, 42), symbol.symbolValue());
+
+    const table = Entry.table(256, 4);
+    try std.testing.expectEqual(EntryOp.table, table.op);
+    try std.testing.expectEqual(@as(u16, 256), table.payload);
+    try std.testing.expectEqual(@as(u8, 4), table.bits);
+    try std.testing.expectEqual(@as(u16, 256), table.tableOffset());
 }
 
 test "VP8L Huffman table decodes a single leaf without consuming bits" {
@@ -515,6 +559,19 @@ test "VP8L Huffman table decodes symbols from a second-level table" {
     const code_lengths = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 9 };
     const table = try SymbolTable.build(&entries, &code_lengths);
 
+    // Codes longer than root_bits must land in a second-level table entry.
+    var saw_table_entry = false;
+    for (table.entries[0..SymbolTable.root_entry_count_max]) |root_entry| {
+        if (root_entry.op != .table) continue;
+        saw_table_entry = true;
+        try std.testing.expect(root_entry.tableOffset() >= SymbolTable.root_entry_count_max);
+        try std.testing.expect(root_entry.bits > 0);
+        const sub = table.entries[root_entry.tableOffset()];
+        try std.testing.expectEqual(EntryOp.symbol, sub.op);
+        _ = sub.symbolValue();
+    }
+    try std.testing.expect(saw_table_entry);
+
     var encoded: [4]u8 = undefined;
     var writer = bit_writer.BitWriter.init(&encoded);
     try writer.writeBits(reverseBits(0b111111110, 9), 9);
@@ -558,7 +615,74 @@ test "VP8L Huffman table reports bounded table buffers and truncated input" {
 
     var entries: [SymbolTable.entry_count_limit]Entry = undefined;
     const table = try SymbolTable.build(&entries, &.{ 1, 2, 2 });
-    var reader = bit_reader.BitReader.init(&.{});
+    try std.testing.expect(table.single_symbol == null);
 
+    var reader = bit_reader.BitReader.init(&.{});
     try std.testing.expectError(error.TruncatedBitstream, table.decode(&reader));
+
+    // After the final available bit is consumed, further decode truncates.
+    // Single-symbol tables still decode without needing bits.
+    const encoded = [_]u8{0};
+    var limited = bit_reader.BitReader.init(&encoded);
+    try limited.dropBits(7);
+    try std.testing.expectEqual(@as(usize, 1), limited.remainingBits());
+    try std.testing.expectEqual(@as(u16, 0), try table.decode(&limited));
+    try std.testing.expectError(error.TruncatedBitstream, table.decode(&limited));
+
+    var single_entries: [SymbolTable.entry_count_limit]Entry = undefined;
+    const single = try SymbolTable.build(&single_entries, &.{ 0, 0, 1 });
+    var empty = bit_reader.BitReader.init(&.{});
+    try std.testing.expectEqual(@as(u16, 2), try single.decode(&empty));
+}
+
+test "VP8L Huffman compact Entry keeps distinct absolute subtable offsets" {
+    // Goal: after packing symbol/subtable into one u16 payload, two root
+    // `.table` entries must carry different absolute offsets. A tree with
+    // 254 length-8 symbols and 4 length-9 symbols is complete (Kraft = 1)
+    // and spreads the long codes across at least two root prefixes.
+    const bit_writer = @import("../bit_writer.zig");
+
+    var code_lengths: [258]u8 = undefined;
+    @memset(code_lengths[0..254], 8);
+    @memset(code_lengths[254..], 9);
+
+    var entries: [SymbolTable.entry_count_limit]Entry = undefined;
+    const table = try SymbolTable.build(&entries, &code_lengths);
+
+    var offsets: [8]u16 = undefined;
+    var offset_count: usize = 0;
+    for (table.entries[0..SymbolTable.root_entry_count_max]) |root_entry| {
+        if (root_entry.op != .table) continue;
+
+        const offset = root_entry.tableOffset();
+        try std.testing.expect(offset >= SymbolTable.root_entry_count_max);
+        try std.testing.expect(root_entry.bits > 0);
+
+        var seen = false;
+        for (offsets[0..offset_count]) |existing| {
+            if (existing == offset) seen = true;
+        }
+        if (!seen) {
+            try std.testing.expect(offset_count < offsets.len);
+            offsets[offset_count] = offset;
+            offset_count += 1;
+        }
+    }
+    try std.testing.expect(offset_count >= 2);
+    try std.testing.expect(offsets[0] != offsets[1]);
+
+    // Every length-9 symbol must decode from a second-level table.
+    var found = [_]bool{false} ** 4;
+    var pattern: u32 = 0;
+    while (pattern < 512) : (pattern += 1) {
+        var encoded: [2]u8 = undefined;
+        var writer = bit_writer.BitWriter.init(&encoded);
+        try writer.writeBits(pattern, 9);
+        var reader = bit_reader.BitReader.init(try writer.finish());
+        const symbol = table.decode(&reader) catch continue;
+        if (symbol >= 254 and symbol <= 257) {
+            found[symbol - 254] = true;
+        }
+    }
+    try std.testing.expect(found[0] and found[1] and found[2] and found[3]);
 }

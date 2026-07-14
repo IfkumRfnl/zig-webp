@@ -188,7 +188,7 @@ fn writeConstantPrefixCodeGroup(
 }
 
 comptime {
-    assert(@sizeOf(huffman.Entry) == 6);
+    assert(@sizeOf(huffman.Entry) == 4);
     assert(meta_prefix.group_count_max == 65_536);
 }
 
@@ -277,6 +277,19 @@ test "VP8L prefix group store enforces group and allocation limits" {
         Store.readAll(std.testing.allocator, &limited_reader, 1, 0, .{
             .allocation_bytes_max = 1,
         }, buffers),
+    );
+}
+
+test "VP8L compact Huffman Entry allocation charges four bytes per entry" {
+    // Contract after Entry 6→4 densification: one 8-bit root table is 1KB,
+    // and allocationBytes must track that size (not the former 1536).
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(huffman.Entry));
+    try std.testing.expectEqual(
+        @as(usize, 1024),
+        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max,
+    );
+    try std.testing.expect(
+        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max < 1536,
     );
 }
 
