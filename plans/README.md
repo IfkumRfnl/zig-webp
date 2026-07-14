@@ -63,12 +63,13 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 
 ## Reconcile log
 
-- **2026-07-14** — Cumulative draft PR #103 rebased onto main after #100/#101
+- **2026-07-14** — Cumulative draft PR #103 rebased onto main after #100/#101/#102
   squash-merges. Conservative cut through compact Huffman `fbe738c`: plan
   **024** vector IDCT (`e9254a3`) omitted because all-lossy
   **1.0287×–1.0375×** straddled the 1.03× gate. Focused Huffman
   multi-subtable / 4-byte allocation and max-`block_bits` tile-run
-  equivalence tests retained on the draft head.
+  equivalence tests retained on the draft head. C-ABI plan **015** history
+  from #102 is preserved alongside the #103 perf record.
 
 - **2026-07-11** — Compact VP8L Huffman `Entry` accepted at `fbe738c`
   (`Entry` **6→4** bytes, **33%** denser; 8-bit root **1.5KB→1KB**). Two
