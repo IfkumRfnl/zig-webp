@@ -879,8 +879,30 @@ fn fillAsymmetricPlane(plane: []u8, stride: usize, rows: usize, cols: usize, see
         while (x < cols) : (x += 1) {
             // Asymmetric in x versus y so a mistaken transpose still fails
             // even when both axes share similar statistics.
+            // Vertical neighbor delta is (91 + 13*x) mod 256; over luma x in
+            // 0..31 the minimum absolute delta is 4, so hev_threshold in
+            // {0,1,2} is always exceeded — this fill exercises the HEV/filter2
+            // branch, not filter4/filter6.
             const mixed = seed +% @as(u32, @intCast(x)) *% 37 +% @as(u32, @intCast(y)) *% 91 +% @as(u32, @intCast(x * y)) *% 13;
             plane[y * stride + x] = @truncate(mixed);
+        }
+    }
+}
+
+/// Gentle vertical ramp used to reach the !hev path (filter4/filter6).
+/// `row_delta` is the exact |p[y+1]-p[y]| (no wrap for the small frames under
+/// test); keep it <= hev_threshold so complex edges select the wide filters.
+fn fillSmoothRampPlane(plane: []u8, stride: usize, rows: usize, cols: usize, seed: u32, row_delta: u8) void {
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        var x: usize = 0;
+        while (x < cols) : (x += 1) {
+            // Bound the base so base + y*row_delta stays inside 0..255 for the
+            // macroblock-padded frames the equivalence tests allocate (≤32 rows).
+            const base = (seed +% @as(u32, @intCast(x)) *% 3) % 200;
+            const value = base + @as(u32, @intCast(y)) * row_delta;
+            assert(value <= 255);
+            plane[y * stride + x] = @intCast(value);
         }
     }
 }
@@ -914,6 +936,8 @@ fn expectPlanesEqual(a: []const u8, b: []const u8) !void {
     try testing.expectEqualSlices(u8, a, b);
 }
 
+const EquivalenceFill = enum { asymmetric, smooth_ramp };
+
 fn runEquivalenceCase(
     columns: u32,
     rows: u32,
@@ -922,6 +946,19 @@ fn runEquivalenceCase(
     sharpness: u8,
     inner: bool,
     seed: u32,
+) !void {
+    try runEquivalenceCaseFill(columns, rows, filter_type, level, sharpness, inner, seed, .asymmetric);
+}
+
+fn runEquivalenceCaseFill(
+    columns: u32,
+    rows: u32,
+    filter_type: Type,
+    level: u8,
+    sharpness: u8,
+    inner: bool,
+    seed: u32,
+    fill: EquivalenceFill,
 ) !void {
     const y_stride: usize = columns * 16;
     const uv_stride: usize = columns * 8;
@@ -943,9 +980,19 @@ fn runEquivalenceCase(
     const v_v = try testing.allocator.alloc(u8, uv_len);
     defer testing.allocator.free(v_v);
 
-    fillAsymmetricPlane(luma_s, y_stride, y_rows, y_stride, seed);
-    fillAsymmetricPlane(u_s, uv_stride, uv_rows, uv_stride, seed ^ 0xa5a5a5a5);
-    fillAsymmetricPlane(v_s, uv_stride, uv_rows, uv_stride, seed ^ 0x5a5a5a5a);
+    switch (fill) {
+        .asymmetric => {
+            fillAsymmetricPlane(luma_s, y_stride, y_rows, y_stride, seed);
+            fillAsymmetricPlane(u_s, uv_stride, uv_rows, uv_stride, seed ^ 0xa5a5a5a5);
+            fillAsymmetricPlane(v_s, uv_stride, uv_rows, uv_stride, seed ^ 0x5a5a5a5a);
+        },
+        .smooth_ramp => {
+            // row_delta 1 keeps |p1-p0|==1 <= hev_threshold for levels ≥15.
+            fillSmoothRampPlane(luma_s, y_stride, y_rows, y_stride, seed, 1);
+            fillSmoothRampPlane(u_s, uv_stride, uv_rows, uv_stride, seed ^ 0xa5a5a5a5, 1);
+            fillSmoothRampPlane(v_s, uv_stride, uv_rows, uv_stride, seed ^ 0x5a5a5a5a, 1);
+        },
+    }
     @memcpy(luma_v, luma_s);
     @memcpy(u_v, u_s);
     @memcpy(v_v, v_s);
@@ -1014,6 +1061,7 @@ test "SIMD horizontal edges match scalar on randomized asymmetric frames" {
 test "SIMD horizontal edges honor boundary macroblock guards" {
     // 1x1: no left/top neighbors — only possible edges are inner ones.
     // 2x1: left neighbor on the second MB, still no top neighbor.
+    // 1x2: top neighbor on the second row, still no left neighbor.
     const levels = [_]u8{ 10, 25, 63 };
     const sharpnesses = [_]u8{ 0, 4, 7 };
     var seed: u32 = 0x1357_9bdf;
@@ -1026,7 +1074,30 @@ test "SIMD horizontal edges honor boundary macroblock guards" {
                     seed +%= 0x7f4a7c15;
                     try runEquivalenceCase(2, 1, filter_type, level, sharpness, inner, seed);
                     seed +%= 0x9e3779b9;
+                    try runEquivalenceCase(1, 2, filter_type, level, sharpness, inner, seed);
+                    seed +%= 0x6a09e667;
                 }
+            }
+        }
+    }
+}
+
+test "SIMD horizontal edges match scalar on smooth ramps (low HEV)" {
+    // Asymmetric fill always exceeds hev_threshold at the tested levels, so it
+    // never selects filter4Vec/filter6Vec. A unit vertical ramp keeps hev false
+    // while needsFilter2 still passes at high strength — defending those kernels.
+    const levels = [_]u8{ 25, 40, 63 };
+    const sharpnesses = [_]u8{ 0, 4, 7 };
+    var seed: u32 = 0x0f1e_2d3c;
+
+    for (levels) |level| {
+        for (sharpnesses) |sharpness| {
+            for ([_]bool{ false, true }) |inner| {
+                try runEquivalenceCaseFill(2, 2, .complex, level, sharpness, inner, seed, .smooth_ramp);
+                seed +%= 0x9e3779b9;
+                // Top-only grid: macroblock-edge filter6 without a left edge.
+                try runEquivalenceCaseFill(1, 2, .complex, level, sharpness, inner, seed, .smooth_ramp);
+                seed +%= 0x7f4a7c15;
             }
         }
     }
