@@ -179,10 +179,12 @@ Recorded decisions (summary; full text in `PLAN.MD`):
   decode-Into pixels; read-only encode `zwebp_image_view`; library-owned
   encode bytes freed via `zwebp_free(ptr, len)`; Zig must gain a const-input
   encode path before C ships.
-- **Struct strategy** — leading `struct_size` on option/config/limits only;
-  size-aware `zwebp_*_init(void* s, uint32_t struct_size)` (optional
-  `ZWEBP_*_INIT(s)` macro) never writes past the caller's allocation;
-  directional older-prefix / newer-tail rules; fixed carriers unversioned.
+- **Struct strategy** — `struct_size` + size-aware init for option/config
+  structs only; `zwebp_limits` is fixed-layout (no `struct_size`;
+  non-size-aware `zwebp_limits_init`); size-aware
+  `zwebp_*_init(void* s, uint32_t struct_size)` (optional `ZWEBP_*_INIT(s)`
+  macro) never writes past the caller's allocation; directional
+  older-prefix / newer-tail rules; fixed carriers unversioned.
 - **Acceptance gates** — header/export consistency on static and shared
   artifacts; decode-from-C and encode-from-C behavioral smokes (encode frees
   via `zwebp_free`); error-map exhaustiveness; `struct_size` / init

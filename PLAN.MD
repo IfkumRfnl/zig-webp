@@ -507,7 +507,8 @@ ad-hoc numbers at runtime. C-surface validation that never becomes a Zig
 `errors.Error` also uses published stable codes: at least
 `ZWEBP_ERROR_BAD_STRUCT_SIZE` (unknown/too-small option/config
 `struct_size` on size-aware init or callees) and
-`ZWEBP_ERROR_INVALID_ARGUMENT` (FFI pointer/length violations in
+`ZWEBP_ERROR_INVALID_ARGUMENT` (FFI required-pointer NULLs,
+pointer/length violations, and invalid enum discriminants in
 decision 4) — numbered in the header, appended-only like the Zig-mapped
 codes, and covered by `zwebp_error_category` / `zwebp_error_name`.
 
@@ -548,20 +549,42 @@ pointer and length, so size-aware allocators remain possible.
 `ResourceLimits.allocation_bytes_max` remains the caller's bound on internal
 scratch/output exactly as in Zig.
 
-**FFI pointer/length validation (before Zig slices).** Every C wrapper that
-accepts a raw C pointer/length pair **must** validate it at the FFI
-boundary **before** constructing a Zig slice (or otherwise interpreting the
-bytes). Required nonempty buffers reject `NULL` pointers (`pixels` /
-`data` / input byte streams / metadata payload pointers when the
-corresponding length is nonzero or the buffer is required). Lengths are
-`uint64_t` on the C side; on targets where `usize` is narrower (wasm32 /
-32-bit), reject `len > SIZE_MAX` / `len > std.math.maxInt(usize)` rather
-than truncating or trapping. On violation, return the published
+**FFI invalid-argument validation (before Zig slices / enums).** Every C
+wrapper **must** validate FFI arguments at the boundary **before**
+constructing a Zig slice, dereferencing a caller pointer, or converting an
+integer discriminant into a Zig enum. On violation, return the published
 `ZWEBP_ERROR_INVALID_ARGUMENT` (decision 3) — never trap, never silently
-truncate. This applies to decode output `zwebp_buffer` pixel pairs, encode
-input `zwebp_image_view` pairs, input WebP byte streams
-`(const uint8_t* data, uint64_t len)`, and metadata payload
-`*_data`/`*_len` pairs on encode options.
+truncate, never `@enumFromInt` an unchecked value.
+
+- **Required pointers (plain and nested).** `NULL` for any required pointer
+  argument returns `ZWEBP_ERROR_INVALID_ARGUMENT`. This covers option/init
+  struct pointers (`zwebp_decoder_options*`, `zwebp_encoder_options*`,
+  `zwebp_demux_options*`, `zwebp_limits*` on `zwebp_limits_init`, and the
+  `void* s` of every size-aware `zwebp_*_init`), destination / view
+  pointers (`zwebp_buffer*`, `zwebp_image_view*` / `const zwebp_image_view*`),
+  and parse-result out-params (`zwebp_container_header*`,
+  `zwebp_chunk_header*`, feature-summary outs, and any other required
+  out-pointer). Optional pointers remain nullable only where the contract
+  explicitly says so (e.g. metadata payload pointers when the matching
+  `has_*` flag is clear).
+- **Pointer/length pairs.** Every raw C pointer/length pair must be
+  validated before a Zig slice is built. Required nonempty buffers reject
+  `NULL` pointers (`pixels` / `data` / input byte streams / metadata
+  payload pointers when the corresponding length is nonzero or the buffer
+  is required). Lengths are `uint64_t` on the C side; on targets where
+  `usize` is narrower (wasm32 / 32-bit), reject `len > SIZE_MAX` /
+  `len > std.math.maxInt(usize)` rather than truncating or trapping. This
+  applies to decode output `zwebp_buffer` pixel pairs, encode input
+  `zwebp_image_view` pairs, input WebP byte streams
+  `(const uint8_t* data, uint64_t len)`, and metadata payload
+  `*_data`/`*_len` pairs on encode options.
+- **Enum discriminants.** Every integer enum field the wrappers convert
+  into a Zig enum — including `ZWEBP_FORMAT_*` pixel formats on
+  `zwebp_buffer` / `zwebp_image_view`, and any other published enum
+  constants — **must** be range-checked against the published constant set
+  **before** `@enumFromInt` (or equivalent). Unknown values return
+  `ZWEBP_ERROR_INVALID_ARGUMENT`; wrappers must not trap on an invalid
+  discriminant or pass one into Zig.
 
 **Rationale.** Process-wide ownership keeps the C call shape close to
 "buffer in, status out" without a context handle on every call; Into
@@ -674,11 +697,16 @@ Mirror:
   - `zwebp_limits limits;` — nested by value (Zig `limits: ResourceLimits =
     .{}`); same nested-init rule as decoder options (fixed nested limits,
     no nested `struct_size`);
-  - `int32_t format;` — Zig `format: FormatKind = .lossless`; fixed header
-    constants `ZWEBP_CODEC_LOSSY = 0`, `ZWEBP_CODEC_LOSSLESS = 1` (not
-    `ZWEBP_FORMAT_*` pixel-order values; a unit test pins the mapping).
-    Default `ZWEBP_CODEC_LOSSLESS`. `encodeLossless` requires lossless;
-    `encodeLossy` requires lossy (same gate as Zig);
+  - **no** codec/format discriminator field — Zig `EncoderOptions.format`
+    (`features.FormatKind`, default `.lossless` in `src/options.zig`) is
+    **not** mirrored on the C struct. Each C entry point sets the Zig-side
+    `format` from the wrapper invoked: `zwebp_encode_lossless` →
+    `.lossless`, `zwebp_encode_lossy` → `.lossy` (matching
+    `encodeStaticLossless` / `encodeStaticLossy` in `src/encode.zig` /
+    `encodeLossless` / `encodeLossy` in `src/root.zig`, which reject a
+    mismatched `format` with `error.UnsupportedImageFormat`). There are no
+    `ZWEBP_CODEC_*` constants; pixel byte-order uses `ZWEBP_FORMAT_*` on
+    `zwebp_buffer` / `zwebp_image_view` only;
   - `uint8_t quality;` — Zig `quality: u8 = 75`; default `75`;
   - `bool preserve_metadata;` — Zig `preserve_metadata: bool = true`
     (reserved/no-effect; default `true`);
@@ -806,8 +834,13 @@ size-extensible (or nesting any extensible struct before later option
 fields — appending inside the nested type would shift subsequent fields and
 break the old-prefix promise); growing nested `zwebp_limits` after v1
 instead of appending new limit knobs on the embedding option/config tail;
-duplicating decode format on `zwebp_decoder_options.output_format` when C
-v1 is Into-only and `zwebp_buffer.format` is already authoritative;
+exposing a codec/format discriminator (`int32_t format` /
+`ZWEBP_CODEC_*`) on `zwebp_encoder_options` when the C entry-point name
+already selects the codec (Zig defaults `EncoderOptions.format` to
+`.lossless`, so default-initialized options would make `encodeLossy` fail
+with `UnsupportedImageFormat`); duplicating decode format on
+`zwebp_decoder_options.output_format` when C v1 is Into-only and
+`zwebp_buffer.format` is already authoritative;
 `0`-as-unset sentinels; omitting `zwebp_*_init` and forcing callers to
 hand-reconstruct Zig defaults with no helper; treating
 `struct_size = sizeof(...)` alone as initialization; a size-unaware
@@ -821,7 +854,10 @@ inputs; `@constCast` (or equivalent) from `zwebp_image_view`'s
 `const uint8_t* pixels` onto Zig `ImageBuffer` / `[]u8`, or a silent
 whole-image copy to obtain mutable encode input (primary requirement: the
 Zig const-input encode path in decision 4); packing Zig slices as fat
-pointers without the decision-4 FFI pointer/length checks; bidirectional
+pointers without the decision-4 FFI required-pointer / pointer-length /
+enum-discriminant checks; leaving required option/buffer/out-param
+pointers unchecked (NULL dereference/trap); converting unchecked
+`int32_t` enum fields with `@enumFromInt`; bidirectional
 "accept any `sizeof`" (old libraries must not silently ignore unknown
 trailing semantics); rejecting every smaller-than-current option/config
 struct (would make appended fields a breaking change for old callers).
@@ -870,10 +906,14 @@ the C ABI ships):
 2. **Behavioral decode gate** — a C smoke program decodes a committed
    corpus still into a caller-owned buffer via the Into analogue and
    byte-compares against Zig `decodeStatic` / corpus hash expectations.
-   Behavioral coverage also includes decision 4's FFI pointer/length rule:
-   at least one NULL and one oversized-`len` rejection case on a decode
-   output buffer and/or input byte stream, returning
-   `ZWEBP_ERROR_INVALID_ARGUMENT` (no trap / no truncate).
+   Behavioral coverage also includes decision 4's FFI invalid-argument
+   rule: at least one NULL and one oversized-`len` rejection case on a
+   decode output buffer and/or input byte stream; at least one NULL
+   required-pointer case (options struct, `zwebp_buffer*`, or a
+   parse-result out-param); and at least one invalid enum-discriminant
+   case (e.g. unknown `ZWEBP_FORMAT_*` on a `zwebp_buffer`), each
+   returning `ZWEBP_ERROR_INVALID_ARGUMENT` (no trap / no truncate / no
+   unchecked `@enumFromInt`).
 3. **Behavioral encode gate** — presupposes the Zig const-input encode
    path from decision 4. C smoke programs encode from a
    `const zwebp_image_view` through **each encoder exported in v1** —
@@ -886,7 +926,10 @@ the C ABI ships):
    or casting away const on caller pixels; `@constCast` bridges are out of
    policy), wrong result lengths, and missing or mismatched paired freeing
    in **either** encoder. Include at least one NULL / oversized-`len`
-   rejection case on an encode input view and on a metadata payload pair
+   rejection case on an encode input view and on a metadata payload pair;
+   at least one NULL required-pointer case (`zwebp_encoder_options*` or
+   `const zwebp_image_view*`); and at least one invalid enum-discriminant
+   case (e.g. unknown `ZWEBP_FORMAT_*` on a `zwebp_image_view`)
    (decision 4).
 4. **Error-map exhaustiveness** — for each exported C wrapper, a test
    (comptime preference, else unit) proves the Zig→C status map covers that
