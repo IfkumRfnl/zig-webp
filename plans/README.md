@@ -43,18 +43,18 @@ below and can be turned into plans on request.
 | 010 | Docs truth-up: encoder options, root docs, install flow, `zig build ci` | P1 | S | — | DONE — merged as PR #86 (commit `ce11ad6`) |
 | 011 | VP8L palette detection O(pixels) via fixed hash probe | P2 | S | — | DONE — merged as PR #85 (commit `6922f08`) |
 | 012 | `decodeStaticInto` — decode into caller-owned buffers (step 12) | P1 | M | — | DONE — merged as PR #90 (merge commit `772485e`; implementation commit `5843be4`; codex review green on first pass) |
-| 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | DONE — merged as PR #92 (merge commit `753b6e7`; first `big-endian` CI run green: full 464-test suite on powerpc64 under QEMU, no endianness bugs; `macos` job green after an operator-authorized setup-zig key-mapping fix, commit `c7b03da`; browser check remains a pre-tag manual gate) |
-| 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | DONE — branch `wasm32-spike`; `wasm-check` + full wasm32-wasi suite under wasmtime in CI; 32-bit Huffman shift fix landed |
-| 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | DONE — PR #102 (branch `c-abi-design`); `PLAN.MD` step-13 section only; follow-up implementation post-1.0 |
+| 013 | 1.0 stability contract + compatibility matrix (BE/macOS CI, browser gate) | P1 | M | 012 (soft) | DONE — merged as PR #92 (merge commit `753b6e7`); big-endian and macOS CI passed, the manual browser gate later closed, and `v1.0.0` shipped |
+| 014 | WASM (wasm32) build spike + compile gate | P2 | S | — | DONE — merged as PR #96 (merge commit `29be0df`); `wasm-check` plus the full wasm32-wasi suite run in CI, and the 32-bit Huffman shift fix landed |
+| 015 | C-ABI export layer — design document (PLAN.MD section, no code) | P2 | M | 012, 013 | DONE — merged as PR #102 (merge commit `7839d8d`); `PLAN.MD` step-13 section only, with implementation left to separate post-1.0 plans |
 | 016 | Lossy encoder m5/m6 headroom measurement + recommendation | P3 | M | — | TODO |
-| 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | DONE — PR #99; `zig build info` / `tools/zig-webp-info.zig` container probe on public `parseWebP` |
-| 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — executed on branch `step-12-tier1-audit` (worktree `/home/hayk/zig-webp-exec-018`, HEAD `131efd0`); reviewer-verified, not merged (no PR per instructions) |
+| 017 | `zig-webp-info` CLI (webpinfo-style probe) | P3 | S | — | DONE — merged as PR #99 (merge commit `08561a2`); `zig build info` probes container structure through public `parseWebP` |
+| 018 | Step-12 close-out: Tier-1 API audit + docs completeness + 1.0 readiness | P1 | M | 012, 013 | DONE — merged as PR #94 (merge commit `31ecd89`); reviewer-verified Tier-1 audit and release-readiness record |
 | 019 | Big-endian CI job to ~3 min: ReleaseSafe + 4-way sharded QEMU run | P1 | M | — | DONE — PR #97 CI green; full 464-test powerpc64 ReleaseSafe suite passed in 3m9s with 4 QEMU shards (run `28993818050`) |
-| 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | DONE — branch `bench-dwebp-internal-timing` |
-| 021 | VP8L bit reader: bulk 64-bit refill + unchecked fast path, byte-exact | P1 | M | 020 (soft) | TODO |
-| 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft) | TODO |
-| 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | TODO |
-| 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | REJECTED for merge — all-lossy 1.0287×–1.0375× straddles 1.03×; IDCT omitted on draft `perf/vp8-idct-prediction-simd`; prediction untouched |
+| 020 | Record dwebp internal decode time in webp-bench.sh (drop the I/O asterisk) | P1 | S | — | DONE — merged as PR #98 (merge commit `91298d9`); `decode_int_ms` records `dwebp -v` internal decode time |
+| 021 | VP8L bit reader: bulk 64-bit refill + unchecked fast path, byte-exact | P1 | M | 020 (soft) | REJECTED — byte-exact experiment measured about 1.011× aggregate lossless speedup, below the plan's 1.05× complexity gate; not merged |
+| 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft; independently executable) | DONE — merged as PR #100 (merge commit `2369b01`); about 1.05×–1.08× aggregate lossless speedup with byte-exact output |
+| 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | DONE — merged as PR #101 (merge commit `28d9a58`); horizontal SIMD improved aggregate lossy decode 1.0654×, while vertical edges remain scalar |
+| 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | REJECTED for merge — all-lossy 1.0287×–1.0375× straddled 1.03×; PR #103 retained scalar IDCT and left prediction untouched |
 | 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
 | 026 | Luma SSIM column in the lossy encode report | P3 | S | — | TODO |
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
@@ -62,6 +62,26 @@ below and can be turned into plans on request.
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-15** — Reconciled all 27 plans against `origin/main` at
+  `7686a55`. Representative cheap HEAD checks still hold for every DONE
+  cohort (CI/tool compilation, hardening/fuzz wiring, Tier-1/portability
+  contracts, and accepted decode-performance paths); no plan is BLOCKED or
+  stale IN PROGRESS. Plans **014/015/017–020/022/023** are merged.
+  Plans **021/024** remain REJECTED measurement outcomes; their retained
+  notes are historical evidence, not authorization to reopen either
+  experiment without a new measurement plan.
+- The executable TODO set is **016/025/026/027**. All four commit-range drift
+  checks are empty at `7686a55`; cwebp/dwebp 1.5.0 and the reference/photo
+  inputs required by plan 016 are present. Plan 025's global-predictor premise
+  still matches the encoder and its 34-source committed / 77-source local
+  report contracts remain distinct.
+- Refreshed active-plan accuracy: plan 016 now rejects the lossy report's
+  incorrect 37.13 dB headline denominator and requires photo-only finite rows;
+  plan 026 includes correcting that report accounting (34 total, 30 finite,
+  42.0847 dB finite-row mean) and its false oracle-consumer comment; plan 027
+  pins its step-14 insertion point and requires an explicit caller-owned
+  `std.Io`/provider ownership decision instead of an implicit global scheduler.
 
 - **2026-07-14** — Cumulative draft PR #103 rebased onto main after #100/#101/#102
   squash-merges. Conservative cut through compact Huffman `fbe738c`: plan
@@ -118,10 +138,10 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   all in-scope), CI run `28878252291` at `6d62f55` confirmed green via `gh`
   (3 jobs), oracle modes re-run by the executor with artifacts on disk
   (`/tmp/plan018-encode-corpus.tsv`, `/tmp/plan018-anim-diff/`) matching the
-  0.2.0 records digit-for-digit. 1.0.0 readiness recorded in `PROGRESS.MD`;
-  remaining decisions (tag now vs land 014/016/017 first; run the release
-  procedure) are the operator's. **Not merged** — merging is the operator's
-  call.
+  0.2.0 records digit-for-digit. The audit subsequently landed through PR #94
+  (`31ecd89`); release PR #95 produced tag `v1.0.0`. Plans 014 and 017 later
+  merged through PRs #96 and #99. Plan 016 remains an independent post-release
+  measurement TODO.
 
 - **2026-07-07** — Plan 012 executed end to end on branch
   `decode-static-into`, commit `5843be4`. Drift check against planning commit

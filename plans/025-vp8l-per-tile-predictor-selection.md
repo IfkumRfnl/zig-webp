@@ -7,10 +7,10 @@
 > in `plans/README.md` — unless a reviewer dispatched you and told you they
 > maintain the index.
 >
-> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/vp8l/encoder.zig src/vp8l/forward_transform.zig testdata/encode-corpus-sizes.tsv PROGRESS.MD`
-> If any in-scope file changed since this plan was written, compare the
-> "Current state" excerpts against the live code before proceeding; on a
-> mismatch, treat it as a STOP condition.
+> **Drift check (run first)**: `git diff --stat 7686a55..HEAD -- src/vp8l/encoder.zig src/vp8l/forward_transform.zig testdata/encode-corpus-sizes.tsv PROGRESS.MD plans/README.md`
+> This plan was refreshed against `origin/main` after the decode-performance
+> campaign. The encoder premise still holds; compare later in-scope changes
+> against the contracts below and stop on a mismatch.
 
 ## Status
 
@@ -19,22 +19,20 @@
 - **Risk**: MED (encoder output changes by design; round-trip exactness and size-regression gates protect it)
 - **Depends on**: none (independent of the decode-perf plans)
 - **Category**: perf (compression ratio)
-- **Planned at**: commit `29be0df`, 2026-07-09
+- **Planned at**: commit `7686a55`, refreshed 2026-07-15 (originally authored
+  at `29be0df`)
 
 ## Why this matters
 
 The lossless encoder's known size gap vs `cwebp -lossless` is concentrated
-in photographic content: per the committed baseline, the corpus median is
-1.0368× but `lossless2`/`lossless3` reach **1.59×** and the photos run
-1.05–1.18× (`PROGRESS.MD`, "Recently Completed" step-7 rows). The recorded
-diagnosis — written into the encoder's own docs — is that the predictor
-transform picks **one global mode for the whole image**, while cwebp picks a
-mode **per tile** (its default effort uses 16×16 tiles). The decoder already
-supports per-tile predictor sub-images (it decodes every `cwebp -lossless`
-file byte-exactly), so this is purely encoder work: choose a mode per tile,
-emit a real (non-constant) predictor sub-image, and keep the bit-exact
-round-trip guarantee. This closes the single most embarrassing number in
-the encode record.
+in photographic content: the committed baseline records a 1.0368× corpus
+median, `lossless2`/`lossless3` up to 1.59×, and photos around 1.05–1.18×
+(`PROGRESS.MD`, step-7 rows). The leading working hypothesis is that choosing
+one global predictor mode leaves local structure unmodeled while `cwebp` can
+choose per tile. The decoder already supports per-tile predictor sub-images,
+so this experiment can isolate the encoder change while preserving the
+bit-exact round-trip gate. Its before/after size measurements decide whether
+the hypothesis explains enough of the tail to retain the added machinery.
 
 ## Current state
 
@@ -102,9 +100,9 @@ in `src/vp8l/transform.zig:120-138` (`readBlockTransform`:
   `src/testing/encode_corpus.zig` (synthetic matrix from
   `src/testing/synth.zig` + committed photos in `testdata/photos/`) plus
   the 43-file corpus re-encode round-trip.
-- Size reporting: `zig build encode-report` prints per-source encoded size
-  and round-trip verdict; committed baseline
-  `testdata/encode-corpus-sizes.tsv`.
+- Size reporting: plain `zig build encode-report` covers the 34 committed
+  synthetic/photo sources used by `testdata/encode-corpus-sizes.tsv`;
+  `--with-corpus` adds 43 in-tree WebPs for a 77-source local oracle report.
 - External size oracle (local only, not CI):
   `tools/webp-oracle.sh compare-encode-corpus REPORT.tsv` pairs sizes
   against `cwebp -lossless`.
@@ -120,9 +118,10 @@ reimplement from the spec; libwebp may only inform *what* to test.
 
 | Purpose | Command | Expected on success |
 |---|---|---|
-| Full local gate | `zig build ci` | exit 0 (fmt, compile, 464+ tests incl. encode round-trips) |
-| Size report | `zig build encode-report` | TSV, 77 sources, 0 round-trip mismatches |
-| Size oracle (optional, local) | `tools/webp-oracle.sh compare-encode-corpus /tmp/plan025-report.tsv` | per-file ratios vs `cwebp -lossless` |
+| Full local gate | `zig build ci` | exit 0 (fmt, compile, tests, and encode round-trips) |
+| Committed-baseline report | `zig build encode-report -- /tmp/plan025-base.tsv` | TSV, 34 sources, 0 round-trip mismatches |
+| Full local oracle report | `zig build encode-report -- --with-corpus /tmp/plan025-full.tsv` | TSV, 77 sources, 0 round-trip mismatches |
+| Size oracle (optional, local) | `tools/webp-oracle.sh compare-encode-corpus /tmp/plan025-full.tsv` | per-file ratios vs `cwebp -lossless` |
 | Decode validity (optional, local) | `dwebp <file> -o /dev/null` | exit 0 |
 | 32-bit/wasm gate | `zig build wasm-check` | exit 0 |
 
@@ -133,6 +132,7 @@ reimplement from the spec; libwebp may only inform *what* to test.
 - `src/vp8l/forward_transform.zig`
 - `testdata/encode-corpus-sizes.tsv` (regenerate — sizes change by design)
 - `PROGRESS.MD` (dated result row + entry)
+- `plans/README.md` (status row only)
 
 **Out of scope** (do NOT touch, even though they look related):
 - `src/vp8l/decoder.zig`, `src/vp8l/inverse_transform.zig`,
@@ -156,12 +156,16 @@ reimplement from the spec; libwebp may only inform *what* to test.
 
 ### Step 1: Record the size baseline
 
-`zig build encode-report > /tmp/plan025-before.tsv` — confirm 0 mismatches
-and stash the sizes. If `cwebp` is available, also run
-`tools/webp-oracle.sh compare-encode-corpus /tmp/plan025-before.tsv` and
-save the ratio table (`lossless2`/`lossless3` should read ≈1.59×).
+Generate both baselines:
 
-**Verify**: report exists, `0` in the mismatch column throughout.
+1. `zig build encode-report -- /tmp/plan025-before-base.tsv` — 34 committed
+   synthetic/photo sources, 0 mismatches.
+2. `zig build encode-report -- --with-corpus /tmp/plan025-before-full.tsv` —
+   77 sources, 0 mismatches. If `cwebp` is available, run
+   `tools/webp-oracle.sh compare-encode-corpus /tmp/plan025-before-full.tsv`;
+   `lossless2`/`lossless3` should read about 1.59×.
+
+**Verify**: both reports exist and every mismatch field is `0`.
 
 ### Step 2: Tiled forward transform
 
@@ -241,22 +245,20 @@ encode decodes bit-exactly through this library's own decoder.
 
 ### Step 4: Measure sizes, regenerate the committed baseline
 
-1. `zig build encode-report > /tmp/plan025-after.tsv` — must show
-   **0 round-trip mismatches** across all 77 sources.
-2. Compare against `/tmp/plan025-before.tsv`: aggregate must not grow;
-   photographic sources should shrink. If any single file grows > 2%,
-   investigate the selection rule before proceeding (likely the side-info
-   estimate is too optimistic for that content class).
+1. Run `zig build encode-report -- /tmp/plan025-after-base.tsv`; compare its
+   34 rows against `/tmp/plan025-before-base.tsv`. Aggregate must not grow.
+2. Run `zig build encode-report -- --with-corpus
+   /tmp/plan025-after-full.tsv`; compare all 77 rows against
+   `/tmp/plan025-before-full.tsv`. Photographic sources should shrink. If any
+   file grows more than 2%, investigate the selection rule before proceeding
+   (the side-information estimate may be too optimistic for that class).
 3. If `cwebp` is available: `tools/webp-oracle.sh compare-encode-corpus
-   /tmp/plan025-after.tsv`. Success target: `lossless2`/`lossless3`
-   materially below 1.59× and corpus median ≤ 1.0368× (no regression).
-   Also spot-check 3 encoded files with `dwebp -o /dev/null` (external
-   decodability).
-4. Regenerate the committed baseline exactly as the harness documents:
-   update `testdata/encode-corpus-sizes.tsv` from the new report (check
-   `src/testing/encode_corpus.zig` / the report tool header for the exact
-   regeneration command; it is the encode-side analogue of
-   `zig build corpus-hashes`).
+   /tmp/plan025-after-full.tsv`. Success target: `lossless2`/`lossless3`
+   materially below 1.59× and corpus median no worse than 1.0368×. Also
+   spot-check three encoded files with `dwebp -o /dev/null`.
+4. Regenerate the committed 34-source baseline with
+   `zig build encode-report -- testdata/encode-corpus-sizes.tsv`. Do not
+   commit the 77-source `--with-corpus` report.
 5. Append the dated `PROGRESS.MD` row + entry: per-file median/aggregate
    ratios, the `lossless2`/`lossless3` before/after, and the honest note
    that encode *speed* changed too (report the `zig build bench` lossless
@@ -297,7 +299,9 @@ Verification: `zig build test` → all pass including the new tests.
 Machine-checkable. ALL must hold:
 
 - [ ] `zig build ci` exits 0; `zig build wasm-check` exits 0
-- [ ] `zig build encode-report`: 77 sources, 0 round-trip mismatches
+- [ ] Plain `zig build encode-report`: 34 sources, 0 round-trip mismatches
+- [ ] `zig build encode-report -- --with-corpus /tmp/plan025-after-full.tsv`:
+      77 sources, 0 round-trip mismatches
 - [ ] Aggregate corpus size ≤ before; no single file > +2% without a
       recorded justification
 - [ ] If cwebp present: `lossless2`/`lossless3` ratio < 1.40× (from 1.59×)
