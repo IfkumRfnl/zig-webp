@@ -556,7 +556,7 @@ test "VP8L entropy selects prefix groups from meta-prefix blocks" {
         2,
         0,
         .{},
-        buffers,
+        &buffers.prefix_code_group,
     );
     defer store.deinit();
 
@@ -610,7 +610,7 @@ test "VP8L entropy rejects meta-prefix groups that were not read" {
         1,
         0,
         .{},
-        buffers,
+        &buffers.prefix_code_group,
     );
     defer store.deinit();
 

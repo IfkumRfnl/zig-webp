@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Current Position
 
@@ -133,6 +133,52 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-15 — VP8L packed tables, bounded scratch, and packed predictor add
+
+Three independent ReleaseFast experiments were accepted into
+`perf/vp8l-next`; rejected alternatives and temporary instrumentation were
+not retained.
+
+- **Two-byte Huffman entries.** `huffman.Entry` is now a packed `u16`
+  (`bits:u4` + `payload:u12`) with the 8-bit root unchanged. The green-table
+  `enough.c`/libwebp bound tightens `SymbolTable.entry_count_limit` from
+  **33024** to **2704**; symbols (maximum 2327), table offsets, invalid
+  sentinel, and root-relative kind are asserted. Default entries fail closed,
+  secondary slots require symbol kind, and accessors assert the caller's root
+  width. One five-table scratch set falls from about **645 KiB** to about
+  **29 KiB**.
+- **One reentrant scratch set.** Transform, meta-prefix, group, and main-image
+  parsing are sequential, and owned groups copy their entries before the next
+  parse. They now share one caller-stack `PrefixCodeGroupBuffers` instead of
+  nesting two sets. The rejected prototype used a large mutable
+  `threadlocal`; production keeps caller-owned stack state, preserving
+  reentrancy and avoiding a permanent TLS/wasm memory tax. Parsers initialize
+  every scratch entry before reading it.
+- **Packed predictor residual add.** VP8L predictor restoration adds the four
+  wrapping ARGB channels with two masked `u32` sums. The retained channel-wise
+  helper is the equivalence authority; deterministic random and wraparound
+  cases cover carry isolation. This is numeric-lane arithmetic, not
+  endian-dependent byte reinterpretation.
+
+**Correctness.** `zig build ci` passes (**485/485** tests), including format
+and compile gates; `zig build wasm-check` passes wasm32-wasi and
+wasm32-freestanding compilation. Three full `image-webp` comparison runs each
+validated **135/135** stills with zero skips.
+
+**Speed (ReleaseFast, AMD EPYC 7663, single thread).** Three alternating full
+direct-Zig baseline/integrated orderings used `decode-into`, `--iters 15
+--warmup 2 --budget-ms 1500`. Median-of-three per-file speedups were:
+lossless opaque **1.3041×** geomean (**1.0956×** summed time), lossless alpha
+**8.5807×** geomean, lossy opaque **1.0009×** geomean (control), and lossy
+alpha **1.6987×** geomean (compressed `ALPH` uses VP8L). The alpha geomeans are
+small-file-heavy, not general throughput claims: `lossless_vec_1_0.webp`
+improved **0.2075→0.0085 ms** (**24.4×**) and
+`one_color_no_palette.webp` **0.4422→0.1549 ms** (**2.86×**), while a separate
+long-budget cumulative run on `lossless_big_random_alpha.webp` improved
+**264.39→258.32 ms** (**1.0235×**). The isolated packed-add experiment measured
+**212.76→202.69 ms** (**1.0497×**) on that asset; host variance remains large
+for the biggest files.
 
 ### 2026-07-14 — Plan 024 IDCT omitted from cumulative draft (conservative cut)
 

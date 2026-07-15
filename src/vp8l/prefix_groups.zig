@@ -20,6 +20,8 @@ pub const Options = struct {
     group_count_max: u32 = meta_prefix.group_count_max,
 };
 
+/// Scratch holder for tests and callers that still allocate a dedicated buffer.
+/// Prefer sharing the decoder's `prefix_code_group` scratch instead.
 pub const WorkBuffers = struct {
     prefix_code_group: image_data.PrefixCodeGroupBuffers = .{},
 };
@@ -36,7 +38,7 @@ pub const Store = struct {
         group_count: u32,
         color_cache_size: u16,
         options: Options,
-        buffers: *WorkBuffers,
+        prefix_code_group: *image_data.PrefixCodeGroupBuffers,
     ) errors.Error!Store {
         if (group_count == 0) return error.InvalidVP8LImageData;
         if (group_count > meta_prefix.group_count_max) return error.InvalidVP8LImageData;
@@ -63,7 +65,7 @@ pub const Store = struct {
             const prefix_group = try image_data.readPrefixCodeGroup(
                 reader,
                 color_cache_size,
-                &buffers.prefix_code_group,
+                prefix_code_group,
             );
             store.groups[group_index] = try store.copyGroup(prefix_group, options);
             store.initialized_count += 1;
@@ -188,7 +190,7 @@ fn writeConstantPrefixCodeGroup(
 }
 
 comptime {
-    assert(@sizeOf(huffman.Entry) == 4);
+    assert(@sizeOf(huffman.Entry) == 2);
     assert(meta_prefix.group_count_max == 65_536);
 }
 
@@ -203,7 +205,7 @@ test "VP8L prefix group store reads and owns multiple groups" {
     defer std.testing.allocator.destroy(buffers);
     buffers.* = .{};
 
-    var store = try Store.readAll(std.testing.allocator, &reader, 2, 0, .{}, buffers);
+    var store = try Store.readAll(std.testing.allocator, &reader, 2, 0, .{}, &buffers.prefix_code_group);
     defer store.deinit();
 
     var symbol_reader = bit_reader.BitReader.init(&.{});
@@ -229,7 +231,7 @@ test "VP8L prefix group store selects groups through meta-prefix blocks" {
     defer std.testing.allocator.destroy(buffers);
     buffers.* = .{};
 
-    var store = try Store.readAll(std.testing.allocator, &reader, 2, 0, .{}, buffers);
+    var store = try Store.readAll(std.testing.allocator, &reader, 2, 0, .{}, &buffers.prefix_code_group);
     defer store.deinit();
 
     const info = meta_prefix.Info{
@@ -267,7 +269,7 @@ test "VP8L prefix group store enforces group and allocation limits" {
     buffers.* = .{};
     try std.testing.expectError(
         error.InvalidVP8LImageData,
-        Store.readAll(std.testing.allocator, &zero_reader, 0, 0, .{}, buffers),
+        Store.readAll(std.testing.allocator, &zero_reader, 0, 0, .{}, &buffers.prefix_code_group),
     );
 
     var limited_reader = bit_reader.BitReader.init(try writer.finish());
@@ -276,20 +278,19 @@ test "VP8L prefix group store enforces group and allocation limits" {
         error.AllocationLimitExceeded,
         Store.readAll(std.testing.allocator, &limited_reader, 1, 0, .{
             .allocation_bytes_max = 1,
-        }, buffers),
+        }, &buffers.prefix_code_group),
     );
 }
 
-test "VP8L compact Huffman Entry allocation charges four bytes per entry" {
-    // Contract after Entry 6→4 densification: one 8-bit root table is 1KB,
-    // and allocationBytes must track that size (not the former 1536).
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(huffman.Entry));
+test "VP8L packed Huffman Entry allocation charges two bytes per entry" {
+    // Contract after Entry 4→2 densification: one 8-bit root table is 512B.
+    try std.testing.expectEqual(@as(usize, 2), @sizeOf(huffman.Entry));
     try std.testing.expectEqual(
-        @as(usize, 1024),
+        @as(usize, 512),
         @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max,
     );
     try std.testing.expect(
-        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max < 1536,
+        @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max < 1024,
     );
 }
 
@@ -310,6 +311,6 @@ test "VP8L prefix group store cleans up partial group copies on limit failure" {
         error.AllocationLimitExceeded,
         Store.readAll(std.testing.allocator, &reader, 1, 0, .{
             .allocation_bytes_max = partial_limit,
-        }, buffers),
+        }, &buffers.prefix_code_group),
     );
 }

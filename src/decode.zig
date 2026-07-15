@@ -173,7 +173,6 @@ fn decodeLossless(
 
     const out = try gpa.alloc(u8, output_count);
     errdefer gpa.free(out);
-
     var work_buffers = vp8l_decoder.WorkBuffers{
         .transform_pixels = transform_pixels,
         .entropy_image = entropy_image,

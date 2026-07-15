@@ -18,8 +18,9 @@ const prefix_groups = @import("prefix_groups.zig");
 const transform = @import("transform.zig");
 
 pub const WorkBuffers = struct {
-    prefix_code_group: image_data.PrefixCodeGroupBuffers = .{},
-    prefix_groups: prefix_groups.WorkBuffers = .{},
+    /// Huffman scratch shared by transform, main-image, and group parsing.
+    /// Every parser initializes the entries it uses before reading them.
+    prefix_code_group: image_data.PrefixCodeGroupBuffers = undefined,
     prefix_group_options: prefix_groups.Options = .{},
     entropy_image: []pixel.Pixel = &.{},
     transform_pixels: []pixel.Pixel = &.{},
@@ -226,7 +227,7 @@ fn decodeMainImage(
         info.group_count,
         image_data.colorCacheSize(color_cache),
         buffers.prefix_group_options,
-        &buffers.prefix_groups,
+        &buffers.prefix_code_group,
     );
     defer group_store.deinit();
 

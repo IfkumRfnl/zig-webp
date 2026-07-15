@@ -18,6 +18,8 @@ Plans 020–027: improve-skill `plan` session of 2026-07-09 (commit `29be0df`;
 maintainer requested plans for the advised performance push after reviewing
 the step-10 record). See "Planning session — 2026-07-09" below for the
 selection rationale and one recorded reversal.
+Plan 028: Rust-informed VP8L performance audit of 2026-07-15 (commit
+`02f4e05`), with four independently gated decode experiments.
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -58,6 +60,7 @@ below and can be turned into plans on request.
 | 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
 | 026 | Luma SSIM column in the lossy encode report | P3 | S | — | TODO |
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
+| 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -224,6 +227,38 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   SSIM.
 - 027 is post-1.0 track like 015; execute after the release decisions, with
   020–023's measurements in hand.
+- 028 starts from the cumulative packed-entry/scratch/predictor branch at
+  `02f4e05`. Its four candidates are measured independently in this order:
+  preserve spatial-group state, specialize cached copies, specialize palette
+  expansion, then inspect/remove discarded summary work. Rejected plan-021
+  refill and 10-bit-root shapes stay out of scope.
+
+## Performance audit — 2026-07-15 (commit `02f4e05`)
+
+The maintainer asked why the local pure-Rust `image-webp` source was not being
+used systematically to explain its remaining lead. A direct source comparison
+confirmed that the 135-file benchmark is directionally comparable and found
+four Zig-side opportunities, recorded with excerpts, tests, gates, and STOP
+conditions in plan 028:
+
+- LZ77 copies currently discard valid spatial Huffman-group run state and
+  trigger another checked, by-value group lookup.
+- Cached copies remain scalar, including redundant distance-one cache
+  insertion; Rust separates copying from cache updates and peeks a second
+  primary-table cache symbol.
+- Palette expansion performs per-output-pixel coordinate/shift/bounds work;
+  Rust specializes packed-byte expansion by palette-size band.
+- High-level decode discards `DecodeSummary`, but per-operation counters may
+  survive unless ReleaseFast inlining eliminates them; assembly inspection is
+  required before changing code.
+
+Current three-run medians: Zig / Rust lossless opaque **2.7621x**, lossless
+alpha **2.8057x**, Zig wins **0/47** lossless files. Existing attribution says
+entropy is about **66%–95%** of VP8L decode, so plan 028 orders entropy work
+before palette work. Already measured and rejected: 10-bit Huffman root,
+plan-021 bulk refill/unchecked lookup, and an unconditional constant-group
+fill branch.
+
 
 ## Planning session — 2026-07-09 (commit `29be0df`, `plan` variant)
 
