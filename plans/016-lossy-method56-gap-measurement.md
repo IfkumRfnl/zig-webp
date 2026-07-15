@@ -8,10 +8,10 @@
 > done, update the status row in `plans/README.md` — unless a reviewer
 > dispatched you and told you they maintain the index.
 >
-> **Drift check (run first)**: `git diff --stat 4c5572a..HEAD -- src/vp8/encoder.zig src/options.zig tools/zig-webp-encode-lossy-report.zig tools/webp-oracle.sh`
-> If any in-scope-for-reading file changed since this plan was written,
-> compare the "Current state" excerpts against the live code before
-> proceeding; on a mismatch, treat it as a STOP condition.
+> **Drift check (run first)**: `git diff --stat 7686a55..HEAD -- src/vp8/encoder.zig src/options.zig src/testing/metrics.zig tools/zig-webp-encode-lossy-report.zig tools/webp-oracle.sh PROGRESS.MD plans/README.md`
+> This plan was refreshed after the 1.0 release and decode-performance
+> campaign. Compare later encoder, metric, or report changes against the
+> contracts below; treat a measurement-shape mismatch as a STOP condition.
 
 ## Status
 
@@ -21,13 +21,14 @@
 - **Depends on**: none. Requires `cwebp` and `dwebp` (libwebp 1.5.x) on PATH
   and the reference clones under `references/` (see STOP conditions).
 - **Category**: direction
-- **Planned at**: commit `4c5572a`, 2026-07-07
+- **Planned at**: commit `7686a55`, refreshed 2026-07-15 (originally authored
+  at `4c5572a`)
 
 ## Why this matters
 
 `EncoderOptions.method` is documented `cwebp -m` compatible (0..6), but
 methods 5 and 6 are a shipped no-op: they clamp to method 4's search
-(`src/options.zig:28-32`, `src/vp8/encoder.zig:145-165`). That is honest
+(`src/options.zig:30-34`, `src/vp8/encoder.zig:145-158`). That is honest
 today — the step-8b search is exhaustive over the modes this encoder
 implements — but it means the knob's top third does nothing, while `cwebp
 -m 5/-m 6` buy real quality through features this encoder lacks (adaptive
@@ -42,7 +43,7 @@ the question.
 
 ## Current state
 
-- `src/vp8/encoder.zig:145-165` — the `Effort` tier map:
+- `src/vp8/encoder.zig:145-158` — the `Effort` tier map:
 
   ```zig
   ///   * 0..1: DC mode only, no B_PRED, no segmentation (fastest).
@@ -53,9 +54,9 @@ the question.
   /// "equal or more search" means equal here.
   ```
 
-- `src/options.zig:28-32` — the public knob's doc: "methods 5–6 currently
+- `src/options.zig:30-34` — the public knob's doc: "methods 5–6 currently
   clamp to 4 (no extra search above the 8b baseline yet)."
-- Known missing-vs-libwebp features (from README.MD:38-39 and PROGRESS.MD's
+- Known missing-vs-libwebp features (from README.MD and PROGRESS.MD's
   step-8 rows): coefficient probabilities stay at the RFC 6386 defaults
   (libwebp adapts them per frame), one token partition, no trellis
   quantization, no near-lossless. The 8b gate result: at matched output size
@@ -71,9 +72,9 @@ the question.
   - `zig build encode-lossy -- IN.webp OUT.webp Q` (tool `zig-webp-encode`)
     — re-encodes a still WebP at quality Q; also installed as
     `zig-out/bin/zig-webp-encode` by `zig build`.
-  - `src/testing/metrics.zig` — the luma-PSNR definition both sides must
-    use: libwebp's integer `VP8RGBToY` weights
-    (`16839*r + 33059*g + 6420*b`, YUV_FIX=16, +16<<16 offset).
+  - `src/testing/metrics.zig:48-52` — the luma-PSNR definition both sides
+    must use: full-range integer BT.601 weights
+    (`19595*r + 38470*g + 7471*b + 32768`) shifted right by 16.
 - **Two measurement pitfalls, learned the hard way (respect both):**
   1. The matched-size methodology: the step-8b/8c comparisons are luma PSNR
      **at matched output size**, not matched quality number. Procedure per
@@ -84,11 +85,14 @@ the question.
      luma PSNRs at that size. There is no committed harness — build a
      scratch script (keep it out of the repo, or under your scratch
      directory; do NOT commit it).
-  2. `encode-lossy-report`'s headline mean EXCLUDES files whose PSNR is
-     `inf` (losslessly reconstructed flats), so corpus-wide means mislead
-     across encoder variants. Compare on the **photo corpus rows only**
-     (`awk -F'\t' '$1=="photo"'`), and filter `$9!="inf"` (the literal
-     string `inf` parses as 0 in naive awk).
+  2. Do **not** consume `encode-lossy-report`'s headline PSNR mean. At this
+     revision it skips `inf` rows in the numerator but still divides by all 34
+     sources: four infinite rows make the summary print 37.13 dB while the 30
+     finite rows average 42.0847 dB. Derive this plan's result from the
+     **photo rows only**, filtering the TSV with
+     `awk -F'\t' '$1=="photo" && $9!="inf"'` (the literal string `inf` parses
+     as 0 in naive awk). Plan 026 is written to correct the report accounting;
+     this measurement remains valid whether it runs before or after that fix.
 - `references/libwebp` — the oracle clone (recreate per PLAN.MD's clone
   commands if absent). Per `AGENTS.md`: study behavior and configuration,
   never copy code.

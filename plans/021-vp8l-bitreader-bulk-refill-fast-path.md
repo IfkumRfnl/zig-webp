@@ -1,13 +1,11 @@
 # Plan 021: Give the VP8L bit reader a bulk 64-bit refill and an unchecked fast path, byte-exact
 
-> **Executor instructions**: Follow this plan step by step. Run every
-> verification command and confirm the expected result before moving to the
-> next step. If anything in the "STOP conditions" section occurs, stop and
-> report — do not improvise. When done, update the status row for this plan
-> in `plans/README.md` — unless a reviewer dispatched you and told you they
-> maintain the index.
+> **Historical execution record**: This plan was executed and rejected at its
+> performance gate. Do not re-execute it as an open TODO. The detailed design,
+> including the corrected 63-bit `u6` refill boundary, is retained so future
+> profiling does not repeat the same experiment or its initial boundary error.
 >
-> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/bit_reader.zig src/vp8l/huffman.zig PROGRESS.MD`
+> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/bit_reader.zig src/vp8l/huffman.zig PROGRESS.MD plans/README.md`
 > If any in-scope file changed since this plan was written, compare the
 > "Current state" excerpts against the live code before proceeding; on a
 > mismatch, treat it as a STOP condition.
@@ -20,6 +18,9 @@
 - **Depends on**: plans/020-bench-libwebp-internal-decode-timing.md (soft — only for the recorded ratio)
 - **Category**: perf
 - **Planned at**: commit `29be0df`, 2026-07-09
+- **Execution status**: REJECTED — byte-exact validation passed, but the
+  experiment measured about 1.011× aggregate lossless decode speedup, below
+  the 1.05× complexity gate. The source changes were not merged.
 
 ## Why this matters
 
@@ -103,7 +104,7 @@ pub fn decode(self: Self, reader: *bit_reader.BitReader) Error!u16 {
 
 Table geometry (`src/vp8l/huffman.zig:44-51`): `root_bits_default = 8`,
 `max_code_bits = 15`, so a root+subtable read needs at most 23 bits — always
-satisfiable from a ≥ 57-bit-full buffer except near end of stream, where
+satisfiable from a ≥ 56-bit-full buffer except near end of stream, where
 `decodeSlow` already exists and stays authoritative.
 
 Semantics that MUST be preserved exactly:
@@ -156,6 +157,7 @@ Repo conventions that apply:
 - `src/bit_reader.zig`
 - `src/vp8l/huffman.zig`
 - `PROGRESS.MD` (dated result row + short entry; append-only)
+- `plans/README.md` (status row only)
 
 **Out of scope** (do NOT touch, even though they look related):
 - `src/vp8/bool_reader.zig` — different codec, already optimized (slice 10c).
@@ -190,18 +192,22 @@ In `src/bit_reader.zig`:
 
 ```zig
 /// Tops the buffer up from `bytes` without failing: loads as many whole
-/// bytes as fit in the 64-bit buffer (single unaligned little-endian load
-/// when 8+ bytes remain, byte loop on the short tail).
+/// bytes as fit under the `bit_count: u6` cap of 63 (single unaligned
+/// little-endian load when 8+ bytes remain, byte loop on the short tail).
+/// Never credits 64 bits — that value is not representable in `u6`.
 pub fn fill(self: *BitReader) void {
     const remaining = self.bytes.len - self.byte_offset;
     if (remaining >= 8) {
         const word = std.mem.readInt(u64, self.bytes[self.byte_offset..][0..8], .little);
         self.bit_buffer |= word << self.bit_count;
-        const usable_bytes: usize = (64 - @as(usize, self.bit_count)) / 8;
+        // Cap at 63 so `bit_count` stays in u6. From empty, this is seven
+        // bytes / 56 bits — the refill floor when enough input remains.
+        const usable_bytes: usize = (63 - @as(usize, self.bit_count)) / 8;
         self.byte_offset += usable_bytes;
         self.bit_count += @intCast(usable_bytes * 8);
     } else {
-        while (self.bit_count <= 64 - 8 and self.byte_offset < self.bytes.len) {
+        // Tail: stop while `bit_count + 8 <= 63` so the add stays in u6.
+        while (self.bit_count <= 63 - 8 and self.byte_offset < self.bytes.len) {
             self.bit_buffer |= @as(u64, self.bytes[self.byte_offset]) << self.bit_count;
             self.byte_offset += 1;
             self.bit_count += bits_per_byte;
@@ -211,19 +217,32 @@ pub fn fill(self: *BitReader) void {
 ```
 
    Correctness argument to keep as a comment: when `bit_count = c`, the
-   shifted word contributes bits `c..64`; only `floor((64-c)/8)` whole bytes
-   land entirely below bit 64, and exactly those are consumed — bytes whose
-   bits would be truncated are neither credited to `bit_count` nor skipped
-   in `byte_offset`. (`bit_count ≤ 63` always, so `64 - c ≥ 1`.) Note when
-   `bit_count ≥ 57`, `usable_bytes == 0` and the call is a no-op — fine.
+   shifted word contributes bits `c..64`; only `floor((63-c)/8)` whole bytes
+   land entirely at or below bit 63, and exactly those are consumed — bytes
+   whose bits would be truncated (or would push `bit_count` to 64) are
+   neither credited to `bit_count` nor skipped in `byte_offset`.
+   `bit_count ≤ 63` always. Note when `bit_count ≥ 56`, `usable_bytes == 0`
+   and the call is a no-op — fine; the refill floor with abundant input is
+   56 bits (seven bytes).
 
 2. Rewrite `ensureBits` to: return early if satisfied; else `self.fill()`;
    then `if (self.bit_count < count) return error.TruncatedBitstream;`.
    The truncation condition is equivalent to the old byte-count check
-   because `count ≤ 32` and `fill` loads everything available up to ≥ 57
+   because `count ≤ 32` and `fill` loads everything available up to ≥ 56
    bits. Keep the `assert(count <= 32)`.
 
-3. Add the unchecked pair for callers that have already filled:
+3. Redefine the stale `buffered_bits_max` constant and its comptime asserts
+   at `src/bit_reader.zig:12,197-203`. Today it is
+   `read_bits_max + bits_per_byte - 1` (= 39) and
+   `assert(buffered_bits_max == 39)` — that matched one-byte-at-a-time
+   `ensureBits` overshoot, not the bulk refill. Set
+   `buffered_bits_max = 63` (the `u6` / refill cap), replace the `== 39`
+   assert with `assert(buffered_bits_max == 63)`, and keep
+   `assert(buffered_bits_max <= std.math.maxInt(u6))` and
+   `assert(buffered_bits_max < @bitSizeOf(u64))`. Extend the comptime block;
+   do not delete it.
+
+4. Add the unchecked pair for callers that have already filled:
 
 ```zig
 /// Requires `bit_count >= count` (call `fill` first). `count` in 1..32.
@@ -237,16 +256,17 @@ pub fn dropBitsUnchecked(self: *BitReader, count: u6) void { ... }
    Have `peekBits`/`dropBits` keep their current signatures and error
    behavior (they are used by header/transform parsing and by tests).
 
-4. Update this file's unit tests for the new prefetch amounts: the tests at
+5. Update this file's unit tests for the new prefetch amounts: the tests at
    `src/bit_reader.zig:246-307` assert exact `loadedBytes()` values after
    partial reads (e.g. `loadedBytes() == 1` after `peekBits(1)` on a 2-byte
-   input). With bulk fill on a <8-byte input the byte loop fills everything,
-   so expected values become the full input length. Update expectations —
-   do NOT weaken the logical-bit-order or truncation assertions. Add one new
-   test: a 16+-byte input where a single `peekBits(1)` prefetches exactly 8
-   bytes (the u64 path), then 32-bit reads proceed correctly across the
-   bulk/tail boundary and end in `error.TruncatedBitstream` at the right
-   spot.
+   input). With bulk fill on a <8-byte input the byte loop fills everything
+   that fits under the 63-bit cap, so expected values become the full input
+   length (or seven bytes when more remain). Update expectations — do NOT
+   weaken the logical-bit-order or truncation assertions. Add one new test:
+   a 16+-byte input where a single `peekBits(1)` prefetches exactly seven
+   bytes / 56 bits (the u64 bulk path under the u6 cap), then 32-bit reads
+   proceed correctly across the bulk/tail boundary and end in
+   `error.TruncatedBitstream` at the right spot.
 
 **Verify**: `zig build test` → exit 0 (the corpus SHA-256 gate proves decode
 is byte-exact); `zig build wasm-check` → exit 0.
@@ -264,7 +284,7 @@ In `src/vp8l/huffman.zig` `decode` (`:219-257`):
    `reader.dropBitsUnchecked(@intCast(root_entry.bits))` — a `.symbol` root
    entry has `bits ≤ root_bits ≤ bufferedBits`, so the unchecked drop is
    safe; keep an `assert(root_entry.bits <= root_bits)` beside it.
-3. Subtable: `total_bits ≤ 23 < 57`, so after one `fill` the only failure
+3. Subtable: `total_bits ≤ 23 < 56`, so after one `fill` the only failure
    mode is a genuinely short stream: replace the second `remainingBits()`
    check with `if (reader.bufferedBits() < total_bits) return self.decodeSlow(reader);`
    then use the unchecked peek/drop pair. Keep `decodeSlow` byte-identical
@@ -295,7 +315,7 @@ Do not touch `build`, `fillRoot`, `fillSubtable`, or `decodeSlow` logic.
 
 ## Test plan
 
-- Updated expectations in `src/bit_reader.zig` tests (Step 2.4) plus the new
+- Updated expectations in `src/bit_reader.zig` tests (Step 2.5) plus the new
   bulk/tail-boundary test. Model after the existing
   `test "bit reader peeks and drops without changing logical bit order"`.
 - No new tests in `src/vp8l/huffman.zig` needed beyond the existing suite:
@@ -337,8 +357,10 @@ Stop and report back (do not improvise) if:
 - Plan 022 (specialized VP8L pixel loop) builds directly on `fill` +
   `peekBitsUnchecked`/`dropBitsUnchecked`; land this first.
 - Reviewer should scrutinize: the `usable_bytes` accounting comment in
-  `fill` (the truncated-high-bits argument), the updated `loadedBytes()`
-  test expectations (must reflect prefetch, not paper over bit-order bugs),
-  and that `decodeSlow` still owns every end-of-stream path.
+  `fill` (63-cap / truncated-high-bits argument; never `bit_count == 64`),
+  the redefined `buffered_bits_max == 63` comptime asserts, the updated
+  `loadedBytes()` test expectations (56-bit / seven-byte initial prefetch,
+  not paper over bit-order bugs), and that `decodeSlow` still owns every
+  end-of-stream path.
 - The `BitReader` root re-export is Tier 2; its checked API is unchanged
   anyway.

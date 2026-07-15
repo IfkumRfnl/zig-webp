@@ -1,13 +1,10 @@
 # Plan 023: Vectorize the VP8 loop filter with @Vector, byte-exact
 
-> **Executor instructions**: Follow this plan step by step. Run every
-> verification command and confirm the expected result before moving to the
-> next step. If anything in the "STOP conditions" section occurs, stop and
-> report — do not improvise. When done, update the status row for this plan
-> in `plans/README.md` — unless a reviewer dispatched you and told you they
-> maintain the index.
+> **Historical execution record**: The accepted horizontal SIMD subset of this
+> plan merged through PR #101. Do not treat the unimplemented vertical section
+> below as pending scope; it requires a new attribution-gated follow-up plan.
 >
-> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/vp8/loop_filter.zig PROGRESS.MD`
+> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/vp8/loop_filter.zig PROGRESS.MD plans/README.md`
 > If `src/vp8/loop_filter.zig` changed since this plan was written, compare
 > the "Current state" excerpts against the live code before proceeding; on a
 > mismatch, treat it as a STOP condition.
@@ -20,6 +17,9 @@
 - **Depends on**: plans/020-bench-libwebp-internal-decode-timing.md (soft — better ratios in the record)
 - **Category**: perf
 - **Planned at**: commit `29be0df`, 2026-07-09
+- **Execution status**: DONE — horizontal 8/16-lane SIMD merged in PR #101
+  (`28d9a58`) and improved aggregate lossy decode 1.0654×. Vertical edges
+  remain scalar by design.
 
 ## Why this matters
 
@@ -150,6 +150,7 @@ Repo conventions that apply — the house SIMD pattern is
 **In scope** (the only files you should modify):
 - `src/vp8/loop_filter.zig`
 - `PROGRESS.MD` (dated result row + short entry; append-only)
+- `plans/README.md` (status row only)
 
 **Out of scope** (do NOT touch, even though they look related):
 - `src/vp8/decoder.zig`, `src/vp8/encoder.zig` — callers; `applyFrame`'s
@@ -209,19 +210,22 @@ never `@divTrunc`; clamp helpers become `@min`/`@max` splat pairs mirroring
 **Verify**: `zig build test` → exit 0. The corpus gate (88 lossy stills,
 filter on, byte-for-byte) is the primary oracle for this step.
 
-### Step 3: Vectorize vertical edges via transpose
+### Step 3: Vectorize vertical edges via `Lanes` eight-byte gathers
 
-For `across == 1` edges (left/inner-vertical): load the 8×`Lanes` pixel
-block around the edge (8 strided contiguous-row loads of 8 bytes... note
-here the 8 taps are contiguous per edge pixel and the Lanes edge pixels are
-strided). Transpose to tap-major vectors with `@shuffle`, run the exact
-Step-2 lane math, transpose back, store rows.
+For `across == 1` edges (left/inner-vertical): the `Lanes` edge pixels are
+strided (`along = stride`) while the eight taps around each edge pixel are
+horizontally contiguous. Require **`Lanes` vertical eight-byte gathers** —
+`Lanes = 16` for luma, `Lanes = 8` for chroma — each gather loading the
+eight tap bytes for one edge pixel (or an equivalent gather/`@shuffle`
+construction that yields `@Vector(Lanes, …)` tap-major lanes). Run the
+exact Step-2 lane math on those tap vectors, then scatter/store the
+affected taps back along the edge.
 
-If the transpose cost eats the win (measure!), an acceptable fallback is to
-keep vertical edges scalar and record that in `PROGRESS.MD` — half the
-edges vectorized is still a real win. Decide by measurement, not vibes: run
-the bench with Step 2 only, then with Step 3, and keep Step 3 only if it
-improves the aggregate.
+If the gather/transpose cost eats the win (measure!), an acceptable
+fallback is to keep vertical edges scalar and record that in
+`PROGRESS.MD` — half the edges vectorized is still a real win. Decide by
+measurement, not vibes: run the bench with Step 2 only, then with Step 3,
+and keep Step 3 only if it improves the aggregate.
 
 **Verify**: `zig build test` → exit 0 after whichever variant you keep;
 `zig build wasm-check` → exit 0; `zig fmt .`; `zig build ci` → exit 0.
@@ -235,9 +239,15 @@ file, what stayed unchanged, rejected alternatives). If dwebp is present,
 refresh the `bryce` ratio via `tools/webp-bench.sh` (`decode_int_ms` column
 if plan 020 landed).
 
-**Verify**: aggregate lossy decode ≥ 1.05× (filter share varies by corpus;
-`lossy_extreme_probabilities`-class files with high filter levels should
-show the largest wins). Below 1.03× → STOP outcome.
+**Verify**: aggregate lossy decode speedup disposition bands:
+- **≥ 1.05×**: success — record and merge by default.
+- **[1.03×, 1.05×)**: real but soft win — record the numbers in
+  `PROGRESS.MD`, keep the code, and leave the merge decision to the
+  maintainer (do not STOP; do not treat as an automatic ship).
+- **< 1.03×**: STOP outcome — report numbers, leave unmerged.
+
+Filter share varies by corpus; `lossy_extreme_probabilities`-class files
+with high filter levels should show the largest wins.
 
 ## Test plan
 
@@ -291,6 +301,7 @@ Stop and report back (do not improvise) if:
   before assuming; if padding is insufficient for 4-tap reads at frame
   borders, STOP and report rather than growing the padding).
 - Speedup < 1.03× aggregate lossy decode: report numbers, leave unmerged.
+  (The [1.03×, 1.05×) band is not a STOP — see Step 4 disposition.)
 
 ## Maintenance notes
 

@@ -1,13 +1,10 @@
 # Plan 024: Attribution-gated spike — SIMD for VP8 inverse DCT and intra prediction
 
-> **Executor instructions**: Follow this plan step by step. Run every
-> verification command and confirm the expected result before moving to the
-> next step. If anything in the "STOP conditions" section occurs, stop and
-> report — do not improvise. When done, update the status row for this plan
-> in `plans/README.md` — unless a reviewer dispatched you and told you they
-> maintain the index.
+> **Historical execution record**: This attribution-gated spike completed and
+> was rejected for production. Do not re-execute it as an open TODO. The
+> profiling and transform notes remain as evidence for the measured decision.
 >
-> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/vp8/transform.zig src/vp8/prediction.zig PROGRESS.MD`
+> **Drift check (run first)**: `git diff --stat 29be0df..HEAD -- src/vp8/transform.zig src/vp8/prediction.zig PROGRESS.MD plans/README.md`
 > If any in-scope file changed since this plan was written, compare the
 > "Current state" excerpts against the live code before proceeding; on a
 > mismatch, treat it as a STOP condition.
@@ -20,6 +17,11 @@
 - **Depends on**: plans/023-vp8-loop-filter-simd.md (hard — the profile must be taken *after* the filter is vectorized, or it will mis-attribute)
 - **Category**: perf
 - **Planned at**: commit `29be0df`, 2026-07-09
+- **Execution status**: REJECTED for merge — the profile gate passed, but
+  vector IDCT measured 1.0375× then 1.0287× across two all-lossy orderings,
+  straddling the 1.03× merge gate. PR #103 retained scalar IDCT; prediction
+  stayed scalar because its named functions were below the vectorization
+  threshold.
 
 ## Why this matters — and why it is gated
 
@@ -85,7 +87,8 @@ enforced by the SHA-256 corpus gate inside `zig build test`.
 |---|---|---|
 | Full local gate | `zig build ci` | exit 0 |
 | Bench (ReleaseFast) | `zig build bench -Doptimize=ReleaseFast` | TSV to stdout |
-| Profile | `perf record -F 999 --call-graph dwarf -o /tmp/plan024.perf -- zig build bench -Doptimize=ReleaseFast` then `perf report -i /tmp/plan024.perf --no-children` | symbol table incl. `addInverseDct`, prediction fns |
+| Warm bench | `zig build bench -Doptimize=ReleaseFast >/dev/null` | ReleaseFast binary built; warm before profiling |
+| Profile | After the warm build: `perf record -F 999 --call-graph dwarf -o /tmp/plan024.perf -- zig build bench -Doptimize=ReleaseFast` then `perf report -i /tmp/plan024.perf --no-children` (filter to the bench process / its DSO — see Step 1) | symbol table incl. `addInverseDct`, prediction fns |
 | 32-bit/wasm gate | `zig build wasm-check` | exit 0 |
 
 If `perf` is unavailable and cannot be installed without sudo, STOP at
@@ -94,10 +97,11 @@ not proceed on guesswork).
 
 ## Scope
 
-**In scope** (files you may modify, ONLY if the gate passes):
-- `src/vp8/transform.zig`
-- `src/vp8/prediction.zig`
+**In scope** (the only files you should modify):
+- `src/vp8/transform.zig` (only if the attribution gate passes)
+- `src/vp8/prediction.zig` (only if the attribution gate passes)
 - `PROGRESS.MD` (dated findings row — written in BOTH outcomes)
+- `plans/README.md` (status row only — updated in BOTH outcomes)
 
 **Out of scope** (do NOT touch):
 - `src/vp8/decoder.zig`, `src/vp8/encoder.zig` — callsites unchanged.
@@ -114,22 +118,33 @@ not proceed on guesswork).
 
 ### Step 1: Profile lossy decode (the gate)
 
-With plan 023 merged into the branch point: run the `perf` command above.
-In `perf report`, sum the self-time share of (a) `addInverseDct` +
-`inverseWalshHadamard`, and (b) the `src/vp8/prediction.zig` functions,
-restricted to the bench tool's lossy-decode phase (the bench also runs
-encode; either filter by symbol or accept the dilution and note it — the
-shares below are of *total* bench time in that case, so also record the
-lossy-decode fraction of total to normalize).
+With plan 023 merged into the branch point:
 
-**Gate**: if (a) + (b) normalized to lossy-decode time is **< 8%**, the
+1. **Warm ReleaseFast first**: run
+   `zig build bench -Doptimize=ReleaseFast >/dev/null` so compilation and
+   linking are done before any profile sample is collected.
+2. Then run the `perf record` command from the table (still via
+   `zig build bench -Doptimize=ReleaseFast`, which should now be a cache
+   hit for the compile).
+3. In `perf report`, **filter samples to the benchmark process / its DSO**
+   (the `zig-webp-bench` artifact and its mapped objects — drop
+   `zig`/compiler, build-runner, and unrelated processes). Exclude any
+   residual compilation/link samples from the denominator.
+4. Sum the self-time share of (a) `addInverseDct` + `inverseWalshHadamard`,
+   and (b) the `src/vp8/prediction.zig` functions, restricted to the bench
+   tool's lossy-decode phase (the bench also runs encode; filter by symbol
+   or record the lossy-decode fraction of filtered bench time to normalize).
+
+**Gate**: if (a) + (b) normalized to **filtered lossy-decode time** (warm
+ReleaseFast; compilation excluded from the denominator) is **< 8%**, the
 plan's outcome is REJECTED. Write the dated `PROGRESS.MD` row recording the
 measured shares (so nobody re-litigates without new evidence), update
 `plans/README.md` status to `REJECTED (measured: <shares>)`, and finish —
 Steps 2+ do not run.
 
 **Verify**: a written percentage for (a) and (b) with the normalization
-stated, either in your report (gate failed) or carried into Step 2.
+stated (warm build, process/DSO filter, compilation excluded), either in
+your report (gate failed) or carried into Step 2.
 
 ### Step 2 (gate passed): Vectorize `addInverseDct`
 
@@ -137,11 +152,21 @@ stated, either in your report (gate failed) or carried into Step 2.
 `TransformTwo` shape is optional and only if callsite batching is free —
 callers hand blocks one at a time, so start with single-block lanes):
 
+- Pass 1 reads four coefficient columns as vectors, writes an **inter-pass
+  4×4 transpose** into a `[16]i32` (or four `@Vector(4, i32)` rows) so pass 2
+  reads rows with the same index shape as the scalar `transposed[4 * i + …]`
+  layout in `src/vp8/transform.zig:54-68`. Pass 2 then produces the four
+  output rows without a second full matrix materialization if stores go
+  straight to the destination — but the inter-pass transpose itself is
+  required for lane alignment with the scalar butterflies.
 - Each pass processes the 4 columns (then rows) as one vector per line:
-  `a`, `b`, `c`, `d` become vector expressions with wrapping ops (`+%` on
-  vectors) and `mulCos`/`mulSin` as vector helpers
-  (`(v *% @as(V, @splat(20091))) >> @splat(16)` etc. — signed arithmetic
-  shift on i32 vectors preserves the scalar semantics).
+  `a`, `b`, `c`, `d` become vector expressions with wrapping ops (`+%` /
+  `-%` / `*%` on vectors). Exact vector helpers matching the scalar
+  (`:32-37`):
+  - `mulCos(v) = ((v *% @as(V, @splat(20091))) >> @as(V, @splat(16))) +% v`
+  - `mulSin(v) = (v *% @as(V, @splat(35468))) >> @as(V, @splat(16))`
+  Signed arithmetic shift on i32 vectors preserves the scalar semantics;
+  do not omit mulCos's `+% v` (the constant is `cos−1`).
 - The add-clamp store widens the 4 destination bytes, adds, clamps 0..255
   (`@min`/`@max`), narrows, stores 4 bytes.
 - Keep the scalar version compiled (rename `addInverseDctScalar`) as the

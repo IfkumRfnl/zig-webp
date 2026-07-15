@@ -3,6 +3,10 @@
 //! satisfies `i % TEST_SHARD_COUNT == TEST_SHARD_INDEX`, so N processes
 //! cover the full suite by construction — no name filters, no drift risk.
 //!
+//! Optional sharding is POSIX-target-only (env lookup via
+//! `Environ.getPosix`), matching this runner's Linux/QEMU purpose for the
+//! big-endian CI job — not a general Windows/non-POSIX harness.
+//!
 //! Behavior mirrors the terminal path of Zig 0.16.0's default test runner
 //! (`lib/compiler/test_runner.zig`, `mainTerminal`): per-test testing
 //! allocator and io instance, leak accounting, `error.SkipZigTest`
