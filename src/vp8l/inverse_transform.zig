@@ -488,6 +488,15 @@ fn applyColorTransformReference(
 }
 
 fn addPixelsModulo(residual: pixel.Pixel, prediction: pixel.Pixel) pixel.Pixel {
+    // Byte-parallel wrapping add: even/odd channels are isolated so carries land
+    // in the intervening zero byte and are cleared by the mask.
+    const even_mask: pixel.Pixel = 0x00ff00ff;
+    const even = ((residual & even_mask) +% (prediction & even_mask)) & even_mask;
+    const odd = (((residual >> 8) & even_mask) +% ((prediction >> 8) & even_mask)) & even_mask;
+    return even | (odd << 8);
+}
+
+fn addPixelsModuloChannels(residual: pixel.Pixel, prediction: pixel.Pixel) pixel.Pixel {
     return pixel.fromChannels(
         pixel.alpha(residual) +% pixel.alpha(prediction),
         pixel.red(residual) +% pixel.red(prediction),
@@ -1086,6 +1095,28 @@ test "VP8L inverse predictor transform matches reference across modes and tiles"
             }
         }
     }
+}
+
+test "VP8L addPixelsModulo matches channel-wise wrapping add" {
+    var prng = std.Random.DefaultPrng.init(0xad50_0001);
+    const random = prng.random();
+    var i: u32 = 0;
+    while (i < 10_000) : (i += 1) {
+        const residual = random.int(pixel.Pixel);
+        const prediction = random.int(pixel.Pixel);
+        try std.testing.expectEqual(
+            addPixelsModuloChannels(residual, prediction),
+            addPixelsModulo(residual, prediction),
+        );
+    }
+    try std.testing.expectEqual(
+        addPixelsModuloChannels(0xffffffff, 0x02020202),
+        addPixelsModulo(0xffffffff, 0x02020202),
+    );
+    try std.testing.expectEqual(
+        addPixelsModuloChannels(0xffffffff, 0xffffffff),
+        addPixelsModulo(0xffffffff, 0xffffffff),
+    );
 }
 
 test "VP8L inverse predictor transform catches right-edge top-right tile errors" {
