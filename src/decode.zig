@@ -61,8 +61,8 @@ pub fn decodeStatic(
 /// `Buffer.validate()` and `dest.dimensions` must exactly equal the file's
 /// canvas dimensions — any mismatch returns `error.InvalidCanvasSize`. Both
 /// checks run before any pixel is decoded. Lossless decoding allocates only
-/// VP8L reconstruction scratch from `gpa`; the caller-owned destination and no
-/// packed output copy are charged against
+/// VP8L reconstruction scratch from `gpa`; neither the caller-owned destination
+/// nor a packed output copy is charged against
 /// `decode_options.limits.allocation_bytes_max`. Lossy decoding retains the
 /// owned intermediate used by `decodeStatic`.
 /// Bytes in `dest.pixels` outside the written rows (stride padding, tail
