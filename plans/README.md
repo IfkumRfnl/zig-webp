@@ -20,6 +20,9 @@ the step-10 record). See "Planning session — 2026-07-09" below for the
 selection rationale and one recorded reversal.
 Plan 028: Rust-informed VP8L performance audit of 2026-07-15 (commit
 `02f4e05`), with four independently gated decode experiments.
+Plan 029: authored 2026-07-15 after review of plan 028's decisive rejection
+record; attribution-gated removal of the avoidable VP8L `decodeStaticInto`
+packed-output allocation/copy, with a conditional output-kernel experiment.
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -60,7 +63,8 @@ below and can be turned into plans on request.
 | 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
 | 026 | Luma SSIM column in the lossy encode report | P3 | S | — | TODO |
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
-| 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | TODO |
+| 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | REJECTED — all four candidates missed their gates; source reverted, decisive record on `perf/vp8l-rust-informed-loops` at `30cc1ba` |
+| 029 | Attribute and remove the VP8L `decodeStaticInto` output tax | P1 | M-L | 022 + reviewed 028 outcome | DONE — direct lossless sink accepted at 1.0714× full-lossless summed speedup; output-kernel follow-on skipped below its 5% gate |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -232,6 +236,11 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   preserve spatial-group state, specialize cached copies, specialize palette
   expansion, then inspect/remove discarded summary work. Rejected plan-021
   refill and 10-bit-root shapes stay out of scope.
+- 029 starts from source-equivalent `703297c` after plan 028 rejected every
+  candidate. It first isolates parse/allocation/entropy/transform/conversion/
+  copy cost. Production work proceeds only if the packed-output tax is
+  material, then removes that allocation and second copy from lossless
+  `decodeStaticInto`; format-kernel specialization is a separate gate.
 
 ## Performance audit — 2026-07-15 (commit `02f4e05`)
 
@@ -258,6 +267,13 @@ entropy is about **66%–95%** of VP8L decode, so plan 028 orders entropy work
 before palette work. Already measured and rejected: 10-bit Huffman root,
 plan-021 bulk refill/unchecked lookup, and an unconditional constant-group
 fill branch.
+
+Plan 028's decisive 47-file lossless-only remeasure rejected all four
+candidates; its implementation was reverted and the reviewed result branch is
+`perf/vp8l-rust-informed-loops` at `30cc1ba`. Plan 029 does not stack those
+misses. It measures the still-unattributed packed-output/conversion/copy tax in
+`decodeStaticInto` and changes production code only if that tax and the
+resulting A/B speedup clear explicit gates.
 
 
 ## Planning session — 2026-07-09 (commit `29be0df`, `plan` variant)

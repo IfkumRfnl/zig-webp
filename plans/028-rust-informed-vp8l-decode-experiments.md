@@ -23,6 +23,8 @@
   through commit `02f4e05`
 - **Category**: perf
 - **Planned at**: commit `02f4e05`, 2026-07-15
+- **Status**: REJECTED — all four candidates missed their gates; production
+  source was reverted, with the reviewed decisive record at `30cc1ba`
 
 ## Why this matters
 

@@ -474,9 +474,11 @@ pub fn decodeStatic(
 /// `DecoderOptions.output_format` is ignored on this path. `dest` must pass
 /// `ImageBuffer.validate()` and its dimensions must exactly equal the file's
 /// canvas dimensions; any mismatch fails with `error.InvalidCanvasSize`
-/// before any pixel is decoded. Internal scratch (including one packed
-/// output-sized buffer) is still allocated from `gpa` and budgeted against
-/// `DecoderOptions.limits.allocation_bytes_max`. Bytes in `dest.pixels`
+/// before any pixel is decoded. Lossless decoding allocates only VP8L
+/// reconstruction scratch from `gpa`; it does not allocate or budget a packed
+/// public output plane. Lossy decoding retains its owned intermediate. All
+/// actual scratch is budgeted against `DecoderOptions.limits.allocation_bytes_max`.
+/// Bytes in `dest.pixels`
 /// outside the written rows (stride padding, tail slack) are left untouched.
 /// Animated inputs fail with `error.UnsupportedAnimationDecode`.
 pub fn decodeStaticInto(

@@ -9,7 +9,7 @@ pub const Error = errors.Error;
 pub const read_bits_max = 32;
 
 const bits_per_byte = 8;
-const buffered_bits_max = read_bits_max + bits_per_byte - 1;
+const buffered_bits_max = std.math.maxInt(u6);
 
 pub const ByteReader = struct {
     bytes: []const u8,
@@ -147,6 +147,75 @@ pub const BitReader = struct {
         return value;
     }
 
+    /// Tops the local buffer up to at least 56 bits when input permits.
+    ///
+    /// The hot VP8L entropy loop calls this once per decoded token, then uses
+    /// `readBitsBuffered` and Huffman's buffered lookup without repeated
+    /// slice-bound checks. Bytes that cannot be credited without overflowing
+    /// `bit_count: u6` remain unconsumed even though the 64-bit lookahead may
+    /// copy their bits speculatively into the high end of `bit_buffer`.
+    pub inline fn fill(self: *BitReader) void {
+        assert(self.byte_offset <= self.bytes.len);
+        if (self.bit_count >= 56) return;
+
+        const remaining = self.bytes.len - self.byte_offset;
+        if (remaining >= @sizeOf(u64)) {
+            const lookahead = std.mem.readInt(
+                u64,
+                self.bytes[self.byte_offset..][0..@sizeOf(u64)],
+                .little,
+            );
+            const usable_bytes = (buffered_bits_max - @as(usize, self.bit_count)) /
+                bits_per_byte;
+            assert(usable_bytes > 0);
+            assert(usable_bytes < @sizeOf(u64));
+
+            self.bit_buffer |= lookahead << self.bit_count;
+            self.byte_offset += usable_bytes;
+            self.bit_count += @intCast(usable_bytes * bits_per_byte);
+            return;
+        }
+
+        while (self.bit_count <= buffered_bits_max - bits_per_byte and
+            self.byte_offset < self.bytes.len)
+        {
+            self.bit_buffer |= @as(u64, self.bytes[self.byte_offset]) << self.bit_count;
+            self.byte_offset += 1;
+            self.bit_count += bits_per_byte;
+        }
+    }
+
+    /// Reads from a token-prefilled buffer, refilling only when necessary.
+    pub inline fn readBitsBuffered(self: *BitReader, count: u6) Error!u32 {
+        if (count > read_bits_max) return error.InvalidBitCount;
+        if (count == 0) return 0;
+
+        if (self.bit_count < count) {
+            self.fill();
+            if (self.bit_count < count) return error.TruncatedBitstream;
+        }
+
+        const value = if (count == 32)
+            @as(u32, @truncate(self.bit_buffer))
+        else
+            @as(u32, @truncate(self.bit_buffer & ((@as(u64, 1) << count) - 1)));
+        self.dropBitsBuffered(count);
+        return value;
+    }
+
+    pub inline fn peekFull(self: BitReader) u64 {
+        return self.bit_buffer;
+    }
+
+    pub inline fn dropBitsBuffered(self: *BitReader, count: u6) void {
+        assert(count > 0);
+        assert(count <= read_bits_max);
+        assert(self.bit_count >= count);
+
+        self.bit_buffer >>= count;
+        self.bit_count = @intCast(@as(u7, self.bit_count) - @as(u7, count));
+    }
+
     pub fn peekBits(self: *BitReader, count: u6) Error!u32 {
         if (count > read_bits_max) return error.InvalidBitCount;
         if (count == 0) return 0;
@@ -197,7 +266,7 @@ pub const BitReader = struct {
 comptime {
     assert(read_bits_max == 32);
     assert(bits_per_byte == 8);
-    assert(buffered_bits_max == 39);
+    assert(buffered_bits_max == 63);
     assert(buffered_bits_max <= std.math.maxInt(u6));
     assert(buffered_bits_max < @bitSizeOf(u64));
 }
@@ -304,4 +373,31 @@ test "bit reader reports invalid counts and truncation without consuming bytes" 
     try std.testing.expectError(error.TruncatedBitstream, reader.readBits(16));
     try std.testing.expectEqual(@as(usize, 0), reader.loadedBytes());
     try std.testing.expectEqual(@as(u32, 0x5a), try reader.readBits(8));
+}
+
+test "buffered bit reads match checked reads across bulk refill and tail" {
+    const bytes = [_]u8{
+        0x11, 0x72, 0xa5, 0x0f, 0x39, 0xc4, 0x88, 0xfe,
+        0x63, 0x91, 0x27, 0xdb, 0x40, 0xb6, 0x5c, 0xe2,
+    };
+    const counts = [_]u6{ 1, 7, 13, 31, 5, 32, 17, 22 };
+
+    var buffered = BitReader.init(&bytes);
+    var checked = BitReader.init(&bytes);
+    buffered.fill();
+    try std.testing.expectEqual(@as(usize, 7), buffered.loadedBytes());
+    try std.testing.expectEqual(@as(u6, 56), buffered.bufferedBits());
+
+    for (counts) |count| {
+        buffered.fill();
+        try std.testing.expectEqual(
+            try checked.readBits(count),
+            try buffered.readBitsBuffered(count),
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, bytes.len), buffered.loadedBytes());
+    try std.testing.expectEqual(@as(u6, 0), buffered.bufferedBits());
+    try std.testing.expectError(error.TruncatedBitstream, buffered.readBitsBuffered(1));
+    try std.testing.expectError(error.TruncatedBitstream, checked.readBits(1));
 }
