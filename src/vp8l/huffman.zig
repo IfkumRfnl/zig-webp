@@ -343,6 +343,51 @@ pub fn Table(comptime options: TableOptions) type {
             }
         }
 
+        /// Decodes from the entropy loop's token-prefilled bit buffer.
+        ///
+        /// The normal `decode` path remains the checked authority for parsing
+        /// and the short physical tail. With `code_bits_max` buffered, every
+        /// valid primary or secondary lookup can consume without another
+        /// refill or bounds check.
+        pub inline fn decodeBuffered(self: Self, reader: *bit_reader.BitReader) Error!u16 {
+            if (self.single_symbol) |symbol| return symbol;
+
+            if (reader.bufferedBits() < code_bits_max_u6) {
+                reader.fill();
+                if (reader.bufferedBits() < code_bits_max_u6) {
+                    return self.decode(reader);
+                }
+            }
+
+            assert(self.entries.len >= root_entry_count);
+            const value: u32 = @truncate(reader.peekFull());
+            const root_index: usize = @intCast(value & root_mask_u32);
+            const root_entry = self.entries[root_index];
+            switch (root_entry.kind(root_bits)) {
+                .invalid => return error.InvalidHuffmanCode,
+                .symbol => {
+                    reader.dropBitsBuffered(@intCast(root_entry.bits));
+                    return root_entry.symbolValue(root_bits);
+                },
+                .table => {
+                    const subtable_bits: u6 = @intCast(root_entry.subtableBits(root_bits));
+                    const subtable_mask = maskBits(subtable_bits);
+                    const subtable_index: usize =
+                        @as(usize, root_entry.tableOffset(root_bits)) +
+                        @as(usize, @intCast((value >> root_bits) & subtable_mask));
+                    const subtable_entry = self.entries[subtable_index];
+                    if (subtable_entry.kind(root_bits) != .symbol) {
+                        return error.InvalidHuffmanCode;
+                    }
+
+                    const consumed_bits =
+                        root_bits_u6 + @as(u6, @intCast(subtable_entry.bits));
+                    reader.dropBitsBuffered(consumed_bits);
+                    return subtable_entry.symbolValue(root_bits);
+                },
+            }
+        }
+
         fn decodeSlow(self: Self, reader: *bit_reader.BitReader) Error!u16 {
             var length: u6 = 1;
             while (length <= code_bits_max_u6) : (length += 1) {
@@ -604,6 +649,11 @@ test "VP8L Huffman table decodes canonical two-symbol codes" {
     var reader = bit_reader.BitReader.init(try writer.finish());
     try std.testing.expectEqual(@as(u16, 0), try table.decode(&reader));
     try std.testing.expectEqual(@as(u16, 1), try table.decode(&reader));
+
+    var buffered_reader = bit_reader.BitReader.init(try writer.finish());
+    buffered_reader.fill();
+    try std.testing.expectEqual(@as(u16, 0), try table.decodeBuffered(&buffered_reader));
+    try std.testing.expectEqual(@as(u16, 1), try table.decodeBuffered(&buffered_reader));
 }
 
 test "VP8L Huffman table decodes reversed canonical bit order" {
@@ -657,6 +707,11 @@ test "VP8L Huffman table decodes symbols from a second-level table" {
     var reader = bit_reader.BitReader.init(try writer.finish());
     try std.testing.expectEqual(@as(u16, 8), try table.decode(&reader));
     try std.testing.expectEqual(@as(u16, 9), try table.decode(&reader));
+
+    var buffered_reader = bit_reader.BitReader.init(try writer.finish());
+    buffered_reader.fill();
+    try std.testing.expectEqual(@as(u16, 8), try table.decodeBuffered(&buffered_reader));
+    try std.testing.expectEqual(@as(u16, 9), try table.decodeBuffered(&buffered_reader));
 }
 
 test "VP8L Huffman table falls back when fewer than root bits remain" {
@@ -671,6 +726,10 @@ test "VP8L Huffman table falls back when fewer than root bits remain" {
     try std.testing.expectEqual(@as(usize, 1), reader.remainingBits());
     try std.testing.expectEqual(@as(u16, 0), try table.decode(&reader));
     try std.testing.expectEqual(@as(usize, 0), reader.remainingBits());
+
+    var buffered_reader = bit_reader.BitReader.init(&encoded);
+    try buffered_reader.dropBits(7);
+    try std.testing.expectEqual(@as(u16, 0), try table.decodeBuffered(&buffered_reader));
 }
 
 test "VP8L Huffman table rejects invalid trees" {

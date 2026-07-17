@@ -197,7 +197,8 @@ fn decodeLoop(
             assert(run_remaining > 0);
         }
 
-        const green_symbol = try prefix_codes.green.decode(reader);
+        reader.fill();
+        const green_symbol = try prefix_codes.green.decodeBuffered(reader);
         if (green_symbol < huffman.literal_alphabet_size) {
             const value = try readLiteral(reader, prefix_codes, green_symbol);
             output[output_index] = value;
@@ -236,7 +237,7 @@ fn decodeLoop(
     return summary;
 }
 
-fn readLiteral(
+inline fn readLiteral(
     reader: *bit_reader.BitReader,
     prefix_codes: image_data.PrefixCodeGroup,
     green_symbol: u16,
@@ -244,21 +245,35 @@ fn readLiteral(
     assert(green_symbol < huffman.literal_alphabet_size);
 
     const green: u8 = @intCast(green_symbol);
+
     const red = try readChannel(reader, prefix_codes.red);
     const blue = try readChannel(reader, prefix_codes.blue);
     const alpha = try readChannel(reader, prefix_codes.alpha);
-
     return pixel.fromChannels(alpha, red, green, blue);
 }
 
-fn readChannel(
+inline fn readChannel(
     reader: *bit_reader.BitReader,
     table: huffman.SymbolTable,
 ) errors.Error!u8 {
-    const symbol = try table.decode(reader);
+    const symbol = try table.decodeBuffered(reader);
     if (symbol >= huffman.literal_alphabet_size) return error.InvalidVP8LImageData;
 
     return @intCast(symbol);
+}
+
+inline fn readPrefixValueBuffered(
+    reader: *bit_reader.BitReader,
+    prefix_code: u8,
+) errors.Error!u32 {
+    if (prefix_code >= huffman.distance_alphabet_size) {
+        return error.InvalidVP8LImageData;
+    }
+    if (prefix_code < 4) return @as(u32, prefix_code) + 1;
+
+    const extra_bits: u5 = @intCast((prefix_code - 2) >> 1);
+    const offset = @as(u32, 2 + (prefix_code & 1)) << extra_bits;
+    return offset + try reader.readBitsBuffered(extra_bits) + 1;
 }
 
 fn copyBackwardReference(
@@ -276,16 +291,16 @@ fn copyBackwardReference(
     assert(output_index_start < output.len);
 
     const length_prefix: u8 = @intCast(green_symbol - huffman.literal_alphabet_size);
-    const length = try image_data.readPrefixValue(reader, length_prefix);
+    const length = try readPrefixValueBuffered(reader, length_prefix);
     if (length > output.len - output_index_start) return error.InvalidVP8LImageData;
 
-    const distance_prefix_symbol = try prefix_codes.distance.decode(reader);
+    const distance_prefix_symbol = try prefix_codes.distance.decodeBuffered(reader);
     if (distance_prefix_symbol >= huffman.distance_alphabet_size) {
         return error.InvalidVP8LImageData;
     }
 
     const distance_prefix: u8 = @intCast(distance_prefix_symbol);
-    const distance_code = try image_data.readPrefixValue(reader, distance_prefix);
+    const distance_code = try readPrefixValueBuffered(reader, distance_prefix);
     const distance = image_data.distanceFromCode(distance_code, dimensions.width);
     if (distance > output_index_start) return error.InvalidVP8LImageData;
 

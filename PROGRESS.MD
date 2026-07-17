@@ -134,6 +134,161 @@ Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms`
 
 ## Recently Completed
 
+### 2026-07-15 — Plan 029 direct VP8L decode-into output
+
+Plan 029 measured and removed the caller-owned lossless output tax from
+`decodeStaticInto`. **Candidate A is retained**: VP8L reconstruction still uses
+numeric ARGB scratch, but conversion now writes each row directly into the
+caller's RGB/RGBA/BGRA/ARGB destination. The packed public output allocation and
+the second row copy are gone from this path and from its allocation budget.
+`decodeStatic`, animation, and lossy decode retain their prior ownership paths.
+
+**Measurement contract.** ReleaseFast on Linux x86_64, AMD EPYC 7663, one
+benchmark process/thread, Zig **0.16.0**, and Rust **1.96.1** at image-webp
+`f4d80bd`. Every full paired run validated **135/135** digests with **0 skips**.
+Candidate gating used three alternating baseline/candidate orderings
+(baseline→candidate, candidate→baseline, baseline→candidate), `15` timed
+samples, `2` warmups, and a 1500 ms per-measurement budget. Aggregation was
+median-of-three timed medians **per file**, then bucket geomean and summed time.
+Early unpinned and CPU-0-pinned aggregate runs varied by more than 15%; focused
+same-decoder medians also moved by up to 1.5×. This was recorded as shared-cloud
+scheduling/frequency noise rather than a codec effect; all decisions use the
+alternating per-file aggregation, not one ordering.
+
+**Disposable baseline attribution.** Counters accumulated in memory and printed
+once after each timed set. The five non-tiny Zig stage sums reconciled to
+end-to-end time within **0.2%**; the tiny control reconciled within **3.4%**.
+Values below are per-decode means over 25 timed samples; each stage is
+`milliseconds / percent of end-to-end`. Zig output tax is packed-output
+allocation/free + conversion + final row copy.
+
+| Asset | Zig total | Parse | Scratch alloc/free | Transform-image parse | Entropy | Inverse | Output tax |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `photo_foliage.webp` | 27.6876 | 0.0043/0.02% | 0.2046/0.74% | 0.1087/0.39% | 24.5220/88.57% | 1.6980/6.13% | 1.1471/4.14% |
+| `photo_signage.webp` | 29.0872 | 0.0045/0.02% | 0.1056/0.36% | 0.0710/0.24% | 25.4223/87.40% | 2.4745/8.51% | 1.0067/3.46% |
+| `color_cache_bits_11.webp` | 3.0268 | 0.0014/0.05% | 0.0411/1.36% | 0.1621/5.36% | 2.6096/86.22% | 0.1412/4.67% | 0.0703/2.32% |
+| `bad_palette_index.webp` | 0.4430 | 0.0005/0.12% | 0.0388/8.77% | 0.0179/4.04% | 0.3013/68.01% | 0.0334/7.55% | 0.0504/11.37% |
+| `lossless_big_random_alpha.webp` | 287.8265 | 0.0067/0.00% | 3.2775/1.14% | 0.1222/0.04% | 207.4728/72.08% | 46.5516/16.17% | 30.3866/10.56% |
+| `lossless_vec_1_0.webp` | 0.0134 | 0.0002/1.67% | 0.0002/1.36% | 0.0000/0.31% | 0.0120/89.30% | 0.0000/0.00% | 0.0005/3.97% |
+
+Inverse-transform detail:
+
+- `photo_foliage.webp`: predictor **0.9377 ms/3.39%**, color
+  **0.3976/1.44%**, palette **0/0%**, subtract-green **0.3628/1.31%**.
+- `photo_signage.webp`: predictor **1.4811 ms/5.09%**, color **0.4711/1.62%**,
+  palette **0/0%**, subtract-green **0.5222/1.80%**.
+- `color_cache_bits_11.webp`: predictor **0.0814 ms/2.69%**, color
+  **0.0449/1.48%**, palette **0/0%**, subtract-green **0.0149/0.49%**.
+- `bad_palette_index.webp`: palette **0.0334 ms/7.55%**; other inverse
+  transforms absent.
+- `lossless_big_random_alpha.webp`: predictor **28.7180 ms/9.98%**, color
+  **12.6697/4.40%**, palette **0/0%**, subtract-green **5.1639/1.79%**.
+- `lossless_vec_1_0.webp`: inverse transforms absent.
+
+The equivalent disposable Rust counters separated constructor/container,
+transform parse, main entropy, inverse transforms, and final RGB/RGBA handling:
+
+| Asset | Rust total | Constructor | Transform parse | Entropy | Inverse | Final output |
+|---|---:|---:|---:|---:|---:|---:|
+| `photo_foliage.webp` | 5.3566 | 0.0020/0.04% | 0.0688/1.29% | 3.0019/56.04% | 1.9859/37.07% | 0.2931/5.47% |
+| `photo_signage.webp` | 5.9706 | 0.0024/0.04% | 0.0581/0.97% | 4.4852/75.12% | 1.1570/19.38% | 0.2635/4.41% |
+| `color_cache_bits_11.webp` | 0.4956 | 0.0006/0.12% | 0.0307/6.19% | 0.3209/64.76% | 0.1308/26.40% | 0.0112/2.27% |
+| `bad_palette_index.webp` | 0.3849 | 0.0009/0.24% | 0.0182/4.74% | 0.3422/88.91% | 0.0085/2.22% | 0.0134/3.49% |
+| `lossless_big_random_alpha.webp` | 139.8768 | 0.0071/0.01% | 0.1220/0.09% | 105.3343/75.31% | 34.3991/24.59% | 0/0% |
+| `lossless_vec_1_0.webp` | 0.0026 | 0.0001/4.06% | 0.0000/1.42% | 0.0022/84.48% | 0/0% | 0/0% |
+
+Across the 47 lossless files, per-file mean stage sums attributed **8.0527%**
+of Zig time to output tax: packed allocation **0.0141%**, conversion
+**6.3352%**, final copy **1.1201%**, and packed free **0.5833%**. Opaque output
+tax was **4.3551%**; alpha was **9.5430%**. The large-alpha asset independently
+cleared the proceed gate at **10.5573%**. Entropy was **77.0059%** and inverse
+transforms **13.8298%** overall. Parse was below **0.03%** on both photos, so
+parse optimization is dropped from the backlog. Plan 028's palette candidate
+remains rejected.
+
+**Candidate A result.** The accepted helper owns the common VP8L scratch and
+decode pipeline; only allocating `decodeStatic` requests a packed public output.
+The into path dispatches format once, writes arbitrary valid strides directly,
+and leaves padding/tail slack untouched. Median-of-three A/B:
+
+- opaque (**n=24**): **1.0625×** geomean, **1.0464×** summed-time speedup;
+- alpha (**n=23**): **1.0775×** geomean, **1.0782×** summed-time speedup;
+- full lossless (**n=47**): **1.0698×** geomean, **1.0714×** summed-time
+  speedup.
+
+This clears Candidate A's first retain gate. Post-A counters measured direct
+conversion at only **1.6116%** on the large-alpha asset (all other named assets
+below 2.5%). **Candidate B was not attempted** because conversion missed its
+5% proceed threshold, despite scalar/unrolled ReleaseFast codegen. Disassembly
+also showed the existing runtime format choice already lowered to one jump
+table outside the conversion loops.
+
+**Final comparison and verdict.** Baseline Zig/Rust ratios were opaque
+**2.7308×** geomean / **3.2234×** sum and alpha **2.7842×** /
+**2.5935×**. Final ratios are opaque **2.5831×** / **3.1184×** and alpha
+**2.6084×** / **2.2704×**. The six 25-sample focused medians all improved
+versus their three-run Zig baseline; the large-alpha file received **25/25**
+samples in every final run. Final Zig/Rust ratios remain **2.2648×**
+(`bad_palette_index`), **3.5132×** (cache), **2.2611×** (large alpha),
+**3.6957×** (tiny), **6.0584×** (foliage), and **4.6150×** (signage).
+Verdict: **useful narrowing, not an edge**. No general or asset-class Rust beat
+is claimed.
+
+Correctness/portability gates: all four formats, packed/padded/unaligned odd
+rows, sentinel slack, destination-format precedence, exact scratch-budget
+boundary, allocation-failure injection, and representative malformed streams
+are covered in `src/decode.zig`; the final Rust differential is **135/135**,
+0 skipped; `zig fmt .`, `zig build ci` (**489/489**), and `zig build wasm-check`
+(wasi + freestanding) pass. Temporary timers and profiler artifacts remain
+under `.zig-cache/` only.
+
+### 2026-07-15 — Plan 028 Rust-informed VP8L decode experiments
+
+Four independently gated ReleaseFast experiments ran on
+`perf/vp8l-rust-informed-loops` from `703297c`. **All four candidates were
+rejected**; no production code from this plan is retained (implementation
+commit `1c4d203` was reverted after a decisive remeasure). The reviewed
+docs-only result is retained at `30cc1ba`.
+
+- **Rejected: preserve spatial group across copies.** Consuming only the
+  applicable part of `run_remaining` after a backward copy (instead of forcing
+  `run_remaining = 0`) missed the gate. Median-of-three Zig A/B vs `703297c`:
+  foliage+signage geomean **1.0610×** (≥1.03 PASS), full-lossless summed time
+  **1.0052×** (≥1.01 FAIL), lossless opaque geomean **0.8927×** and alpha
+  **0.8493×** (both >1% bucket regress FAIL). Pointer/reference hoist was not
+  attempted. Code reverted; no commit.
+- **Rejected: specialize cached backward copies.** Distance-1 `@memset` without
+  reinsert plus copy-then-cache-update for other distances. Focused tests and
+  **135/135** Rust differential validation passed. Median-of-three: targeted
+  (`color_cache_bits_11`+foliage+signage) geomean **0.9106×** (FAIL; alone
+  `color_cache_bits_11` **1.5233×**), full-lossless sum **1.0178×** (PASS),
+  opaque **0.9170×** / alpha **0.8910×** (FAIL). Consecutive-cache peek was not
+  attempted. Code reverted; no commit.
+- **Rejected: packed-byte palette expansion.** Compile-time 1/2/4-bit kernels
+  plus padded 256-entry 8-bit path; scalar retained as authority. Focused
+  equivalence tests and **135/135** validation passed. Alternating medians on
+  tiny `bad_palette_index.webp` appeared **1.2989×**, but a quieter
+  long-budget focused run measured only **1.0212×** (<1.05 palette-target
+  gate). Code reverted; no commit.
+- **Rejected after decisive remeasure: skip summary collection on high-level
+  decode.** Earlier absolute-path full-corpus A/B appeared to pass, but
+  independent and final cumulative measurements conflicted. The decisive
+  protocol used three alternating baseline (`703297c`) / candidate
+  (`1c4d203`) comparisons over the **47 validated lossless** stills,
+  `--iters 25 --warmup 3 --budget-ms 15000`, with the large-alpha file
+  receiving **25/25** timed samples. Aggregation was median-of-three
+  **per-file** decode-into medians, then bucket geomean / summed-time ratios.
+  Corrected results: opaque **n=24** geomean **0.9609×** / sum **0.8551×**;
+  alpha **n=23** geomean **1.0392×** / sum **0.9890×**; full-lossless
+  **n=47** geomean **0.9985×** / sum **0.9584×**;
+  `lossless_big_random_alpha.webp` **320.948→324.243 ms** (**0.9898×**).
+  Gates failed (full sum <1.01 and opaque regressed >1%);
+  `1c4d203` was reverted by `28f1298`.
+
+**Outcome:** source on the result branch matches `703297c` for the in-scope
+decode files. No general Zig beat of `image-webp` is claimed. Machine:
+AMD EPYC 7663, Linux x86_64, single thread, Zig **0.16.0** ReleaseFast.
+
 ### 2026-07-15 — VP8L packed tables, bounded scratch, and packed predictor add
 
 Three independent ReleaseFast experiments were accepted into
@@ -179,6 +334,44 @@ long-budget cumulative run on `lossless_big_random_alpha.webp` improved
 **264.39→258.32 ms** (**1.0235×**). The isolated packed-add experiment measured
 **212.76→202.69 ms** (**1.0497×**) on that asset; host variance remains large
 for the biggest files.
+
+### 2026-07-15 — Fused VP8L buffered entropy kernel (accepted)
+
+The VP8L token loop now owns a 64-bit LSB-first bit-buffer cursor, refills it
+once at token boundaries, and uses buffered Huffman/prefix reads through
+literal and backward-reference reconstruction. Selector dispatch occurs once
+before decoding into four concrete cache/no-cache and single/spatial loops,
+removing optional-cache and selector-shape branches from each token. Checked
+reader/Huffman paths remain authoritative for short physical tails and
+malformed inputs.
+
+Discarded follow-ons are absent from production: an outlined loop, a copied
+local reader cursor, unchecked invalid-table entries, token-wide bit-count
+assumptions, and narrower backward-copy arguments all regressed one or more
+predeclared assets. The retained cut is the smallest candidate that improved
+both meaningful classes.
+
+**Correctness.** `zig build test --summary all` passes **490/490** tests.
+New focused tests compare buffered and checked reads across bulk-refill/tail
+boundaries and exercise buffered root and secondary Huffman lookups. Five
+paired full-corpus campaigns each validated **135/135** stills against
+`image-webp`, with zero skips.
+
+**Speed (ReleaseFast, AMD EPYC 7663, Linux x86_64, CPU 0).** Five frozen-parent
+and five retained-source full-corpus campaigns used `decode-into`,
+`--iters 15 --warmup 2 --budget-ms 1500`; figures are median-of-five per file.
+Across the **47** lossless stills, frozen/current speedups were **1.1330×**
+geomean and **1.6624×** summed time. Opaque: **1.2106×** geomean,
+**1.2671×** summed. Alpha: **1.0574×** geomean, **1.7831×** summed. Two early
+campaigns transiently measured `lossless_vec_1_0.webp` at ~**0.165 ms**;
+three later full-order campaigns and a 100-sample isolated reproduction
+measured **0.0083–0.0098 ms**, so five-campaign medians are reported.
+
+**Remaining Rust gap.** Current Zig/`image-webp` ratios are **2.0951×** opaque
+and **2.4614×** alpha by per-file geomean (**2.5552×** and **1.6286×** by
+summed time). This closes a material part of the entropy gap but does **not**
+beat Rust. No general performance win is claimed; subsequent work should start
+from fresh stage/profile evidence rather than stacking speculative loop tweaks.
 
 ### 2026-07-14 — Plan 024 IDCT omitted from cumulative draft (conservative cut)
 
@@ -1479,6 +1672,8 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-07-11 | VP8L predictor/color inverse transforms around tile runs | Tile-run rewrite of predictor/color inverse transforms in `src/vp8l/inverse_transform.zig` (commit `1c97839`; color-indexing unchanged; scalar helpers remain authority). **Profiler attribution (base, temporary stage timers; profiler worktree clean / no commit):** entropy **66%–95%**; when present predictor **5.8%–16%**, color **4.3%–12.7%**; transforms absent on small vec / one-color. **Correctness:** focused inverse-transform equivalence tests; **135/135** decode-into; byte-exact corpus hashes; `zig build ci`; `zig build wasm-check`. **Speed (ReleaseFast, AMD EPYC 7663, single thread; two serial orderings of direct Zig medians vs plan-022 / constant-base reverse TSV; `--iters 5 --warmup 1 --budget-ms 500`):** lossless opaque ~**1.046×–1.065×**, lossless alpha ~**1.015×–1.031×**; `photo_foliage` ~**1.04×–1.05×**, `photo_portrait` ~**1.12×–1.13×**, `lossless_big_random_alpha` ~**1.09×–1.17×**, `lossless1` ~**1.016×**. Entropy remains the bottleneck; environment-dependent; not a CI gate; not a general-win claim. |
 | 2026-07-14 | Plan 024 IDCT omitted from cumulative draft (conservative cut) | Spike on `e9254a3` measured all-lossy **1.0375×**/**1.0287×** vs `fbe738c` (straddles 1.03×; lossy alpha below gate). Draft PR #103 omits vector IDCT and keeps production `addInverseDct` scalar through compact Huffman `fbe738c` + tile-run transforms. Prediction untouched. Spike numbers retained in the 2026-07-11/14 narrative; no general beat. |
 | 2026-07-11 | Compact VP8L Huffman `Entry` accepted (`fbe738c`); 10-bit root rejected (`391f449`) | Accepted: `Entry` **6→4** bytes (**33%** denser; root **1.5KB→1KB**). **Correctness:** **135** validated; focused **11+5**; root compile; CI; wasm. **Speed (ReleaseFast, AMD EPYC 7663; two serial 135-file orderings vs `e45fafd`):** lossless opaque **1.0908×**/**1.0935×**, lossless alpha **1.3504×**/**1.3627×**, lossy opaque **0.9911×**/**0.9897×** (noise), lossy alpha **1.1011×**/**1.1170×** (ALPH→VP8L). Small-heavy aggregate; large-file variance (`photo_foliage` ~**0.99×**, `lossless_big_random_alpha` **0.985–1.070×**). Rejected `391f449`: +**3072** bytes/non-single table, +**15360** five-table scratch; vs accepted 8-bit base lossless opaque **0.9620×**, alpha **0.9261×** → reject/no merge; tests **481** pass. Accepted draft cut remains `fbe738c` (IDCT omitted); no general beat. |
+
+| 2026-07-15 | Plan 028 Rust-informed VP8L experiments: all four candidates rejected after decisive lossless-only remeasure; implementation reverted | Four gated ReleaseFast experiments from `703297c`. Rejected: spatial-copy (full-lossless sum **1.0052×**); cached-copy (targeted **0.9106×**); packed-byte palette (long-budget **1.0212×** <1.05); summary-free high-level decode after decisive 47-file A/B. Required per-file aggregation: opaque **0.9609×** geo / **0.8551×** sum, alpha **1.0392×** / **0.9890×**, full **0.9985×** / **0.9584×**; big-alpha **320.948→324.243 ms** (**0.9898×**). Source matches `703297c`; reviewed docs-only result at `30cc1ba`; no general `image-webp` beat claimed. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.
