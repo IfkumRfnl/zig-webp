@@ -231,6 +231,40 @@ pub fn applyColorIndexingTransformGreen(
     const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
     const pixels_per_source: usize = @as(usize, 1) << width_bits;
 
+    if (width_bits > 0) {
+        var lookup: [256][8]u8 = undefined;
+        for (0..256) |packed_value| {
+            for (0..pixels_per_source) |lane| {
+                const shift: u3 = @intCast(lane * index_bits);
+                const color_index = (@as(u8, @intCast(packed_value)) >> shift) & index_mask;
+                lookup[packed_value][lane] =
+                    if (color_index < color_indexing.color_table_size)
+                        pixel.green(color_table[color_index])
+                    else
+                        0;
+            }
+        }
+
+        const height: usize = @intCast(dimensions.height);
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            const source_row_start = y * source_width;
+            const output_row_start = y * output_width;
+            var source_x: usize = 0;
+            while (source_x < source_width) : (source_x += 1) {
+                const packed_indices =
+                    pixel.green(packed_pixels[source_row_start + source_x]);
+                const output_start = source_x * pixels_per_source;
+                const output_count = @min(pixels_per_source, output_width - output_start);
+                @memcpy(
+                    output[output_row_start + output_start ..][0..output_count],
+                    lookup[packed_indices][0..output_count],
+                );
+            }
+        }
+        return;
+    }
+
     const height: usize = @intCast(dimensions.height);
     var y: usize = 0;
     while (y < height) : (y += 1) {
