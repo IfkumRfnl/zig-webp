@@ -436,7 +436,7 @@ fn decodeLoop(
                 }
 
                 const cached = try readColorCachePixel(peeked.symbol, cache);
-                reader.dropBitsBuffered(peeked.bit_count);
+                if (peeked.bit_count > 0) reader.dropBitsBuffered(peeked.bit_count);
                 output[output_index] = cached;
                 output_index += 1;
                 if (spatial) run_remaining -= 1;
@@ -546,8 +546,10 @@ fn copyBackwardReference(
     assert(output_index_start + length_pixels <= output.len);
 
     if (distance_pixels == 1) {
+        const value = output[output_index_start - 1];
         const dst = output[output_index_start..][0..length_pixels];
-        @memset(dst, output[output_index_start - 1]);
+        @memset(dst, value);
+        if (has_cache) cache.insert(value);
         return output_index_start + length_pixels;
     }
 
@@ -792,6 +794,46 @@ test "VP8L entropy resolves color-cache references" {
     try std.testing.expectEqual(cached_pixel, output[1]);
 }
 
+test "VP8L entropy repeats a single-symbol color-cache code without consuming bits" {
+    const cache_bits: u4 = 1;
+    const cache_size: u16 = @as(u16, 1) << cache_bits;
+    const cache_symbol = huffman.literal_alphabet_size + huffman.length_code_count;
+
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(
+            &buffers.green_entries,
+            cache_symbol,
+            huffman.literal_alphabet_size + huffman.length_code_count + cache_size,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 0, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 0, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 0, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            0,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    var reader = bit_reader.BitReader.init(&.{});
+    var output: [2]pixel.Pixel = undefined;
+    const summary = try decodeWithPrefixCodes(
+        &reader,
+        try image.Dimensions.init(2, 1),
+        .{ .bits = cache_bits, .size = cache_size },
+        prefix_codes,
+        &output,
+    );
+
+    try std.testing.expectEqual(@as(u64, 2), summary.pixel_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.literal_count);
+    try std.testing.expectEqual(@as(u64, 0), summary.copy_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.color_cache_count);
+    try std.testing.expectEqual(@as(pixel.Pixel, 0), output[0]);
+    try std.testing.expectEqual(@as(pixel.Pixel, 0), output[1]);
+}
+
 test "VP8L entropy selects prefix groups from meta-prefix blocks" {
     var group_bytes: [32]u8 = undefined;
     var group_writer = bit_writer.BitWriter.init(&group_bytes);
@@ -990,6 +1032,53 @@ test "VP8L entropy no-cache distance-one copy fills a run" {
     for (output) |value| {
         try std.testing.expectEqual(expected, value);
     }
+}
+
+test "VP8L entropy distance-one copy refreshes the color cache" {
+    const cache_bits: u4 = 1;
+    const stale: pixel.Pixel = 1;
+    const repeated: pixel.Pixel = 0;
+    const repeated_index = color_cache.hash(cache_bits, repeated);
+    try std.testing.expectEqual(repeated_index, color_cache.hash(cache_bits, stale));
+
+    var cache: color_cache.Cache = undefined;
+    try cache.init(cache_bits);
+    cache.insert(stale);
+    try std.testing.expectEqual(stale, try cache.lookup(repeated_index));
+
+    var buffers: image_data.PrefixCodeGroupBuffers = .{};
+    const prefix_codes = image_data.PrefixCodeGroup{
+        .green = try singleSymbolTable(
+            &buffers.green_entries,
+            huffman.literal_alphabet_size,
+            huffman.literal_alphabet_size + huffman.length_code_count,
+        ),
+        .red = try singleSymbolTable(&buffers.red_entries, 0, huffman.literal_alphabet_size),
+        .blue = try singleSymbolTable(&buffers.blue_entries, 0, huffman.literal_alphabet_size),
+        .alpha = try singleSymbolTable(&buffers.alpha_entries, 0, huffman.literal_alphabet_size),
+        .distance = try singleSymbolTable(
+            &buffers.distance_entries,
+            1,
+            huffman.distance_alphabet_size,
+        ),
+    };
+
+    var reader = bit_reader.BitReader.init(&.{});
+    var output = [_]pixel.Pixel{ repeated, undefined };
+    const output_index = try copyBackwardReference(
+        true,
+        &reader,
+        try image.Dimensions.init(2, 1),
+        &prefix_codes,
+        &cache,
+        &output,
+        1,
+        huffman.literal_alphabet_size,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), output_index);
+    try std.testing.expectEqual(repeated, output[1]);
+    try std.testing.expectEqual(repeated, try cache.lookup(repeated_index));
 }
 
 test "VP8L entropy no-cache overlapping copy repeats prior pixels" {
