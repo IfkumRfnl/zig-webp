@@ -10,6 +10,7 @@ const transform = @import("transform.zig");
 
 const predictor_mode_count = 14;
 const predictor_black = pixel.fromChannels(255, 0, 0, 0);
+const grouped_color_indexing_pixel_min = 100_000;
 
 pub fn applyTransform(
     transform_value: transform.Transform,
@@ -228,27 +229,59 @@ pub fn applyColorIndexingTransform(
         @intCast(@as(u8, 8) >> width_bits);
     const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
 
-    var output_index = @as(usize, @intCast(pixel_count));
-    while (output_index > 0) {
-        output_index -= 1;
+    if (pixel_count < grouped_color_indexing_pixel_min or width_bits < 2) {
+        var output_index: usize = @intCast(pixel_count);
+        while (output_index > 0) {
+            output_index -= 1;
 
-        const x = output_index % output_width;
-        const y = output_index / output_width;
-        const source_x = x >> width_bits;
-        const source_index = y * source_width + source_x;
-        assert(source_index < source_pixel_count);
+            const x = output_index % output_width;
+            const y = output_index / output_width;
+            const source_x = x >> width_bits;
+            const source_index = y * source_width + source_x;
+            assert(source_index < source_pixel_count);
 
-        const packed_index = pixel.green(pixels[source_index]);
-        const shift: u3 = if (width_bits == 0)
-            0
-        else
-            @intCast((x & ((@as(usize, 1) << width_bits) - 1)) * index_bits);
-        const color_index = (packed_index >> shift) & index_mask;
+            const packed_index = pixel.green(pixels[source_index]);
+            const shift: u3 = if (width_bits == 0)
+                0
+            else
+                @intCast((x & ((@as(usize, 1) << width_bits) - 1)) * index_bits);
+            const color_index = (packed_index >> shift) & index_mask;
+            pixels[output_index] = if (color_index < color_indexing.color_table_size)
+                color_table[color_index]
+            else
+                pixel.fromChannels(0, 0, 0, 0);
+        }
+        return;
+    }
 
-        pixels[output_index] = if (color_index < color_indexing.color_table_size)
-            color_table[color_index]
-        else
-            pixel.fromChannels(0, 0, 0, 0);
+    const pixels_per_source: usize = @as(usize, 1) << width_bits;
+    var y: usize = @intCast(dimensions.height);
+    while (y > 0) {
+        y -= 1;
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+
+        var source_x = source_width;
+        while (source_x > 0) {
+            source_x -= 1;
+            const source_index = source_row_start + source_x;
+            assert(source_index < source_pixel_count);
+            const packed_indices = pixel.green(pixels[source_index]);
+
+            const output_start = source_x * pixels_per_source;
+            const output_end = @min(output_start + pixels_per_source, output_width);
+            var output_x = output_end;
+            while (output_x > output_start) {
+                output_x -= 1;
+                const shift: u3 = @intCast((output_x - output_start) * index_bits);
+                const color_index = (packed_indices >> shift) & index_mask;
+                pixels[output_row_start + output_x] =
+                    if (color_index < color_indexing.color_table_size)
+                        color_table[color_index]
+                    else
+                        pixel.fromChannels(0, 0, 0, 0);
+            }
+        }
     }
 }
 
