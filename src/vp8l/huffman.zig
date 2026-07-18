@@ -199,7 +199,9 @@ pub fn Table(comptime options: TableOptions) type {
 
         const Self = @This();
         comptime {
-            assert(@sizeOf(Self) == 16);
+            const pointer_size = @sizeOf([*]const Entry);
+            assert(pointer_size == 4 or pointer_size == 8);
+            assert(@sizeOf(Self) == if (pointer_size == 4) 12 else 16);
         }
 
         pub const alphabet_size_limit = alphabet_size_max;
