@@ -255,10 +255,29 @@ fn decodeMainImage(
     }
 
     const allocator = gpa orelse return error.UnsupportedVP8LImageData;
+    var entropy_image = buffers.entropy_image;
+    var entropy_image_owned: ?[]pixel.Pixel = null;
+    var prefix_group_options = buffers.prefix_group_options;
+    if (entropy_image.len == 0) {
+        const pixel_count = try dimensions.pixelCount();
+        if (pixel_count > std.math.maxInt(usize)) return error.AllocationLimitExceeded;
+        if (pixel_count > std.math.maxInt(u64) / @sizeOf(pixel.Pixel)) {
+            return error.AllocationLimitExceeded;
+        }
+        const allocation_bytes = pixel_count * @sizeOf(pixel.Pixel);
+        if (allocation_bytes > prefix_group_options.allocation_bytes_max) {
+            return error.AllocationLimitExceeded;
+        }
+        entropy_image = try allocator.alloc(pixel.Pixel, @intCast(pixel_count));
+        entropy_image_owned = entropy_image;
+        prefix_group_options.allocation_bytes_max -= allocation_bytes;
+    }
+    defer if (entropy_image_owned) |owned| allocator.free(owned);
+
     const info = try meta_prefix.readEntropyImage(
         reader,
         dimensions,
-        buffers.entropy_image,
+        entropy_image,
         &buffers.prefix_code_group,
     );
     var group_store = try prefix_groups.Store.readAll(
@@ -266,7 +285,7 @@ fn decodeMainImage(
         reader,
         info.group_count,
         image_data.colorCacheSize(color_cache),
-        buffers.prefix_group_options,
+        prefix_group_options,
         &buffers.prefix_code_group,
     );
     defer group_store.deinit();
@@ -278,7 +297,7 @@ fn decodeMainImage(
             color_cache,
             group_store,
             info,
-            buffers.entropy_image,
+            entropy_image,
             output,
         );
     }
@@ -288,7 +307,7 @@ fn decodeMainImage(
         color_cache,
         group_store,
         info,
-        buffers.entropy_image,
+        entropy_image,
         output,
     );
 }

@@ -120,6 +120,8 @@ pub fn decodePlaneAllocWithOptions(
 /// Decodes a VP8L-compressed alpha stream: a headerless VP8L image-data
 /// stream whose green channel carries the alpha values, optionally followed
 /// by in-place row unfiltering with the ALPH header filter.
+const lossless_stack_pixel_count = 10_000;
+
 fn decodeLossless(
     gpa: std.mem.Allocator,
     header: Header,
@@ -127,6 +129,57 @@ fn decodeLossless(
     dimensions: image.Dimensions,
     output: []u8,
     decode_options: DecodeAllocOptions,
+) errors.Error!void {
+    const pixel_count = try dimensions.pixelCount();
+    if (pixel_count <= lossless_stack_pixel_count) {
+        return decodeLosslessStack(
+            gpa,
+            header,
+            stream,
+            dimensions,
+            output,
+            decode_options,
+        );
+    }
+    return decodeLosslessWithScratch(
+        gpa,
+        header,
+        stream,
+        dimensions,
+        output,
+        decode_options,
+        &.{},
+    );
+}
+
+noinline fn decodeLosslessStack(
+    gpa: std.mem.Allocator,
+    header: Header,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+    decode_options: DecodeAllocOptions,
+) errors.Error!void {
+    var pixel_scratch: [lossless_stack_pixel_count]vp8l_pixel.Pixel = undefined;
+    return decodeLosslessWithScratch(
+        gpa,
+        header,
+        stream,
+        dimensions,
+        output,
+        decode_options,
+        &pixel_scratch,
+    );
+}
+
+fn decodeLosslessWithScratch(
+    gpa: std.mem.Allocator,
+    header: Header,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+    decode_options: DecodeAllocOptions,
+    pixel_scratch: []vp8l_pixel.Pixel,
 ) errors.Error!void {
     const pixel_count_u64 = try dimensions.pixelCount();
     const pixel_count: usize = @intCast(pixel_count_u64);
@@ -147,7 +200,7 @@ fn decodeLossless(
     );
     const entropy_count = try reserveElements(
         vp8l_pixel.Pixel,
-        pixel_count_u64,
+        if (pixel_count_u64 < 16384) 0 else pixel_count_u64,
         &allocation_bytes,
         decode_options,
     );
@@ -162,8 +215,12 @@ fn decodeLossless(
     }
     pixel_storage_count += entropy_count;
 
-    const pixel_storage = try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
-    defer gpa.free(pixel_storage);
+    const pixel_storage_owned = pixel_storage_count > pixel_scratch.len;
+    const pixel_storage = if (pixel_storage_count <= pixel_scratch.len)
+        pixel_scratch[0..pixel_storage_count]
+    else
+        try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
+    defer if (pixel_storage_owned) gpa.free(pixel_storage);
 
     const argb_pixels = pixel_storage[0..argb_count];
     // Capacity for one color table (256 entries plus rounding) or subsampled

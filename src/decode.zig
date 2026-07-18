@@ -130,16 +130,40 @@ pub fn decodeImage(
     };
 }
 
+const lossless_stack_pixel_count = 10_000;
+
 fn decodeLossless(
     gpa: std.mem.Allocator,
     source: ImageSource,
     decode_options: options.DecoderOptions,
 ) errors.Error!image.OwnedBuffer {
+    const pixel_count = try source.dimensions.pixelCount();
+    if (pixel_count <= lossless_stack_pixel_count) {
+        return decodeLosslessStack(gpa, source, decode_options);
+    }
+    return decodeLosslessWithScratch(gpa, source, decode_options, &.{});
+}
+
+noinline fn decodeLosslessStack(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    decode_options: options.DecoderOptions,
+) errors.Error!image.OwnedBuffer {
+    var pixel_scratch: [lossless_stack_pixel_count]vp8l_pixel.Pixel = undefined;
+    return decodeLosslessWithScratch(gpa, source, decode_options, &pixel_scratch);
+}
+
+fn decodeLosslessWithScratch(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    decode_options: options.DecoderOptions,
+    pixel_scratch: []vp8l_pixel.Pixel,
+) errors.Error!image.OwnedBuffer {
     const dimensions = source.dimensions;
     const output_len = try outputByteLength(dimensions, decode_options.output_format);
 
     var working_set: LosslessWorkingSet = undefined;
-    try working_set.init(gpa, source, decode_options, output_len);
+    try working_set.init(gpa, source, decode_options, output_len, pixel_scratch);
     defer working_set.deinit();
 
     const out = working_set.packed_output.?;
@@ -164,8 +188,32 @@ fn decodeLosslessInto(
     dest: image.Buffer,
     decode_options: options.DecoderOptions,
 ) errors.Error!void {
+    const pixel_count = try source.dimensions.pixelCount();
+    if (pixel_count <= lossless_stack_pixel_count) {
+        return decodeLosslessIntoStack(gpa, source, dest, decode_options);
+    }
+    return decodeLosslessIntoWithScratch(gpa, source, dest, decode_options, &.{});
+}
+
+noinline fn decodeLosslessIntoStack(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    dest: image.Buffer,
+    decode_options: options.DecoderOptions,
+) errors.Error!void {
+    var pixel_scratch: [lossless_stack_pixel_count]vp8l_pixel.Pixel = undefined;
+    return decodeLosslessIntoWithScratch(gpa, source, dest, decode_options, &pixel_scratch);
+}
+
+fn decodeLosslessIntoWithScratch(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    dest: image.Buffer,
+    decode_options: options.DecoderOptions,
+    pixel_scratch: []vp8l_pixel.Pixel,
+) errors.Error!void {
     var working_set: LosslessWorkingSet = undefined;
-    try working_set.init(gpa, source, decode_options, null);
+    try working_set.init(gpa, source, decode_options, null, pixel_scratch);
     defer working_set.deinit();
 
     writePixelsInto(dest, working_set.argb_pixels);
@@ -174,6 +222,7 @@ fn decodeLosslessInto(
 const LosslessWorkingSet = struct {
     gpa: std.mem.Allocator,
     pixel_storage: []vp8l_pixel.Pixel,
+    pixel_storage_owned: bool,
     argb_pixels: []vp8l_pixel.Pixel,
     transform_pixels: []vp8l_pixel.Pixel,
     entropy_image: []vp8l_pixel.Pixel,
@@ -185,10 +234,12 @@ const LosslessWorkingSet = struct {
         source: ImageSource,
         decode_options: options.DecoderOptions,
         packed_output_len: ?u64,
+        pixel_scratch: []vp8l_pixel.Pixel,
     ) errors.Error!void {
         target.* = .{
             .gpa = gpa,
             .pixel_storage = &.{},
+            .pixel_storage_owned = false,
             .argb_pixels = &.{},
             .transform_pixels = &.{},
             .entropy_image = &.{},
@@ -216,7 +267,7 @@ const LosslessWorkingSet = struct {
         );
         const entropy_count = try reserveElements(
             vp8l_pixel.Pixel,
-            pixel_count,
+            if (pixel_count < 16384) 0 else pixel_count,
             &allocation_bytes,
             decode_options,
         );
@@ -225,22 +276,31 @@ const LosslessWorkingSet = struct {
         else
             null;
 
-        if (pixel_count < 16384 and source.bitstream.len >= 128) {
+        var pixel_storage_count = argb_count;
+        if (transform_count > std.math.maxInt(usize) - pixel_storage_count) {
+            return error.AllocationLimitExceeded;
+        }
+        pixel_storage_count += transform_count;
+        if (entropy_count > std.math.maxInt(usize) - pixel_storage_count) {
+            return error.AllocationLimitExceeded;
+        }
+        pixel_storage_count += entropy_count;
+
+        if (pixel_storage_count <= pixel_scratch.len) {
+            target.pixel_storage = pixel_scratch[0..pixel_storage_count];
+            target.argb_pixels = target.pixel_storage[0..argb_count];
+            const transform_start = argb_count;
+            target.transform_pixels =
+                target.pixel_storage[transform_start..][0..transform_count];
+            const entropy_start = transform_start + transform_count;
+            target.entropy_image = target.pixel_storage[entropy_start..][0..entropy_count];
+        } else if (pixel_count < 16384 and source.bitstream.len >= 128) {
             target.argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
             target.transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
             target.entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
         } else {
-            var pixel_storage_count = argb_count;
-            if (transform_count > std.math.maxInt(usize) - pixel_storage_count) {
-                return error.AllocationLimitExceeded;
-            }
-            pixel_storage_count += transform_count;
-            if (entropy_count > std.math.maxInt(usize) - pixel_storage_count) {
-                return error.AllocationLimitExceeded;
-            }
-            pixel_storage_count += entropy_count;
-
             target.pixel_storage = try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
+            target.pixel_storage_owned = true;
             target.argb_pixels = target.pixel_storage[0..argb_count];
             const transform_start = argb_count;
             target.transform_pixels =
@@ -271,9 +331,9 @@ const LosslessWorkingSet = struct {
 
     fn deinit(self: *LosslessWorkingSet) void {
         if (self.packed_output) |out| self.gpa.free(out);
-        if (self.pixel_storage.len > 0) {
+        if (self.pixel_storage_owned) {
             self.gpa.free(self.pixel_storage);
-        } else {
+        } else if (self.pixel_storage.len == 0) {
             if (self.entropy_image.len > 0) self.gpa.free(self.entropy_image);
             if (self.transform_pixels.len > 0) self.gpa.free(self.transform_pixels);
             if (self.argb_pixels.len > 0) self.gpa.free(self.argb_pixels);
