@@ -202,7 +202,6 @@ pub const BitReader = struct {
         self.dropBitsBuffered(count);
         return value;
     }
-
     pub inline fn peekFull(self: BitReader) u64 {
         return self.bit_buffer;
     }

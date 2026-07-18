@@ -68,6 +68,10 @@ pub const EntryKind = enum {
     symbol,
     table,
 };
+pub const PeekedSymbol = struct {
+    symbol: u16,
+    bit_count: u6,
+};
 
 /// Two-byte Huffman lookup entry (bits:u4 + payload:u12).
 ///
@@ -189,16 +193,25 @@ pub fn Table(comptime options: TableOptions) type {
     }
 
     return struct {
-        entries: []const Entry,
+        entries_ptr: [*]const Entry,
+        entries_len: u16,
         single_symbol: ?u16 = null,
 
         const Self = @This();
+        comptime {
+            const pointer_size = @sizeOf([*]const Entry);
+            assert(pointer_size == 4 or pointer_size == 8);
+            assert(@sizeOf(Self) == if (pointer_size == 4) 12 else 16);
+        }
 
         pub const alphabet_size_limit = alphabet_size_max;
         pub const root_bit_count = root_bits;
         pub const code_bit_count_max = code_bits_max;
         pub const root_entry_count_max = root_entry_count;
         pub const entry_count_limit = entry_count_max;
+        pub inline fn entriesSlice(self: Self) []const Entry {
+            return self.entries_ptr[0..self.entries_len];
+        }
 
         pub fn build(entries_buffer: []Entry, code_lengths: []const u8) Error!Self {
             if (code_lengths.len == 0) return error.InvalidHuffmanTree;
@@ -224,10 +237,9 @@ pub fn Table(comptime options: TableOptions) type {
                 // The VP8L single-leaf exception is encoded with length 1.
                 if (code_lengths[@intCast(last_symbol)] != 1) return error.InvalidHuffmanTree;
 
-                @memset(entries_buffer[0..root_entry_count], Entry.symbol(last_symbol, 0));
-
                 return .{
-                    .entries = entries_buffer[0..root_entry_count],
+                    .entries_ptr = entries_buffer.ptr,
+                    .entries_len = 0,
                     .single_symbol = last_symbol,
                 };
             }
@@ -298,13 +310,16 @@ pub fn Table(comptime options: TableOptions) type {
 
             try validateTable(entries_buffer[0..entry_count]);
 
-            return .{ .entries = entries_buffer[0..entry_count] };
+            return .{
+                .entries_ptr = entries_buffer.ptr,
+                .entries_len = @intCast(entry_count),
+            };
         }
 
         pub fn decode(self: Self, reader: *bit_reader.BitReader) Error!u16 {
             if (self.single_symbol) |symbol| return symbol;
 
-            assert(self.entries.len >= root_entry_count);
+            assert(self.entries_len >= root_entry_count);
 
             if (reader.remainingBits() < root_bits) {
                 return self.decodeSlow(reader);
@@ -312,7 +327,7 @@ pub fn Table(comptime options: TableOptions) type {
 
             const root_value = try reader.peekBits(root_bits_u6);
             const root_index: usize = @intCast(root_value & root_mask_u32);
-            const root_entry = self.entries[root_index];
+            const root_entry = self.entries_ptr[root_index];
             switch (root_entry.kind(root_bits)) {
                 .invalid => return error.InvalidHuffmanCode,
                 .symbol => {
@@ -331,7 +346,7 @@ pub fn Table(comptime options: TableOptions) type {
                     const subtable_mask = maskBits(subtable_bits);
                     const subtable_index: usize = @as(usize, root_entry.tableOffset(root_bits)) +
                         @as(usize, @intCast((value >> root_bits) & subtable_mask));
-                    const subtable_entry = self.entries[subtable_index];
+                    const subtable_entry = self.entries_ptr[subtable_index];
                     if (subtable_entry.kind(root_bits) != .symbol) {
                         return error.InvalidHuffmanCode;
                     }
@@ -359,33 +374,61 @@ pub fn Table(comptime options: TableOptions) type {
                 }
             }
 
-            assert(self.entries.len >= root_entry_count);
+            return self.decodePrefilled(reader);
+        }
+
+        /// Decodes without a refill after the caller has reserved enough bits
+        /// for the entire maximum-length code.
+        pub inline fn decodePrefilled(
+            self: Self,
+            reader: *bit_reader.BitReader,
+        ) Error!u16 {
+            if (self.single_symbol) |symbol| return symbol;
+            assert(reader.bufferedBits() >= code_bits_max_u6);
+            assert(self.entries_len >= root_entry_count);
+
             const value: u32 = @truncate(reader.peekFull());
             const root_index: usize = @intCast(value & root_mask_u32);
-            const root_entry = self.entries[root_index];
-            switch (root_entry.kind(root_bits)) {
-                .invalid => return error.InvalidHuffmanCode,
-                .symbol => {
-                    reader.dropBitsBuffered(@intCast(root_entry.bits));
-                    return root_entry.symbolValue(root_bits);
-                },
-                .table => {
-                    const subtable_bits: u6 = @intCast(root_entry.subtableBits(root_bits));
-                    const subtable_mask = maskBits(subtable_bits);
-                    const subtable_index: usize =
-                        @as(usize, root_entry.tableOffset(root_bits)) +
-                        @as(usize, @intCast((value >> root_bits) & subtable_mask));
-                    const subtable_entry = self.entries[subtable_index];
-                    if (subtable_entry.kind(root_bits) != .symbol) {
-                        return error.InvalidHuffmanCode;
-                    }
-
-                    const consumed_bits =
-                        root_bits_u6 + @as(u6, @intCast(subtable_entry.bits));
-                    reader.dropBitsBuffered(consumed_bits);
-                    return subtable_entry.symbolValue(root_bits);
-                },
+            const root_entry = self.entries_ptr[root_index];
+            if (root_entry.bits <= root_bits) {
+                reader.dropBitsBuffered(@intCast(root_entry.bits));
+                return root_entry.symbolValue(root_bits);
             }
+
+            const subtable_bits: u6 = @intCast(root_entry.subtableBits(root_bits));
+            const subtable_mask = maskBits(subtable_bits);
+            const subtable_index: usize =
+                @as(usize, root_entry.tableOffset(root_bits)) +
+                @as(usize, @intCast((value >> root_bits) & subtable_mask));
+            const subtable_entry = self.entries_ptr[subtable_index];
+            const consumed_bits =
+                root_bits_u6 + @as(u6, @intCast(subtable_entry.bits));
+            reader.dropBitsBuffered(consumed_bits);
+            return subtable_entry.symbolValue(root_bits);
+        }
+
+        /// Peeks a symbol that is fully represented by the root table.
+        ///
+        /// The entropy loop uses this to consume adjacent color-cache symbols
+        /// without repeating its tile-selection and dispatch work.
+        pub inline fn peekBuffered(
+            self: Self,
+            reader: *const bit_reader.BitReader,
+        ) ?PeekedSymbol {
+            if (self.single_symbol) |symbol| {
+                return .{ .symbol = symbol, .bit_count = 0 };
+            }
+            if (reader.bufferedBits() < root_bits_u6) return null;
+
+            const value: u32 = @truncate(reader.peekFull());
+            const root_index: usize = @intCast(value & root_mask_u32);
+            const root_entry = self.entries_ptr[root_index];
+            if (root_entry.bits > root_bits) return null;
+
+            return .{
+                .symbol = root_entry.symbolValue(root_bits),
+                .bit_count = @intCast(root_entry.bits),
+            };
         }
 
         fn decodeSlow(self: Self, reader: *bit_reader.BitReader) Error!u16 {
@@ -410,7 +453,7 @@ pub fn Table(comptime options: TableOptions) type {
 
             if (length <= root_bits_u6) {
                 const root_index: usize = @intCast(code);
-                const entry = self.entries[root_index];
+                const entry = self.entries_ptr[root_index];
                 if (entry.kind(root_bits) == .symbol and entry.bits == length) {
                     return entry.symbolValue(root_bits);
                 }
@@ -419,7 +462,7 @@ pub fn Table(comptime options: TableOptions) type {
             }
 
             const root_index: usize = @intCast(code & root_mask_u32);
-            const root_entry = self.entries[root_index];
+            const root_entry = self.entries_ptr[root_index];
             if (root_entry.kind(root_bits) != .table) return null;
 
             const extra_bits = length - root_bits_u6;
@@ -427,7 +470,7 @@ pub fn Table(comptime options: TableOptions) type {
 
             const subtable_index: usize = @as(usize, root_entry.tableOffset(root_bits)) +
                 @as(usize, @intCast((code >> root_bits) & maskBits(extra_bits)));
-            const entry = self.entries[subtable_index];
+            const entry = self.entries_ptr[subtable_index];
             if (entry.kind(root_bits) == .symbol and entry.bits == extra_bits) {
                 return entry.symbolValue(root_bits);
             }
@@ -562,7 +605,7 @@ fn maskBits(bits: u6) u32 {
 }
 
 comptime {
-    assert(SymbolTable.root_entry_count_max == 256);
+    assert(SymbolTable.root_entry_count_max == 1 << root_bits_default);
     assert(SymbolTable.entry_count_limit == symbol_table_entry_count_enough);
     assert(CodeLengthTable.root_entry_count_max == 32);
     assert(CodeLengthTable.entry_count_limit == 160);
@@ -626,6 +669,7 @@ test "VP8L Huffman table decodes a single leaf without consuming bits" {
     var entries: [SymbolTable.entry_count_limit]Entry = undefined;
     const code_lengths = [_]u8{0} ** 42 ++ [_]u8{1};
     const table = try SymbolTable.build(&entries, &code_lengths);
+    try std.testing.expectEqual(@as(usize, 0), table.entriesSlice().len);
 
     var reader = bit_reader.BitReader.init(&.{});
 
@@ -686,14 +730,14 @@ test "VP8L Huffman table decodes symbols from a second-level table" {
 
     // Codes longer than root_bits must land in a second-level table entry.
     var saw_table_entry = false;
-    for (table.entries[0..SymbolTable.root_entry_count_max]) |root_entry| {
+    for (table.entriesSlice()[0..SymbolTable.root_entry_count_max]) |root_entry| {
         if (root_entry.kind(root_bits_default) != .table) continue;
         saw_table_entry = true;
         try std.testing.expect(
             root_entry.tableOffset(root_bits_default) >= SymbolTable.root_entry_count_max,
         );
         try std.testing.expect(root_entry.subtableBits(root_bits_default) > 0);
-        const sub = table.entries[root_entry.tableOffset(root_bits_default)];
+        const sub = table.entriesSlice()[root_entry.tableOffset(root_bits_default)];
         try std.testing.expect(!sub.isInvalid());
         _ = sub.symbolValue(root_bits_default);
     }
@@ -787,7 +831,7 @@ test "VP8L Huffman compact Entry keeps distinct absolute subtable offsets" {
 
     var offsets: [8]u16 = undefined;
     var offset_count: usize = 0;
-    for (table.entries[0..SymbolTable.root_entry_count_max]) |root_entry| {
+    for (table.entriesSlice()[0..SymbolTable.root_entry_count_max]) |root_entry| {
         if (root_entry.kind(root_bits_default) != .table) continue;
 
         const offset = root_entry.tableOffset(root_bits_default);
@@ -849,7 +893,7 @@ test "VP8L Huffman code-length table fits two-byte entries with 5-bit root" {
     const table = try CodeLengthTable.build(&entries, &code_lengths);
 
     var saw_table = false;
-    for (table.entries[0..CodeLengthTable.root_entry_count_max]) |root_entry| {
+    for (table.entriesSlice()[0..CodeLengthTable.root_entry_count_max]) |root_entry| {
         switch (root_entry.kind(code_length_root_bits)) {
             .invalid => try std.testing.expect(false),
             .symbol => try std.testing.expect(root_entry.bits <= code_length_root_bits),

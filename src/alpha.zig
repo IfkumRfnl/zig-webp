@@ -117,10 +117,11 @@ pub fn decodePlaneAllocWithOptions(
 
     return header;
 }
-
 /// Decodes a VP8L-compressed alpha stream: a headerless VP8L image-data
 /// stream whose green channel carries the alpha values, optionally followed
 /// by in-place row unfiltering with the ALPH header filter.
+const lossless_stack_pixel_count = 10_000;
+
 fn decodeLossless(
     gpa: std.mem.Allocator,
     header: Header,
@@ -128,6 +129,57 @@ fn decodeLossless(
     dimensions: image.Dimensions,
     output: []u8,
     decode_options: DecodeAllocOptions,
+) errors.Error!void {
+    const pixel_count = try dimensions.pixelCount();
+    if (pixel_count <= lossless_stack_pixel_count) {
+        return decodeLosslessStack(
+            gpa,
+            header,
+            stream,
+            dimensions,
+            output,
+            decode_options,
+        );
+    }
+    return decodeLosslessWithScratch(
+        gpa,
+        header,
+        stream,
+        dimensions,
+        output,
+        decode_options,
+        &.{},
+    );
+}
+
+noinline fn decodeLosslessStack(
+    gpa: std.mem.Allocator,
+    header: Header,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+    decode_options: DecodeAllocOptions,
+) errors.Error!void {
+    var pixel_scratch: [lossless_stack_pixel_count]vp8l_pixel.Pixel = undefined;
+    return decodeLosslessWithScratch(
+        gpa,
+        header,
+        stream,
+        dimensions,
+        output,
+        decode_options,
+        &pixel_scratch,
+    );
+}
+
+fn decodeLosslessWithScratch(
+    gpa: std.mem.Allocator,
+    header: Header,
+    stream: []const u8,
+    dimensions: image.Dimensions,
+    output: []u8,
+    decode_options: DecodeAllocOptions,
+    pixel_scratch: []vp8l_pixel.Pixel,
 ) errors.Error!void {
     const pixel_count_u64 = try dimensions.pixelCount();
     const pixel_count: usize = @intCast(pixel_count_u64);
@@ -142,28 +194,41 @@ fn decodeLossless(
     );
     const transform_count = try reserveElements(
         vp8l_pixel.Pixel,
-        try transformPixelCapacity(pixel_count_u64),
+        try transformPixelCapacityForStream(pixel_count_u64, stream),
         &allocation_bytes,
         decode_options,
     );
     const entropy_count = try reserveElements(
         vp8l_pixel.Pixel,
-        pixel_count_u64,
+        if (pixel_count_u64 < 16384) 0 else pixel_count_u64,
         &allocation_bytes,
         decode_options,
     );
 
-    const argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
-    defer gpa.free(argb_pixels);
+    var pixel_storage_count = argb_count;
+    if (transform_count > std.math.maxInt(usize) - pixel_storage_count) {
+        return error.AllocationLimitExceeded;
+    }
+    pixel_storage_count += transform_count;
+    if (entropy_count > std.math.maxInt(usize) - pixel_storage_count) {
+        return error.AllocationLimitExceeded;
+    }
+    pixel_storage_count += entropy_count;
 
-    // Capacity for one color table (256 entries plus rounding) or
-    // subsampled predictor/color transform blocks, matching the public
-    // static decode composition.
-    const transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
-    defer gpa.free(transform_pixels);
+    const pixel_storage_owned = pixel_storage_count > pixel_scratch.len;
+    const pixel_storage = if (pixel_storage_count <= pixel_scratch.len)
+        pixel_scratch[0..pixel_storage_count]
+    else
+        try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
+    defer if (pixel_storage_owned) gpa.free(pixel_storage);
 
-    const entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
-    defer gpa.free(entropy_image);
+    const argb_pixels = pixel_storage[0..argb_count];
+    // Capacity for one color table (256 entries plus rounding) or subsampled
+    // predictor/color transform blocks, matching static decode composition.
+    const transform_start = argb_count;
+    const transform_pixels = pixel_storage[transform_start..][0..transform_count];
+    const entropy_start = transform_start + transform_count;
+    const entropy_image = pixel_storage[entropy_start..][0..entropy_count];
 
     var buffers = vp8l_decoder.WorkBuffers{
         .transform_pixels = transform_pixels,
@@ -172,18 +237,15 @@ fn decodeLossless(
             .allocation_bytes_max = decode_options.allocation_bytes_max - allocation_bytes,
         },
     };
-    _ = try vp8l_decoder.decodeImageStreamAlloc(
+    const plane = output[0..pixel_count];
+    try vp8l_decoder.decodeImageStreamAlphaAllocDiscardSummary(
         gpa,
         stream,
         dimensions,
         argb_pixels,
+        plane,
         &buffers,
     );
-
-    const plane = output[0..pixel_count];
-    for (argb_pixels, plane) |value, *sample| {
-        sample.* = vp8l_pixel.green(value);
-    }
 
     unfilterPlaneInPlace(header.filter, plane, dimensions);
 }
@@ -215,6 +277,13 @@ fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {
     if (pixel_count > std.math.maxInt(u64) - 257) return error.AllocationLimitExceeded;
 
     return pixel_count + 257;
+}
+fn transformPixelCapacityForStream(
+    pixel_count: u64,
+    stream: []const u8,
+) errors.Error!u64 {
+    if (stream.len > 0 and (stream[0] & 1) == 0) return 0;
+    return transformPixelCapacity(pixel_count);
 }
 
 fn unfilterPlaneInPlace(

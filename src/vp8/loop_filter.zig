@@ -173,14 +173,14 @@ fn filterMacroblock(
     switch (filter_type) {
         .none => unreachable,
         .simple => {
-            // Vertical edges stay scalar (strided edge pixels). Horizontal
-            // edges use contiguous-lane @Vector loads (along == 1).
+            // Both edge orientations use vector lanes; vertical edges gather
+            // one byte per row while horizontal edges load contiguous rows.
             if (has_left) {
-                simpleEdge(view.luma, y_base, 1, y_stride, 16, edge);
+                simpleEdgeV(16, view.luma, y_base, y_stride, edge);
             }
             if (info.inner) {
                 for (1..4) |k| {
-                    simpleEdge(view.luma, y_base + 4 * k, 1, y_stride, 16, limit);
+                    simpleEdgeV(16, view.luma, y_base + 4 * k, y_stride, limit);
                 }
             }
             if (has_top) {
@@ -197,16 +197,16 @@ fn filterMacroblock(
             const uv_base = @as(usize, mb_y) * 8 * uv_stride + @as(usize, mb_x) * 8;
 
             if (has_left) {
-                complexEdge(view.luma, y_base, 1, y_stride, 16, edge, inner_limit, hev_threshold, true);
-                complexEdge(view.chroma_u, uv_base, 1, uv_stride, 8, edge, inner_limit, hev_threshold, true);
-                complexEdge(view.chroma_v, uv_base, 1, uv_stride, 8, edge, inner_limit, hev_threshold, true);
+                complexEdgeV(16, view.luma, y_base, y_stride, edge, inner_limit, hev_threshold, true);
+                complexEdgeV(8, view.chroma_u, uv_base, uv_stride, edge, inner_limit, hev_threshold, true);
+                complexEdgeV(8, view.chroma_v, uv_base, uv_stride, edge, inner_limit, hev_threshold, true);
             }
             if (info.inner) {
                 for (1..4) |k| {
-                    complexEdge(view.luma, y_base + 4 * k, 1, y_stride, 16, limit, inner_limit, hev_threshold, false);
+                    complexEdgeV(16, view.luma, y_base + 4 * k, y_stride, limit, inner_limit, hev_threshold, false);
                 }
-                complexEdge(view.chroma_u, uv_base + 4, 1, uv_stride, 8, limit, inner_limit, hev_threshold, false);
-                complexEdge(view.chroma_v, uv_base + 4, 1, uv_stride, 8, limit, inner_limit, hev_threshold, false);
+                complexEdgeV(8, view.chroma_u, uv_base + 4, uv_stride, limit, inner_limit, hev_threshold, false);
+                complexEdgeV(8, view.chroma_v, uv_base + 4, uv_stride, limit, inner_limit, hev_threshold, false);
             }
             if (has_top) {
                 complexEdgeH(16, view.luma, y_base, y_stride, edge, inner_limit, hev_threshold, true);
@@ -225,8 +225,8 @@ fn filterMacroblock(
 }
 
 /// Scalar-only twin of `filterMacroblock` for equivalence tests. Mirrors the
-/// production edge order but always calls the scalar edge loops — never the
-/// horizontal SIMD entry points. Not a production "disable SIMD" knob.
+/// production edge order but always calls the scalar edge loops. Not a
+/// production "disable SIMD" knob.
 fn filterMacroblockScalar(
     view: FrameView,
     filter_type: Type,
@@ -381,17 +381,17 @@ fn complexEdge(
     }
 }
 
-// --- Horizontal SIMD (contiguous lanes, along == 1) -------------------------
+// --- Edge SIMD -------------------------------------------------------------
 //
-// Each tap row p3..q3 is one contiguous Lanes-byte load at center+k*stride.
-// Vertical edges (across == 1, along == stride) stay on the scalar path:
-// gather/transpose of Lanes eight-byte tap groups is not clearly bounded
-// enough to keep alongside the horizontal kernels without extra complexity.
+// Horizontal taps are contiguous vector loads. Vertical taps gather one byte
+// per row into vector lanes, then scatter only the filtered columns. The
+// gather/scatter cost is amortized by vectorizing every filter predicate and
+// update across the 8- or 16-pixel edge.
 //
 // Plane padding is macroblock-aligned with no extra border (decoder
 // FrameAllocationPlan). has_top/has_left keep 4-tap reads inside the plane;
-// horizontal vector loads of Lanes bytes fit within the current macroblock
-// column (16 luma / 8 chroma). Do not grow padding.
+// horizontal vector loads fit within the current macroblock column and
+// vertical gathers fit within its rows. Do not grow padding.
 //
 // i16 headroom: taps 0..255; a = 3*(q0-p0)+sclip1(p1-q1) ∈ [-893, 892];
 // doFilter6 intermediate 27*a_clamped+63 with a_clamped ∈ [-128,127] ∈
@@ -400,6 +400,66 @@ fn complexEdge(
 comptime {
     assert(893 < 32768);
     assert(3492 < 32768);
+}
+
+fn simpleEdgeV(comptime Lanes: usize, plane: []u8, base: usize, stride: usize, threshold: i32) void {
+    comptime assert(Lanes == 8 or Lanes == 16);
+    const threshold2: i16 = @intCast(2 * threshold + 1);
+
+    const p1 = loadColumn(Lanes, plane, base, stride, -2);
+    const p0 = loadColumn(Lanes, plane, base, stride, -1);
+    const q0 = loadColumn(Lanes, plane, base, stride, 0);
+    const q1 = loadColumn(Lanes, plane, base, stride, 1);
+
+    const needs = needsFilterVec(Lanes, p1, p0, q0, q1, threshold2);
+    const f2 = filter2Vec(Lanes, p1, p0, q0, q1);
+    storeColumn(Lanes, plane, base, stride, -1, @select(i16, needs, f2.p0, p0));
+    storeColumn(Lanes, plane, base, stride, 0, @select(i16, needs, f2.q0, q0));
+}
+
+fn complexEdgeV(
+    comptime Lanes: usize,
+    plane: []u8,
+    base: usize,
+    stride: usize,
+    threshold: i32,
+    inner_limit: i32,
+    hev_threshold: i32,
+    comptime macroblock_edge: bool,
+) void {
+    comptime assert(Lanes == 8 or Lanes == 16);
+    const threshold2: i16 = @intCast(2 * threshold + 1);
+    const inner: i16 = @intCast(inner_limit);
+    const hev_thr: i16 = @intCast(hev_threshold);
+
+    const p3 = loadColumn(Lanes, plane, base, stride, -4);
+    const p2 = loadColumn(Lanes, plane, base, stride, -3);
+    const p1 = loadColumn(Lanes, plane, base, stride, -2);
+    const p0 = loadColumn(Lanes, plane, base, stride, -1);
+    const q0 = loadColumn(Lanes, plane, base, stride, 0);
+    const q1 = loadColumn(Lanes, plane, base, stride, 1);
+    const q2 = loadColumn(Lanes, plane, base, stride, 2);
+    const q3 = loadColumn(Lanes, plane, base, stride, 3);
+
+    const needs2 = needsFilter2Vec(Lanes, p3, p2, p1, p0, q0, q1, q2, q3, threshold2, inner);
+    const hev_mask = hevVec(Lanes, p1, p0, q0, q1, hev_thr);
+    const f2 = filter2Vec(Lanes, p1, p0, q0, q1);
+
+    if (macroblock_edge) {
+        const f6 = filter6Vec(Lanes, p2, p1, p0, q0, q1, q2);
+        storeColumn(Lanes, plane, base, stride, -3, @select(i16, needs2, @select(i16, hev_mask, p2, f6.p2), p2));
+        storeColumn(Lanes, plane, base, stride, -2, @select(i16, needs2, @select(i16, hev_mask, p1, f6.p1), p1));
+        storeColumn(Lanes, plane, base, stride, -1, @select(i16, needs2, @select(i16, hev_mask, f2.p0, f6.p0), p0));
+        storeColumn(Lanes, plane, base, stride, 0, @select(i16, needs2, @select(i16, hev_mask, f2.q0, f6.q0), q0));
+        storeColumn(Lanes, plane, base, stride, 1, @select(i16, needs2, @select(i16, hev_mask, q1, f6.q1), q1));
+        storeColumn(Lanes, plane, base, stride, 2, @select(i16, needs2, @select(i16, hev_mask, q2, f6.q2), q2));
+    } else {
+        const f4 = filter4Vec(Lanes, p1, p0, q0, q1);
+        storeColumn(Lanes, plane, base, stride, -2, @select(i16, needs2, @select(i16, hev_mask, p1, f4.p1), p1));
+        storeColumn(Lanes, plane, base, stride, -1, @select(i16, needs2, @select(i16, hev_mask, f2.p0, f4.p0), p0));
+        storeColumn(Lanes, plane, base, stride, 0, @select(i16, needs2, @select(i16, hev_mask, f2.q0, f4.q0), q0));
+        storeColumn(Lanes, plane, base, stride, 1, @select(i16, needs2, @select(i16, hev_mask, q1, f4.q1), q1));
+    }
 }
 
 fn simpleEdgeH(comptime Lanes: usize, plane: []u8, base: usize, stride: usize, threshold: i32) void {
@@ -459,6 +519,43 @@ fn complexEdgeH(
         storeRow(Lanes, plane, base, stride, -1, @select(i16, needs2, @select(i16, hev_mask, f2.p0, f4.p0), p0));
         storeRow(Lanes, plane, base, stride, 0, @select(i16, needs2, @select(i16, hev_mask, f2.q0, f4.q0), q0));
         storeRow(Lanes, plane, base, stride, 1, @select(i16, needs2, @select(i16, hev_mask, q1, f4.q1), q1));
+    }
+}
+
+fn loadColumn(
+    comptime Lanes: usize,
+    plane: []const u8,
+    base: usize,
+    stride: usize,
+    offset: i32,
+) @Vector(Lanes, i16) {
+    const signed = @as(i64, @intCast(base)) + offset;
+    assert(signed >= 0);
+    const column: usize = @intCast(signed);
+    assert(column + (Lanes - 1) * stride < plane.len);
+
+    var values: @Vector(Lanes, i16) = undefined;
+    inline for (0..Lanes) |lane| {
+        values[lane] = plane[column + lane * stride];
+    }
+    return values;
+}
+
+fn storeColumn(
+    comptime Lanes: usize,
+    plane: []u8,
+    base: usize,
+    stride: usize,
+    offset: i32,
+    values: @Vector(Lanes, i16),
+) void {
+    const signed = @as(i64, @intCast(base)) + offset;
+    assert(signed >= 0);
+    const column: usize = @intCast(signed);
+    assert(column + (Lanes - 1) * stride < plane.len);
+    const bytes: @Vector(Lanes, u8) = @intCast(clip255Vec(Lanes, values));
+    inline for (0..Lanes) |lane| {
+        plane[column + lane * stride] = bytes[lane];
     }
 }
 
@@ -1039,7 +1136,7 @@ fn runEquivalenceCaseFill(
     try expectPlanesEqual(v_s, v_v);
 }
 
-test "SIMD horizontal edges match scalar on randomized asymmetric frames" {
+test "SIMD edges match scalar on randomized asymmetric frames" {
     const levels = [_]u8{ 10, 25, 63 };
     const sharpnesses = [_]u8{ 0, 4, 7 };
     const types = [_]Type{ .simple, .complex };
@@ -1058,7 +1155,7 @@ test "SIMD horizontal edges match scalar on randomized asymmetric frames" {
     }
 }
 
-test "SIMD horizontal edges honor boundary macroblock guards" {
+test "SIMD edges honor boundary macroblock guards" {
     // 1x1: no left/top neighbors — only possible edges are inner ones.
     // 2x1: left neighbor on the second MB, still no top neighbor.
     // 1x2: top neighbor on the second row, still no left neighbor.
@@ -1082,10 +1179,11 @@ test "SIMD horizontal edges honor boundary macroblock guards" {
     }
 }
 
-test "SIMD horizontal edges match scalar on smooth ramps (low HEV)" {
+test "SIMD edges match scalar on smooth ramps (low HEV)" {
     // Asymmetric fill always exceeds hev_threshold at the tested levels, so it
     // never selects filter4Vec/filter6Vec. A unit vertical ramp keeps hev false
-    // while needsFilter2 still passes at high strength — defending those kernels.
+    // while needsFilter2 still passes at high strength — defending those kernels
+    // in both edge orientations.
     const levels = [_]u8{ 25, 40, 63 };
     const sharpnesses = [_]u8{ 0, 4, 7 };
     var seed: u32 = 0x0f1e_2d3c;

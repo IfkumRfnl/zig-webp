@@ -10,6 +10,7 @@ const transform = @import("transform.zig");
 
 const predictor_mode_count = 14;
 const predictor_black = pixel.fromChannels(255, 0, 0, 0);
+const grouped_color_indexing_pixel_min = 100_000;
 
 pub fn applyTransform(
     transform_value: transform.Transform,
@@ -95,13 +96,29 @@ pub fn applyPredictorTransform(
 }
 
 pub fn applySubtractGreen(pixels: []pixel.Pixel) void {
-    for (pixels) |*value| {
-        const green_value = pixel.green(value.*);
-        const red_value = pixel.red(value.*) +% green_value;
-        const blue_value = pixel.blue(value.*) +% green_value;
+    var index: usize = 0;
+    while (index + predictor_vector_lanes <= pixels.len) : (index += predictor_vector_lanes) {
+        const values = loadPixelVector(pixels, index);
+        const channel_mask: PixelVector = @splat(0xff);
+        const green = (values >> @splat(8)) & channel_mask;
+        const red = ((values >> @splat(16)) +% green) & channel_mask;
+        const blue = (values +% green) & channel_mask;
+        storePixelVector(
+            pixels,
+            index,
+            (values & @as(PixelVector, @splat(0xff00ff00))) |
+                (red << @splat(16)) |
+                blue,
+        );
+    }
+    while (index < pixels.len) : (index += 1) {
+        const value = pixels[index];
+        const green_value = pixel.green(value);
+        const red_value = pixel.red(value) +% green_value;
+        const blue_value = pixel.blue(value) +% green_value;
 
-        value.* = pixel.fromChannels(
-            pixel.alpha(value.*),
+        pixels[index] = pixel.fromChannels(
+            pixel.alpha(value),
             red_value,
             green_value,
             blue_value,
@@ -149,6 +166,17 @@ pub fn applyColorTransform(
 
             const row_index = y * width + x;
             var offset: usize = 0;
+            while (offset + predictor_vector_lanes <= run_len) : (offset += predictor_vector_lanes) {
+                const pixel_index = row_index + offset;
+                storePixelVector(
+                    image_pixels,
+                    pixel_index,
+                    applyColorTransformVector(
+                        color_element,
+                        loadPixelVector(image_pixels, pixel_index),
+                    ),
+                );
+            }
             while (offset < run_len) : (offset += 1) {
                 const pixel_index = row_index + offset;
                 image_pixels[pixel_index] = applyColorTransformPixel(
@@ -176,6 +204,90 @@ pub fn applyColorTableDeltas(color_table: []pixel.Pixel) void {
         previous = value;
     }
 }
+pub fn applyColorIndexingTransformGreen(
+    color_indexing: transform.ColorIndexing,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    packed_pixels: []const pixel.Pixel,
+    output: []u8,
+) errors.Error!void {
+    try validateColorIndexingTransform(color_indexing, dimensions);
+    if (color_table.len < color_indexing.color_table_size) {
+        return error.InvalidVP8LTransform;
+    }
+
+    const pixel_count = try dimensions.pixelCount();
+    if (output.len < pixel_count) return error.OutputTooLarge;
+    const source_pixel_count = try color_indexing.image_after.pixelCount();
+    if (packed_pixels.len < source_pixel_count) return error.OutputTooLarge;
+
+    const output_width: usize = @intCast(dimensions.width);
+    const source_width: usize = @intCast(color_indexing.image_after.width);
+    const width_bits: u3 = color_indexing.width_bits;
+    const index_bits: u4 = if (width_bits == 0)
+        8
+    else
+        @intCast(@as(u8, 8) >> width_bits);
+    const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
+    const pixels_per_source: usize = @as(usize, 1) << width_bits;
+
+    if (width_bits > 0) {
+        var lookup: [256][8]u8 = undefined;
+        for (0..256) |packed_value| {
+            for (0..pixels_per_source) |lane| {
+                const shift: u3 = @intCast(lane * index_bits);
+                const color_index = (@as(u8, @intCast(packed_value)) >> shift) & index_mask;
+                lookup[packed_value][lane] =
+                    if (color_index < color_indexing.color_table_size)
+                        pixel.green(color_table[color_index])
+                    else
+                        0;
+            }
+        }
+
+        const height: usize = @intCast(dimensions.height);
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            const source_row_start = y * source_width;
+            const output_row_start = y * output_width;
+            var source_x: usize = 0;
+            while (source_x < source_width) : (source_x += 1) {
+                const packed_indices =
+                    pixel.green(packed_pixels[source_row_start + source_x]);
+                const output_start = source_x * pixels_per_source;
+                const output_count = @min(pixels_per_source, output_width - output_start);
+                @memcpy(
+                    output[output_row_start + output_start ..][0..output_count],
+                    lookup[packed_indices][0..output_count],
+                );
+            }
+        }
+        return;
+    }
+
+    const height: usize = @intCast(dimensions.height);
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+        var source_x: usize = 0;
+        while (source_x < source_width) : (source_x += 1) {
+            const packed_indices = pixel.green(packed_pixels[source_row_start + source_x]);
+            const output_start = source_x * pixels_per_source;
+            const output_end = @min(output_start + pixels_per_source, output_width);
+            var output_x = output_start;
+            while (output_x < output_end) : (output_x += 1) {
+                const shift: u3 = @intCast((output_x - output_start) * index_bits);
+                const color_index = (packed_indices >> shift) & index_mask;
+                output[output_row_start + output_x] =
+                    if (color_index < color_indexing.color_table_size)
+                        pixel.green(color_table[color_index])
+                    else
+                        0;
+            }
+        }
+    }
+}
 
 pub fn applyColorIndexingTransform(
     color_indexing: transform.ColorIndexing,
@@ -201,27 +313,59 @@ pub fn applyColorIndexingTransform(
         @intCast(@as(u8, 8) >> width_bits);
     const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
 
-    var output_index = @as(usize, @intCast(pixel_count));
-    while (output_index > 0) {
-        output_index -= 1;
+    if (pixel_count < grouped_color_indexing_pixel_min or width_bits < 2) {
+        var output_index: usize = @intCast(pixel_count);
+        while (output_index > 0) {
+            output_index -= 1;
 
-        const x = output_index % output_width;
-        const y = output_index / output_width;
-        const source_x = x >> width_bits;
-        const source_index = y * source_width + source_x;
-        assert(source_index < source_pixel_count);
+            const x = output_index % output_width;
+            const y = output_index / output_width;
+            const source_x = x >> width_bits;
+            const source_index = y * source_width + source_x;
+            assert(source_index < source_pixel_count);
 
-        const packed_index = pixel.green(pixels[source_index]);
-        const shift: u3 = if (width_bits == 0)
-            0
-        else
-            @intCast((x & ((@as(usize, 1) << width_bits) - 1)) * index_bits);
-        const color_index = (packed_index >> shift) & index_mask;
+            const packed_index = pixel.green(pixels[source_index]);
+            const shift: u3 = if (width_bits == 0)
+                0
+            else
+                @intCast((x & ((@as(usize, 1) << width_bits) - 1)) * index_bits);
+            const color_index = (packed_index >> shift) & index_mask;
+            pixels[output_index] = if (color_index < color_indexing.color_table_size)
+                color_table[color_index]
+            else
+                pixel.fromChannels(0, 0, 0, 0);
+        }
+        return;
+    }
 
-        pixels[output_index] = if (color_index < color_indexing.color_table_size)
-            color_table[color_index]
-        else
-            pixel.fromChannels(0, 0, 0, 0);
+    const pixels_per_source: usize = @as(usize, 1) << width_bits;
+    var y: usize = @intCast(dimensions.height);
+    while (y > 0) {
+        y -= 1;
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+
+        var source_x = source_width;
+        while (source_x > 0) {
+            source_x -= 1;
+            const source_index = source_row_start + source_x;
+            assert(source_index < source_pixel_count);
+            const packed_indices = pixel.green(pixels[source_index]);
+
+            const output_start = source_x * pixels_per_source;
+            const output_end = @min(output_start + pixels_per_source, output_width);
+            var output_x = output_end;
+            while (output_x > output_start) {
+                output_x -= 1;
+                const shift: u3 = @intCast((output_x - output_start) * index_bits);
+                const color_index = (packed_indices >> shift) & index_mask;
+                pixels[output_row_start + output_x] =
+                    if (color_index < color_indexing.color_table_size)
+                        color_table[color_index]
+                    else
+                        pixel.fromChannels(0, 0, 0, 0);
+            }
+        }
     }
 }
 
@@ -252,6 +396,40 @@ pub fn applyColorTransformPixel(
         green_value,
         blue_value,
     );
+}
+inline fn applyColorTransformVector(
+    color_transform_element: pixel.Pixel,
+    values: PixelVector,
+) PixelVector {
+    const channel_mask: PixelVector = @splat(0xff);
+    const green_unsigned = (values >> @splat(8)) & channel_mask;
+    const green_signed = signExtendChannels(green_unsigned);
+
+    const green_to_red: i8 = @bitCast(pixel.blue(color_transform_element));
+    const green_to_blue: i8 = @bitCast(pixel.green(color_transform_element));
+    const red_to_blue: i8 = @bitCast(pixel.red(color_transform_element));
+
+    const red_unsigned = ((values >> @splat(16)) +%
+        @as(PixelVector, @bitCast(
+            (green_signed * @as(PixelVectorSigned, @splat(green_to_red))) >> @splat(5),
+        ))) & channel_mask;
+    const red_signed = signExtendChannels(red_unsigned);
+    const blue_unsigned = (values +%
+        @as(PixelVector, @bitCast(
+            (green_signed * @as(PixelVectorSigned, @splat(green_to_blue))) >> @splat(5),
+        )) +%
+        @as(PixelVector, @bitCast(
+            (red_signed * @as(PixelVectorSigned, @splat(red_to_blue))) >> @splat(5),
+        ))) & channel_mask;
+
+    return (values & @as(PixelVector, @splat(0xff00ff00))) |
+        (red_unsigned << @splat(16)) |
+        blue_unsigned;
+}
+
+inline fn signExtendChannels(values: PixelVector) PixelVectorSigned {
+    const shifted: PixelVectorSigned = @bitCast(values << @splat(24));
+    return shifted >> @splat(24);
 }
 
 fn colorTransformDelta(transform_byte: u8, channel_byte: u8) i32 {
@@ -388,6 +566,11 @@ fn applyPredictorRun(
     assert(x_end <= width);
     assert(width > 0);
 
+    if (comptime modeIsVectorIndependent(mode)) {
+        applyPredictorRunVector(mode, pixels, width, y, x_start, x_end);
+        return;
+    }
+
     const row_start = y * width;
     var x = x_start;
     while (x < x_end) : (x += 1) {
@@ -403,6 +586,94 @@ fn applyPredictorRun(
         };
         pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], predictPixelMode(mode, neighbors));
     }
+}
+
+const predictor_vector_lanes = 8;
+const PixelVector = @Vector(predictor_vector_lanes, pixel.Pixel);
+const PixelVectorSigned = @Vector(predictor_vector_lanes, i32);
+
+fn modeIsVectorIndependent(comptime mode: u8) bool {
+    return switch (mode) {
+        0, 2, 3, 4, 8, 9 => true,
+        else => false,
+    };
+}
+
+fn applyPredictorRunVector(
+    comptime mode: u8,
+    pixels: []pixel.Pixel,
+    width: usize,
+    y: usize,
+    x_start: usize,
+    x_end: usize,
+) void {
+    comptime assert(modeIsVectorIndependent(mode));
+    const row_start = y * width;
+    const top_offset = row_start - width;
+    const vector_end = if (comptime modeUsesTopRight(mode))
+        @min(x_end, width - 1)
+    else
+        x_end;
+
+    var x = x_start;
+    while (x + predictor_vector_lanes <= vector_end) : (x += predictor_vector_lanes) {
+        const pixel_index = row_start + x;
+        const prediction: PixelVector = switch (mode) {
+            0 => @splat(predictor_black),
+            2 => loadPixelVector(pixels, top_offset + x),
+            3 => loadPixelVector(pixels, top_offset + x + 1),
+            4 => loadPixelVector(pixels, top_offset + x - 1),
+            8 => averagePixelVectors(
+                loadPixelVector(pixels, top_offset + x - 1),
+                loadPixelVector(pixels, top_offset + x),
+            ),
+            9 => averagePixelVectors(
+                loadPixelVector(pixels, top_offset + x),
+                loadPixelVector(pixels, top_offset + x + 1),
+            ),
+            else => comptime unreachable,
+        };
+        storePixelVector(
+            pixels,
+            pixel_index,
+            addPixelVectorsModulo(loadPixelVector(pixels, pixel_index), prediction),
+        );
+    }
+
+    while (x < x_end) : (x += 1) {
+        const pixel_index = row_start + x;
+        const neighbors = PredictorNeighbors{
+            .left = pixels[pixel_index - 1],
+            .top = pixels[pixel_index - width],
+            .top_right = if (comptime modeUsesTopRight(mode))
+                (if (x + 1 < width) pixels[pixel_index - width + 1] else pixels[row_start])
+            else
+                predictor_black,
+            .top_left = pixels[pixel_index - width - 1],
+        };
+        pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], predictPixelMode(mode, neighbors));
+    }
+}
+
+inline fn loadPixelVector(pixels: []const pixel.Pixel, start: usize) PixelVector {
+    return @bitCast(pixels[start..][0..predictor_vector_lanes].*);
+}
+
+inline fn storePixelVector(pixels: []pixel.Pixel, start: usize, values: PixelVector) void {
+    pixels[start..][0..predictor_vector_lanes].* = @bitCast(values);
+}
+
+inline fn addPixelVectorsModulo(residual: PixelVector, prediction: PixelVector) PixelVector {
+    const even_mask: PixelVector = @splat(0x00ff00ff);
+    const even = ((residual & even_mask) +% (prediction & even_mask)) & even_mask;
+    const odd = (((residual >> @splat(8)) & even_mask) +%
+        ((prediction >> @splat(8)) & even_mask)) & even_mask;
+    return even | (odd << @splat(8));
+}
+
+inline fn averagePixelVectors(a: PixelVector, b: PixelVector) PixelVector {
+    const channel_high_bits_clear: PixelVector = @splat(0xfefefefe);
+    return (a & b) +% (((a ^ b) & channel_high_bits_clear) >> @splat(1));
 }
 
 /// Per-pixel reference application used by equivalence tests.
@@ -506,12 +777,8 @@ fn addPixelsModuloChannels(residual: pixel.Pixel, prediction: pixel.Pixel) pixel
 }
 
 fn averagePixels(a: pixel.Pixel, b: pixel.Pixel) pixel.Pixel {
-    return pixel.fromChannels(
-        averageChannel(pixel.alpha(a), pixel.alpha(b)),
-        averageChannel(pixel.red(a), pixel.red(b)),
-        averageChannel(pixel.green(a), pixel.green(b)),
-        averageChannel(pixel.blue(a), pixel.blue(b)),
-    );
+    const channel_high_bits_clear: pixel.Pixel = 0xfefefefe;
+    return (a & b) +% (((a ^ b) & channel_high_bits_clear) >> 1);
 }
 
 fn averageChannel(a: u8, b: u8) u8 {

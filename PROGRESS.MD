@@ -42,13 +42,15 @@ and PSNR. The last step-9 gate, the manual ≥2-browser render check, passed on
 `testdata/animation/anim_minimized_lossy.webp` both animate correctly in
 Firefox and Chromium (operator-run; versions not recorded). Step 9 is complete.
 
-Step 10 (performance) is delivered. The benchmark harness, scalar baseline,
-vectorized YUV-to-RGB conversion, and table-driven VP8 boolean-reader
-renormalization are recorded below with their dated measurements. The honest
-summary is unchanged: scalar lossy decode is within the ≤3x single-threaded
-`dwebp` target and materially closer on large VP8 stills after the recorded
-optimizations; lossless decode remains entropy-bound and outside that narrow
-speed target.
+Step 10 (performance) is delivered and has continued post-1.0 optimization.
+Lossy decode now combines vector YUV-to-RGB conversion, table-driven VP8
+boolean-reader renormalization, vector inverse DCT, compact residual-presence
+metadata, and SIMD loop filtering in both edge orientations. The dated
+Zig/Rust run below puts the 70-file lossy opaque corpus at **0.9415× per-file
+geomean** and **0.8208× summed decode time** (Zig/Rust; lower is faster), with
+byte-identical output. VP8L also gained buffered entropy reads, transform
+kernels, reduced scratch, direct caller-owned output, and specialized ALPH
+palette decode; it remains the principal per-file geomean gap on tiny inputs.
 
 Step 11 (robustness hardening) is delivered through the planned slices. The
 limits/malicious-input matrix, allocation-failure injection for public decode and
@@ -133,6 +135,60 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-15 — Full-edge VP8 SIMD and caller-owned VP8L alpha output
+
+The decode campaign retained six independent, byte-exact changes:
+
+- VP8L color, predictor, subtract-green, and palette inverse transforms process
+  bounded runs with vector or lookup kernels; `decodeStaticInto` writes packed
+  rows directly to caller-owned output.
+- VP8L-compressed `ALPH` streams with a color-index transform decode their green
+  channel directly into the caller-owned alpha plane and expand packed palette
+  indices there, avoiding the final ARGB-to-alpha extraction pass.
+- VP8 residual presence checks use compact masks rather than repeatedly scanning
+  coefficient blocks.
+- VP8 inverse DCT uses four-lane `i32` butterflies, with the scalar kernel kept
+  as the equivalence-test oracle.
+- VP8 horizontal and vertical simple/complex loop-filter edges use 8- or
+  16-lane arithmetic. Vertical edges gather one byte per row and scatter only
+  filtered columns; randomized asymmetric-frame, boundary, and low-HEV tests
+  compare the production path with the scalar frame filter.
+
+Debug testing exposed unchecked vector additions in the earlier VP8L transform
+spikes. They now use explicit wrapping arithmetic, matching the scalar modulo-256
+contract in Debug, ReleaseSafe, and ReleaseFast. Allocation-limit tests were
+also moved to an 8x8 transform-free stream so reconstruction scratch, rather
+than temporary demux storage, remains the boundary under test.
+
+**Measurement contract.** Linux x86_64 on one pinned AMD EPYC 7663 core,
+ReleaseFast, Zig **0.16.0**, Rust **1.96.1**, and `image-webp` at `f4d80bd`.
+`tools/webp-rust-bench.sh` validated all **135/135** paired stills with
+**0 skips** before timing. Decode output is digest-identical, so decode quality
+does not move.
+
+- The vector inverse-DCT A/B over all 135 files improved the 70-file lossy
+  opaque bucket by **3.59% geomean** and **4.33% summed time**. Lossy+alpha
+  improved **2.45% geomean / 3.17% summed**; lossless buckets served as
+  no-op controls.
+- A focused eight-file scalar-vertical versus SIMD-vertical A/B improved
+  **3.54% geomean** and **10.74% summed time**. `bryce.webp` improved
+  **896.5540→796.6033 ms** (**11.15%**) and
+  `vp80-00-comprehensive-008.webp` improved **16.6551→15.6609 ms**
+  (**5.97%**).
+- The final 135-file Zig/Rust run measured the 70 lossy opaque stills at
+  **0.9415× geomean** and **0.8208× summed time** (Zig/Rust, lower is faster):
+  Zig is **5.85% faster per-file geomean** and **17.92% faster by aggregate
+  decode time**. Across every codec/alpha class together, Zig used
+  **1080.284 ms** versus Rust's **1228.137 ms** summed (**0.8796×**).
+  The all-file geomean remained **1.1216×**, honestly reflecting Rust's
+  advantage on many tiny VP8L and ALPH inputs; this is a decisive VP8
+  throughput win, not a claim of universal per-file superiority.
+
+Verification: `zig build ci` passed; the 493-test Debug suite also passed in
+16 shards with zero failures or leaks. The paired benchmark digest gate passed
+**135/135**, and `compare-rgb-corpus` matched libwebp on all **88** VP8 stills
+(43 non-VP8 files skipped, zero failures).
 
 ### 2026-07-15 — Plan 029 direct VP8L decode-into output
 
@@ -372,6 +428,43 @@ and **2.4614×** alpha by per-file geomean (**2.5552×** and **1.6286×** by
 summed time). This closes a material part of the entropy gap but does **not**
 beat Rust. No general performance win is claimed; subsequent work should start
 from fresh stage/profile evidence rather than stacking speculative loop tweaks.
+
+### 2026-07-15 — VP8L cache-copy and single-symbol table costs removed
+
+`color_cache.Cache.lookup` previously took `Cache` by value. `Cache` contains
+the complete **2048-entry / 8192-byte** fixed cache, so every cache-symbol read
+copied the whole array before loading one pixel. The retained fix changes only
+the receiver to `*const Cache`; validation, indexing, cache contents, public
+APIs, and decoded bytes are unchanged.
+
+**Focused result (ReleaseFast, AMD EPYC 7663, CPU 0).** The same six-file
+Rust differential contract measured the three cache-heavy inputs at
+**14.5648→4.1066 ms** (`photo_foliage`, **3.55×**),
+**13.4243→4.9330 ms** (`photo_signage`, **2.72×**), and
+**1.2803→0.6161 ms** (`color_cache_bits_11`, **2.08×**). The uncached
+`bad_palette_index` control stayed **0.3104→0.3101 ms**. An adjacent 135-file
+candidate/baseline pair (`15` samples, `2` warmups, 1500 ms budget) moved the
+lossless-opaque Zig/Rust geomean from **2.1007× to 1.5104×** (**1.39×**
+narrowing) and the all-135 geomean from **1.4463× to 1.3180×**; lossless alpha
+was neutral (**2.4072× to 2.4023×**).
+
+Single-symbol Huffman trees also populated an unused **256-entry** root table
+even though both decode paths return `single_symbol` before reading `entries`.
+They now retain an empty entry slice and skip that initialization; owned
+multi-group stores consequently avoid copying/allocating those dead entries.
+An adjacent full-corpus candidate/baseline pair moved lossless-alpha Zig/Rust
+from **2.5160× to 2.2023×** (**1.14×** narrowing), held lossless opaque neutral
+(**1.5572× to 1.5580×**), and moved all 135 files from **1.3956× to 1.3606×**
+(**1.026×**). The lossy-opaque control stayed **1.1338× to 1.1312×**.
+
+Every paired run validated decoded bytes before timing; the full candidate
+validated **135/135** stills with zero skips. Final `zig build ci` and
+`zig build wasm-check` gates pass. Forced cache-helper inlining, unchecked
+cache indexing, copy-then-cache-update, SIMD inverse transforms and output
+shuffles, and a pointer receiver for the small Huffman table handle were
+measured and rejected: none added a stable corpus-level win. The remaining
+lossless ratios are still above 1, so this is a large cache-heavy improvement,
+**not** a general Rust performance lead.
 
 ### 2026-07-14 — Plan 024 IDCT omitted from cumulative draft (conservative cut)
 

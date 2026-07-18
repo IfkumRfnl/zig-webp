@@ -16,6 +16,7 @@ const meta_prefix = @import("meta_prefix.zig");
 const pixel = @import("pixel.zig");
 const prefix_groups = @import("prefix_groups.zig");
 const transform = @import("transform.zig");
+const summary_elision_bytes_min = 256;
 
 pub const WorkBuffers = struct {
     /// Huffman scratch shared by transform, main-image, and group parsing.
@@ -60,7 +61,7 @@ pub fn decodeARGB(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!Result {
-    return decodeARGBInternal(null, payload, output, buffers);
+    return decodeARGBInternal(true, null, payload, output, buffers);
 }
 
 pub fn decodeARGBAlloc(
@@ -69,7 +70,19 @@ pub fn decodeARGBAlloc(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!Result {
-    return decodeARGBInternal(gpa, payload, output, buffers);
+    return decodeARGBInternal(true, gpa, payload, output, buffers);
+}
+pub fn decodeARGBAllocDiscardSummary(
+    gpa: std.mem.Allocator,
+    payload: []const u8,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!void {
+    if (payload.len < summary_elision_bytes_min) {
+        _ = try decodeARGBInternal(true, gpa, payload, output, buffers);
+        return;
+    }
+    _ = try decodeARGBInternal(false, gpa, payload, output, buffers);
 }
 
 /// Decodes a headerless VP8L image-data stream (transform list included)
@@ -81,7 +94,7 @@ pub fn decodeImageStream(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!entropy.DecodeSummary {
-    return decodeImageStreamInternal(null, data, dimensions, output, buffers);
+    return decodeImageStreamInternal(true, null, data, dimensions, output, buffers, null);
 }
 
 pub fn decodeImageStreamAlloc(
@@ -91,10 +104,42 @@ pub fn decodeImageStreamAlloc(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!entropy.DecodeSummary {
-    return decodeImageStreamInternal(gpa, data, dimensions, output, buffers);
+    return decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers, null);
+}
+pub fn decodeImageStreamAllocDiscardSummary(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    buffers: *WorkBuffers,
+) errors.Error!void {
+    if (data.len < summary_elision_bytes_min) {
+        _ = try decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers, null);
+        return;
+    }
+    _ = try decodeImageStreamInternal(false, gpa, data, dimensions, output, buffers, null);
+}
+pub fn decodeImageStreamAlphaAllocDiscardSummary(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    alpha_output: []u8,
+    buffers: *WorkBuffers,
+) errors.Error!void {
+    _ = try decodeImageStreamInternal(
+        false,
+        gpa,
+        data,
+        dimensions,
+        output,
+        buffers,
+        alpha_output,
+    );
 }
 
 fn decodeARGBInternal(
+    comptime collect_summary: bool,
     gpa: ?std.mem.Allocator,
     payload: []const u8,
     output: []pixel.Pixel,
@@ -102,11 +147,13 @@ fn decodeARGBInternal(
 ) errors.Error!Result {
     const parsed_header = try header.parse(payload);
     const entropy_summary = try decodeImageStreamInternal(
+        collect_summary,
         gpa,
         payload[header.byte_count..],
         parsed_header.dimensions,
         output,
         buffers,
+        null,
     );
 
     return .{
@@ -116,11 +163,13 @@ fn decodeARGBInternal(
 }
 
 fn decodeImageStreamInternal(
+    comptime collect_summary: bool,
     gpa: ?std.mem.Allocator,
     stream: []const u8,
     dimensions: image.Dimensions,
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
+    alpha_output: ?[]u8,
 ) errors.Error!entropy.DecodeSummary {
     var reader = bit_reader.BitReader.init(stream);
     var transform_reader = transform.ListReader.init(dimensions);
@@ -168,12 +217,35 @@ fn decodeImageStreamInternal(
     }
 
     const entropy_summary = try decodeMainImage(
+        collect_summary,
         gpa,
         &reader,
         transform_reader.currentDimensions(),
         output,
         buffers,
     );
+
+    if (alpha_output) |plane| {
+        if (transform_count == 1) {
+            switch (transforms[0]) {
+                .color_indexing => |color_indexing| {
+                    const color_table = switch (transform_data[0]) {
+                        .color_table => |pixels| pixels,
+                        .none, .block => unreachable,
+                    };
+                    try inverse_transform.applyColorIndexingTransformGreen(
+                        color_indexing,
+                        color_table,
+                        transform_dimensions[0],
+                        output,
+                        plane,
+                    );
+                    return entropy_summary;
+                },
+                else => {},
+            }
+        }
+    }
 
     var transform_index = transform_count;
     while (transform_index > 0) {
@@ -186,10 +258,18 @@ fn decodeImageStreamInternal(
         );
     }
 
+    if (alpha_output) |plane| {
+        if (plane.len < output.len) return error.OutputTooLarge;
+        for (output, plane[0..output.len]) |value, *sample| {
+            sample.* = pixel.green(value);
+        }
+    }
+
     return entropy_summary;
 }
 
 fn decodeMainImage(
+    comptime collect_summary: bool,
     gpa: ?std.mem.Allocator,
     reader: *bit_reader.BitReader,
     dimensions: image.Dimensions,
@@ -205,7 +285,16 @@ fn decodeMainImage(
             &buffers.prefix_code_group,
         );
 
-        return entropy.decodeWithPrefixCodes(
+        if (collect_summary) {
+            return entropy.decodeWithPrefixCodes(
+                reader,
+                dimensions,
+                color_cache,
+                prefix_codes,
+                output,
+            );
+        }
+        return entropy.decodeWithPrefixCodesDiscardSummary(
             reader,
             dimensions,
             color_cache,
@@ -215,10 +304,29 @@ fn decodeMainImage(
     }
 
     const allocator = gpa orelse return error.UnsupportedVP8LImageData;
+    var entropy_image = buffers.entropy_image;
+    var entropy_image_owned: ?[]pixel.Pixel = null;
+    var prefix_group_options = buffers.prefix_group_options;
+    if (entropy_image.len == 0) {
+        const pixel_count = try dimensions.pixelCount();
+        if (pixel_count > std.math.maxInt(usize)) return error.AllocationLimitExceeded;
+        if (pixel_count > std.math.maxInt(u64) / @sizeOf(pixel.Pixel)) {
+            return error.AllocationLimitExceeded;
+        }
+        const allocation_bytes = pixel_count * @sizeOf(pixel.Pixel);
+        if (allocation_bytes > prefix_group_options.allocation_bytes_max) {
+            return error.AllocationLimitExceeded;
+        }
+        entropy_image = try allocator.alloc(pixel.Pixel, @intCast(pixel_count));
+        entropy_image_owned = entropy_image;
+        prefix_group_options.allocation_bytes_max -= allocation_bytes;
+    }
+    defer if (entropy_image_owned) |owned| allocator.free(owned);
+
     const info = try meta_prefix.readEntropyImage(
         reader,
         dimensions,
-        buffers.entropy_image,
+        entropy_image,
         &buffers.prefix_code_group,
     );
     var group_store = try prefix_groups.Store.readAll(
@@ -226,18 +334,29 @@ fn decodeMainImage(
         reader,
         info.group_count,
         image_data.colorCacheSize(color_cache),
-        buffers.prefix_group_options,
+        prefix_group_options,
         &buffers.prefix_code_group,
     );
     defer group_store.deinit();
 
-    return entropy.decodeWithGroupStore(
+    if (collect_summary) {
+        return entropy.decodeWithGroupStore(
+            reader,
+            dimensions,
+            color_cache,
+            group_store,
+            info,
+            entropy_image,
+            output,
+        );
+    }
+    return entropy.decodeWithGroupStoreDiscardSummary(
         reader,
         dimensions,
         color_cache,
         group_store,
         info,
-        buffers.entropy_image,
+        entropy_image,
         output,
     );
 }
