@@ -907,10 +907,11 @@ test "static decode applies allocation limit to meta-prefix group storage" {
     defer std.testing.allocator.free(encoded);
 
     const pixel_count = try dimensions.pixelCount();
-    const working_pixel_count =
-        pixel_count + try transformPixelCapacity(pixel_count) + pixel_count;
+    // This stream has no transforms and is below the large-image entropy
+    // scratch threshold, so only the ARGB reconstruction plus packed output
+    // precede prefix-group allocation.
     const pre_group_bytes =
-        @as(u64, @sizeOf(vp8l_pixel.Pixel)) * working_pixel_count +
+        @as(u64, @sizeOf(vp8l_pixel.Pixel)) * pixel_count +
         @as(u64, image.PixelFormat.rgba.channelCount()) * pixel_count;
     const group_limit =
         pre_group_bytes + @as(u64, @sizeOf(vp8l_image_data.PrefixCodeGroup)) - 1;
@@ -1252,8 +1253,8 @@ test "decodeStaticInto writes every lossless format without touching slack" {
     }
 }
 
-test "lossless decodeStaticInto budgets only reconstruction scratch" {
-    const dimensions = try image.Dimensions.init(3, 2);
+test "lossless decodeStaticInto budgets probed reconstruction scratch" {
+    const dimensions = try image.Dimensions.init(8, 8);
     var vp8l_payload: [32]u8 = undefined;
     const bitstream = try makeConstantVP8L(
         &vp8l_payload,
@@ -1269,13 +1270,16 @@ test "lossless decodeStaticInto budgets only reconstruction scratch" {
     defer std.testing.allocator.free(encoded);
 
     const pixel_count = try dimensions.pixelCount();
-    const scratch_pixel_count = pixel_count * 3 + 257;
-    const scratch_bytes = scratch_pixel_count * @sizeOf(vp8l_pixel.Pixel);
-    var dest_pixels: [3 * 2 * 4]u8 = undefined;
+    // The stream's transform-present bit is clear, it uses the inline single
+    // prefix group, and the image is below the entropy scratch threshold.
+    // The only budgeted reconstruction storage is one ARGB word per pixel.
+    // At 8x8 this also exceeds the demuxer's temporary chunk-list capacity.
+    const scratch_bytes = pixel_count * @sizeOf(vp8l_pixel.Pixel);
+    var dest_pixels: [8 * 8 * 4]u8 = undefined;
     const dest = image.Buffer{
         .pixels = &dest_pixels,
         .dimensions = dimensions,
-        .stride = 3 * 4,
+        .stride = 8 * 4,
         .format = .rgba,
     };
 

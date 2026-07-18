@@ -101,8 +101,8 @@ pub fn applySubtractGreen(pixels: []pixel.Pixel) void {
         const values = loadPixelVector(pixels, index);
         const channel_mask: PixelVector = @splat(0xff);
         const green = (values >> @splat(8)) & channel_mask;
-        const red = ((values >> @splat(16)) + green) & channel_mask;
-        const blue = (values + green) & channel_mask;
+        const red = ((values >> @splat(16)) +% green) & channel_mask;
+        const blue = (values +% green) & channel_mask;
         storePixelVector(
             pixels,
             index,
@@ -409,15 +409,15 @@ inline fn applyColorTransformVector(
     const green_to_blue: i8 = @bitCast(pixel.green(color_transform_element));
     const red_to_blue: i8 = @bitCast(pixel.red(color_transform_element));
 
-    const red_unsigned = ((values >> @splat(16)) +
+    const red_unsigned = ((values >> @splat(16)) +%
         @as(PixelVector, @bitCast(
             (green_signed * @as(PixelVectorSigned, @splat(green_to_red))) >> @splat(5),
         ))) & channel_mask;
     const red_signed = signExtendChannels(red_unsigned);
-    const blue_unsigned = (values +
+    const blue_unsigned = (values +%
         @as(PixelVector, @bitCast(
             (green_signed * @as(PixelVectorSigned, @splat(green_to_blue))) >> @splat(5),
-        )) +
+        )) +%
         @as(PixelVector, @bitCast(
             (red_signed * @as(PixelVectorSigned, @splat(red_to_blue))) >> @splat(5),
         ))) & channel_mask;
