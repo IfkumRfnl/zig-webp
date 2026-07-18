@@ -204,6 +204,56 @@ pub fn applyColorTableDeltas(color_table: []pixel.Pixel) void {
         previous = value;
     }
 }
+pub fn applyColorIndexingTransformGreen(
+    color_indexing: transform.ColorIndexing,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    packed_pixels: []const pixel.Pixel,
+    output: []u8,
+) errors.Error!void {
+    try validateColorIndexingTransform(color_indexing, dimensions);
+    if (color_table.len < color_indexing.color_table_size) {
+        return error.InvalidVP8LTransform;
+    }
+
+    const pixel_count = try dimensions.pixelCount();
+    if (output.len < pixel_count) return error.OutputTooLarge;
+    const source_pixel_count = try color_indexing.image_after.pixelCount();
+    if (packed_pixels.len < source_pixel_count) return error.OutputTooLarge;
+
+    const output_width: usize = @intCast(dimensions.width);
+    const source_width: usize = @intCast(color_indexing.image_after.width);
+    const width_bits: u3 = color_indexing.width_bits;
+    const index_bits: u4 = if (width_bits == 0)
+        8
+    else
+        @intCast(@as(u8, 8) >> width_bits);
+    const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
+    const pixels_per_source: usize = @as(usize, 1) << width_bits;
+
+    const height: usize = @intCast(dimensions.height);
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+        var source_x: usize = 0;
+        while (source_x < source_width) : (source_x += 1) {
+            const packed_indices = pixel.green(packed_pixels[source_row_start + source_x]);
+            const output_start = source_x * pixels_per_source;
+            const output_end = @min(output_start + pixels_per_source, output_width);
+            var output_x = output_start;
+            while (output_x < output_end) : (output_x += 1) {
+                const shift: u3 = @intCast((output_x - output_start) * index_bits);
+                const color_index = (packed_indices >> shift) & index_mask;
+                output[output_row_start + output_x] =
+                    if (color_index < color_indexing.color_table_size)
+                        pixel.green(color_table[color_index])
+                    else
+                        0;
+            }
+        }
+    }
+}
 
 pub fn applyColorIndexingTransform(
     color_indexing: transform.ColorIndexing,

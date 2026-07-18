@@ -237,18 +237,15 @@ fn decodeLosslessWithScratch(
             .allocation_bytes_max = decode_options.allocation_bytes_max - allocation_bytes,
         },
     };
-    try vp8l_decoder.decodeImageStreamAllocDiscardSummary(
+    const plane = output[0..pixel_count];
+    try vp8l_decoder.decodeImageStreamAlphaAllocDiscardSummary(
         gpa,
         stream,
         dimensions,
         argb_pixels,
+        plane,
         &buffers,
     );
-
-    const plane = output[0..pixel_count];
-    for (argb_pixels, plane) |value, *sample| {
-        sample.* = vp8l_pixel.green(value);
-    }
 
     unfilterPlaneInPlace(header.filter, plane, dimensions);
 }

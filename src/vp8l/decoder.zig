@@ -94,7 +94,7 @@ pub fn decodeImageStream(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!entropy.DecodeSummary {
-    return decodeImageStreamInternal(true, null, data, dimensions, output, buffers);
+    return decodeImageStreamInternal(true, null, data, dimensions, output, buffers, null);
 }
 
 pub fn decodeImageStreamAlloc(
@@ -104,7 +104,7 @@ pub fn decodeImageStreamAlloc(
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
 ) errors.Error!entropy.DecodeSummary {
-    return decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers);
+    return decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers, null);
 }
 pub fn decodeImageStreamAllocDiscardSummary(
     gpa: std.mem.Allocator,
@@ -114,10 +114,28 @@ pub fn decodeImageStreamAllocDiscardSummary(
     buffers: *WorkBuffers,
 ) errors.Error!void {
     if (data.len < summary_elision_bytes_min) {
-        _ = try decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers);
+        _ = try decodeImageStreamInternal(true, gpa, data, dimensions, output, buffers, null);
         return;
     }
-    _ = try decodeImageStreamInternal(false, gpa, data, dimensions, output, buffers);
+    _ = try decodeImageStreamInternal(false, gpa, data, dimensions, output, buffers, null);
+}
+pub fn decodeImageStreamAlphaAllocDiscardSummary(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    dimensions: image.Dimensions,
+    output: []pixel.Pixel,
+    alpha_output: []u8,
+    buffers: *WorkBuffers,
+) errors.Error!void {
+    _ = try decodeImageStreamInternal(
+        false,
+        gpa,
+        data,
+        dimensions,
+        output,
+        buffers,
+        alpha_output,
+    );
 }
 
 fn decodeARGBInternal(
@@ -135,6 +153,7 @@ fn decodeARGBInternal(
         parsed_header.dimensions,
         output,
         buffers,
+        null,
     );
 
     return .{
@@ -150,6 +169,7 @@ fn decodeImageStreamInternal(
     dimensions: image.Dimensions,
     output: []pixel.Pixel,
     buffers: *WorkBuffers,
+    alpha_output: ?[]u8,
 ) errors.Error!entropy.DecodeSummary {
     var reader = bit_reader.BitReader.init(stream);
     var transform_reader = transform.ListReader.init(dimensions);
@@ -205,6 +225,28 @@ fn decodeImageStreamInternal(
         buffers,
     );
 
+    if (alpha_output) |plane| {
+        if (transform_count == 1) {
+            switch (transforms[0]) {
+                .color_indexing => |color_indexing| {
+                    const color_table = switch (transform_data[0]) {
+                        .color_table => |pixels| pixels,
+                        .none, .block => unreachable,
+                    };
+                    try inverse_transform.applyColorIndexingTransformGreen(
+                        color_indexing,
+                        color_table,
+                        transform_dimensions[0],
+                        output,
+                        plane,
+                    );
+                    return entropy_summary;
+                },
+                else => {},
+            }
+        }
+    }
+
     var transform_index = transform_count;
     while (transform_index > 0) {
         transform_index -= 1;
@@ -214,6 +256,13 @@ fn decodeImageStreamInternal(
             transform_dimensions[transform_index],
             output,
         );
+    }
+
+    if (alpha_output) |plane| {
+        if (plane.len < output.len) return error.OutputTooLarge;
+        for (output, plane[0..output.len]) |value, *sample| {
+            sample.* = pixel.green(value);
+        }
     }
 
     return entropy_summary;
