@@ -95,13 +95,29 @@ pub fn applyPredictorTransform(
 }
 
 pub fn applySubtractGreen(pixels: []pixel.Pixel) void {
-    for (pixels) |*value| {
-        const green_value = pixel.green(value.*);
-        const red_value = pixel.red(value.*) +% green_value;
-        const blue_value = pixel.blue(value.*) +% green_value;
+    var index: usize = 0;
+    while (index + predictor_vector_lanes <= pixels.len) : (index += predictor_vector_lanes) {
+        const values = loadPixelVector(pixels, index);
+        const channel_mask: PixelVector = @splat(0xff);
+        const green = (values >> @splat(8)) & channel_mask;
+        const red = ((values >> @splat(16)) + green) & channel_mask;
+        const blue = (values + green) & channel_mask;
+        storePixelVector(
+            pixels,
+            index,
+            (values & @as(PixelVector, @splat(0xff00ff00))) |
+                (red << @splat(16)) |
+                blue,
+        );
+    }
+    while (index < pixels.len) : (index += 1) {
+        const value = pixels[index];
+        const green_value = pixel.green(value);
+        const red_value = pixel.red(value) +% green_value;
+        const blue_value = pixel.blue(value) +% green_value;
 
-        value.* = pixel.fromChannels(
-            pixel.alpha(value.*),
+        pixels[index] = pixel.fromChannels(
+            pixel.alpha(value),
             red_value,
             green_value,
             blue_value,
@@ -149,6 +165,17 @@ pub fn applyColorTransform(
 
             const row_index = y * width + x;
             var offset: usize = 0;
+            while (offset + predictor_vector_lanes <= run_len) : (offset += predictor_vector_lanes) {
+                const pixel_index = row_index + offset;
+                storePixelVector(
+                    image_pixels,
+                    pixel_index,
+                    applyColorTransformVector(
+                        color_element,
+                        loadPixelVector(image_pixels, pixel_index),
+                    ),
+                );
+            }
             while (offset < run_len) : (offset += 1) {
                 const pixel_index = row_index + offset;
                 image_pixels[pixel_index] = applyColorTransformPixel(
@@ -252,6 +279,40 @@ pub fn applyColorTransformPixel(
         green_value,
         blue_value,
     );
+}
+inline fn applyColorTransformVector(
+    color_transform_element: pixel.Pixel,
+    values: PixelVector,
+) PixelVector {
+    const channel_mask: PixelVector = @splat(0xff);
+    const green_unsigned = (values >> @splat(8)) & channel_mask;
+    const green_signed = signExtendChannels(green_unsigned);
+
+    const green_to_red: i8 = @bitCast(pixel.blue(color_transform_element));
+    const green_to_blue: i8 = @bitCast(pixel.green(color_transform_element));
+    const red_to_blue: i8 = @bitCast(pixel.red(color_transform_element));
+
+    const red_unsigned = ((values >> @splat(16)) +
+        @as(PixelVector, @bitCast(
+            (green_signed * @as(PixelVectorSigned, @splat(green_to_red))) >> @splat(5),
+        ))) & channel_mask;
+    const red_signed = signExtendChannels(red_unsigned);
+    const blue_unsigned = (values +
+        @as(PixelVector, @bitCast(
+            (green_signed * @as(PixelVectorSigned, @splat(green_to_blue))) >> @splat(5),
+        )) +
+        @as(PixelVector, @bitCast(
+            (red_signed * @as(PixelVectorSigned, @splat(red_to_blue))) >> @splat(5),
+        ))) & channel_mask;
+
+    return (values & @as(PixelVector, @splat(0xff00ff00))) |
+        (red_unsigned << @splat(16)) |
+        blue_unsigned;
+}
+
+inline fn signExtendChannels(values: PixelVector) PixelVectorSigned {
+    const shifted: PixelVectorSigned = @bitCast(values << @splat(24));
+    return shifted >> @splat(24);
 }
 
 fn colorTransformDelta(transform_byte: u8, channel_byte: u8) i32 {
@@ -388,6 +449,11 @@ fn applyPredictorRun(
     assert(x_end <= width);
     assert(width > 0);
 
+    if (comptime modeIsVectorIndependent(mode)) {
+        applyPredictorRunVector(mode, pixels, width, y, x_start, x_end);
+        return;
+    }
+
     const row_start = y * width;
     var x = x_start;
     while (x < x_end) : (x += 1) {
@@ -403,6 +469,94 @@ fn applyPredictorRun(
         };
         pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], predictPixelMode(mode, neighbors));
     }
+}
+
+const predictor_vector_lanes = 8;
+const PixelVector = @Vector(predictor_vector_lanes, pixel.Pixel);
+const PixelVectorSigned = @Vector(predictor_vector_lanes, i32);
+
+fn modeIsVectorIndependent(comptime mode: u8) bool {
+    return switch (mode) {
+        0, 2, 3, 4, 8, 9 => true,
+        else => false,
+    };
+}
+
+fn applyPredictorRunVector(
+    comptime mode: u8,
+    pixels: []pixel.Pixel,
+    width: usize,
+    y: usize,
+    x_start: usize,
+    x_end: usize,
+) void {
+    comptime assert(modeIsVectorIndependent(mode));
+    const row_start = y * width;
+    const top_offset = row_start - width;
+    const vector_end = if (comptime modeUsesTopRight(mode))
+        @min(x_end, width - 1)
+    else
+        x_end;
+
+    var x = x_start;
+    while (x + predictor_vector_lanes <= vector_end) : (x += predictor_vector_lanes) {
+        const pixel_index = row_start + x;
+        const prediction: PixelVector = switch (mode) {
+            0 => @splat(predictor_black),
+            2 => loadPixelVector(pixels, top_offset + x),
+            3 => loadPixelVector(pixels, top_offset + x + 1),
+            4 => loadPixelVector(pixels, top_offset + x - 1),
+            8 => averagePixelVectors(
+                loadPixelVector(pixels, top_offset + x - 1),
+                loadPixelVector(pixels, top_offset + x),
+            ),
+            9 => averagePixelVectors(
+                loadPixelVector(pixels, top_offset + x),
+                loadPixelVector(pixels, top_offset + x + 1),
+            ),
+            else => comptime unreachable,
+        };
+        storePixelVector(
+            pixels,
+            pixel_index,
+            addPixelVectorsModulo(loadPixelVector(pixels, pixel_index), prediction),
+        );
+    }
+
+    while (x < x_end) : (x += 1) {
+        const pixel_index = row_start + x;
+        const neighbors = PredictorNeighbors{
+            .left = pixels[pixel_index - 1],
+            .top = pixels[pixel_index - width],
+            .top_right = if (comptime modeUsesTopRight(mode))
+                (if (x + 1 < width) pixels[pixel_index - width + 1] else pixels[row_start])
+            else
+                predictor_black,
+            .top_left = pixels[pixel_index - width - 1],
+        };
+        pixels[pixel_index] = addPixelsModulo(pixels[pixel_index], predictPixelMode(mode, neighbors));
+    }
+}
+
+inline fn loadPixelVector(pixels: []const pixel.Pixel, start: usize) PixelVector {
+    return @bitCast(pixels[start..][0..predictor_vector_lanes].*);
+}
+
+inline fn storePixelVector(pixels: []pixel.Pixel, start: usize, values: PixelVector) void {
+    pixels[start..][0..predictor_vector_lanes].* = @bitCast(values);
+}
+
+inline fn addPixelVectorsModulo(residual: PixelVector, prediction: PixelVector) PixelVector {
+    const even_mask: PixelVector = @splat(0x00ff00ff);
+    const even = ((residual & even_mask) +% (prediction & even_mask)) & even_mask;
+    const odd = (((residual >> @splat(8)) & even_mask) +%
+        ((prediction >> @splat(8)) & even_mask)) & even_mask;
+    return even | (odd << @splat(8));
+}
+
+inline fn averagePixelVectors(a: PixelVector, b: PixelVector) PixelVector {
+    const channel_high_bits_clear: PixelVector = @splat(0xfefefefe);
+    return (a & b) +% (((a ^ b) & channel_high_bits_clear) >> @splat(1));
 }
 
 /// Per-pixel reference application used by equivalence tests.
@@ -506,12 +660,8 @@ fn addPixelsModuloChannels(residual: pixel.Pixel, prediction: pixel.Pixel) pixel
 }
 
 fn averagePixels(a: pixel.Pixel, b: pixel.Pixel) pixel.Pixel {
-    return pixel.fromChannels(
-        averageChannel(pixel.alpha(a), pixel.alpha(b)),
-        averageChannel(pixel.red(a), pixel.red(b)),
-        averageChannel(pixel.green(a), pixel.green(b)),
-        averageChannel(pixel.blue(a), pixel.blue(b)),
-    );
+    const channel_high_bits_clear: pixel.Pixel = 0xfefefefe;
+    return (a & b) +% (((a ^ b) & channel_high_bits_clear) >> 1);
 }
 
 fn averageChannel(a: u8, b: u8) u8 {

@@ -102,6 +102,18 @@ pub const Store = struct {
     ) errors.Error!image_data.PrefixCodeGroup {
         return self.group(try info.groupIndex(entropy_image, x, y));
     }
+    pub fn groupForPixelPtr(
+        self: *const Store,
+        info: meta_prefix.Info,
+        entropy_image: []const pixel.Pixel,
+        x: u32,
+        y: u32,
+    ) errors.Error!*const image_data.PrefixCodeGroup {
+        const group_index = try info.groupIndex(entropy_image, x, y);
+        if (group_index >= self.initialized_count) return error.InvalidVP8LImageData;
+
+        return &self.groups[group_index];
+    }
 
     fn copyGroup(
         self: *Store,
@@ -111,19 +123,18 @@ pub const Store = struct {
         var copied: image_data.PrefixCodeGroup = undefined;
 
         copied.green = try self.copyTable(prefix_group.green, options);
-        errdefer self.gpa.free(copied.green.entries);
+        errdefer self.gpa.free(copied.green.entriesSlice());
 
         copied.red = try self.copyTable(prefix_group.red, options);
-        errdefer self.gpa.free(copied.red.entries);
+        errdefer self.gpa.free(copied.red.entriesSlice());
 
         copied.blue = try self.copyTable(prefix_group.blue, options);
-        errdefer self.gpa.free(copied.blue.entries);
+        errdefer self.gpa.free(copied.blue.entriesSlice());
 
         copied.alpha = try self.copyTable(prefix_group.alpha, options);
-        errdefer self.gpa.free(copied.alpha.entries);
+        errdefer self.gpa.free(copied.alpha.entriesSlice());
 
         copied.distance = try self.copyTable(prefix_group.distance, options);
-
         return copied;
     }
 
@@ -132,24 +143,31 @@ pub const Store = struct {
         table: huffman.SymbolTable,
         options: Options,
     ) errors.Error!huffman.SymbolTable {
-        _ = try allocationBytes(huffman.Entry, table.entries.len, &self.allocation_bytes, options);
+        const source_entries = table.entriesSlice();
+        _ = try allocationBytes(
+            huffman.Entry,
+            source_entries.len,
+            &self.allocation_bytes,
+            options,
+        );
 
-        const entries = try self.gpa.alloc(huffman.Entry, table.entries.len);
+        const entries = try self.gpa.alloc(huffman.Entry, source_entries.len);
         errdefer self.gpa.free(entries);
-        @memcpy(entries, table.entries);
+        @memcpy(entries, source_entries);
 
         return .{
-            .entries = entries,
+            .entries_ptr = entries.ptr,
+            .entries_len = @intCast(entries.len),
             .single_symbol = table.single_symbol,
         };
     }
 
     fn freeGroup(self: Store, prefix_group: image_data.PrefixCodeGroup) void {
-        self.gpa.free(prefix_group.green.entries);
-        self.gpa.free(prefix_group.red.entries);
-        self.gpa.free(prefix_group.blue.entries);
-        self.gpa.free(prefix_group.alpha.entries);
-        self.gpa.free(prefix_group.distance.entries);
+        self.gpa.free(prefix_group.green.entriesSlice());
+        self.gpa.free(prefix_group.red.entriesSlice());
+        self.gpa.free(prefix_group.blue.entriesSlice());
+        self.gpa.free(prefix_group.alpha.entriesSlice());
+        self.gpa.free(prefix_group.distance.entriesSlice());
     }
 };
 
@@ -176,6 +194,13 @@ fn writeSimplePrefixCode(writer: *bit_writer.BitWriter, symbol: u8) errors.Error
     try writer.writeBit(0);
     try writer.writeBit(if (symbol <= 1) 0 else 1);
     try writer.writeBits(symbol, if (symbol <= 1) 1 else 8);
+}
+fn writeTwoSymbolPrefixCode(writer: *bit_writer.BitWriter) errors.Error!void {
+    try writer.writeBit(1);
+    try writer.writeBit(1);
+    try writer.writeBit(0);
+    try writer.writeBits(0, 1);
+    try writer.writeBits(1, 8);
 }
 
 fn writeConstantPrefixCodeGroup(
@@ -297,7 +322,11 @@ test "VP8L packed Huffman Entry allocation charges two bytes per entry" {
 test "VP8L prefix group store cleans up partial group copies on limit failure" {
     var encoded: [16]u8 = undefined;
     var writer = bit_writer.BitWriter.init(&encoded);
-    try writeConstantPrefixCodeGroup(&writer, 0);
+    try writeTwoSymbolPrefixCode(&writer);
+    try writeTwoSymbolPrefixCode(&writer);
+    try writeSimplePrefixCode(&writer, 0);
+    try writeSimplePrefixCode(&writer, 0);
+    try writeSimplePrefixCode(&writer, 0);
 
     const one_table_bytes = @sizeOf(huffman.Entry) * huffman.SymbolTable.root_entry_count_max;
     const partial_limit = @sizeOf(image_data.PrefixCodeGroup) + one_table_bytes;

@@ -373,6 +373,43 @@ summed time). This closes a material part of the entropy gap but does **not**
 beat Rust. No general performance win is claimed; subsequent work should start
 from fresh stage/profile evidence rather than stacking speculative loop tweaks.
 
+### 2026-07-15 — VP8L cache-copy and single-symbol table costs removed
+
+`color_cache.Cache.lookup` previously took `Cache` by value. `Cache` contains
+the complete **2048-entry / 8192-byte** fixed cache, so every cache-symbol read
+copied the whole array before loading one pixel. The retained fix changes only
+the receiver to `*const Cache`; validation, indexing, cache contents, public
+APIs, and decoded bytes are unchanged.
+
+**Focused result (ReleaseFast, AMD EPYC 7663, CPU 0).** The same six-file
+Rust differential contract measured the three cache-heavy inputs at
+**14.5648→4.1066 ms** (`photo_foliage`, **3.55×**),
+**13.4243→4.9330 ms** (`photo_signage`, **2.72×**), and
+**1.2803→0.6161 ms** (`color_cache_bits_11`, **2.08×**). The uncached
+`bad_palette_index` control stayed **0.3104→0.3101 ms**. An adjacent 135-file
+candidate/baseline pair (`15` samples, `2` warmups, 1500 ms budget) moved the
+lossless-opaque Zig/Rust geomean from **2.1007× to 1.5104×** (**1.39×**
+narrowing) and the all-135 geomean from **1.4463× to 1.3180×**; lossless alpha
+was neutral (**2.4072× to 2.4023×**).
+
+Single-symbol Huffman trees also populated an unused **256-entry** root table
+even though both decode paths return `single_symbol` before reading `entries`.
+They now retain an empty entry slice and skip that initialization; owned
+multi-group stores consequently avoid copying/allocating those dead entries.
+An adjacent full-corpus candidate/baseline pair moved lossless-alpha Zig/Rust
+from **2.5160× to 2.2023×** (**1.14×** narrowing), held lossless opaque neutral
+(**1.5572× to 1.5580×**), and moved all 135 files from **1.3956× to 1.3606×**
+(**1.026×**). The lossy-opaque control stayed **1.1338× to 1.1312×**.
+
+Every paired run validated decoded bytes before timing; the full candidate
+validated **135/135** stills with zero skips. Final `zig build ci` and
+`zig build wasm-check` gates pass. Forced cache-helper inlining, unchecked
+cache indexing, copy-then-cache-update, SIMD inverse transforms and output
+shuffles, and a pointer receiver for the small Huffman table handle were
+measured and rejected: none added a stable corpus-level win. The remaining
+lossless ratios are still above 1, so this is a large cache-heavy improvement,
+**not** a general Rust performance lead.
+
 ### 2026-07-14 — Plan 024 IDCT omitted from cumulative draft (conservative cut)
 
 Plan 024 measured an attribution-gated `@Vector(4, i32)` inverse DCT on

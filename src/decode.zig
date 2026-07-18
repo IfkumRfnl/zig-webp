@@ -18,6 +18,7 @@ const vp8_frame_header = @import("vp8/frame_header.zig");
 const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
+const vp8l_image_data = @import("vp8l/image_data.zig");
 
 /// Shared demux prologue for the public static decode entry points: parses
 /// the container, rejects animations, and locates the still bitstream. The
@@ -60,11 +61,10 @@ pub fn decodeStatic(
 /// `decode_options.output_format` is ignored on this path. `dest` must pass
 /// `Buffer.validate()` and `dest.dimensions` must exactly equal the file's
 /// canvas dimensions — any mismatch returns `error.InvalidCanvasSize`. Both
-/// checks run before any pixel is decoded. Lossless decoding allocates only
-/// VP8L reconstruction scratch from `gpa`; neither the caller-owned destination
-/// nor a packed output copy is charged against
-/// `decode_options.limits.allocation_bytes_max`. Lossy decoding retains the
-/// owned intermediate used by `decodeStatic`.
+/// checks run before any pixel is decoded. Both codecs allocate only their
+/// reconstruction scratch from `gpa`; neither the caller-owned destination nor
+/// a packed output copy is charged against
+/// `decode_options.limits.allocation_bytes_max`.
 /// Bytes in `dest.pixels` outside the written rows (stride padding, tail
 /// slack) are left untouched. Animated inputs fail with
 /// `error.UnsupportedAnimationDecode`.
@@ -94,19 +94,7 @@ fn decodeLossyInto(
 ) errors.Error!void {
     var into_options = decode_options;
     into_options.output_format = dest.format;
-    var decoded = try decodeLossy(gpa, source, into_options);
-    defer decoded.deinit();
-
-    assert(decoded.buffer.format == dest.format);
-    const row_bytes: usize = @intCast(try dest.rowBytes());
-    assert(decoded.buffer.stride == row_bytes);
-
-    var y: usize = 0;
-    while (y < dest.dimensions.height) : (y += 1) {
-        const source_row = decoded.buffer.pixels[y * row_bytes ..][0..row_bytes];
-        const target_row = dest.pixels[y * @as(usize, dest.stride) ..][0..row_bytes];
-        @memcpy(target_row, source_row);
-    }
+    try decodeLossyToBuffer(gpa, source, dest, into_options, 0);
 }
 
 /// A single still image's bitstream plus the chunk-level context needed to
@@ -185,6 +173,7 @@ fn decodeLosslessInto(
 
 const LosslessWorkingSet = struct {
     gpa: std.mem.Allocator,
+    pixel_storage: []vp8l_pixel.Pixel,
     argb_pixels: []vp8l_pixel.Pixel,
     transform_pixels: []vp8l_pixel.Pixel,
     entropy_image: []vp8l_pixel.Pixel,
@@ -199,6 +188,7 @@ const LosslessWorkingSet = struct {
     ) errors.Error!void {
         target.* = .{
             .gpa = gpa,
+            .pixel_storage = &.{},
             .argb_pixels = &.{},
             .transform_pixels = &.{},
             .entropy_image = &.{},
@@ -214,9 +204,13 @@ const LosslessWorkingSet = struct {
             &allocation_bytes,
             decode_options,
         );
+        const vp8l_stream = if (source.bitstream.len > vp8l_header.byte_count)
+            source.bitstream[vp8l_header.byte_count..]
+        else
+            &.{};
         const transform_count = try reserveElements(
             vp8l_pixel.Pixel,
-            try transformPixelCapacity(pixel_count),
+            try transformPixelCapacityForStream(pixel_count, vp8l_stream),
             &allocation_bytes,
             decode_options,
         );
@@ -231,9 +225,29 @@ const LosslessWorkingSet = struct {
         else
             null;
 
-        target.argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
-        target.transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
-        target.entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
+        if (pixel_count < 16384 and source.bitstream.len >= 128) {
+            target.argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
+            target.transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
+            target.entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
+        } else {
+            var pixel_storage_count = argb_count;
+            if (transform_count > std.math.maxInt(usize) - pixel_storage_count) {
+                return error.AllocationLimitExceeded;
+            }
+            pixel_storage_count += transform_count;
+            if (entropy_count > std.math.maxInt(usize) - pixel_storage_count) {
+                return error.AllocationLimitExceeded;
+            }
+            pixel_storage_count += entropy_count;
+
+            target.pixel_storage = try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
+            target.argb_pixels = target.pixel_storage[0..argb_count];
+            const transform_start = argb_count;
+            target.transform_pixels =
+                target.pixel_storage[transform_start..][0..transform_count];
+            const entropy_start = transform_start + transform_count;
+            target.entropy_image = target.pixel_storage[entropy_start..][0..entropy_count];
+        }
         if (packed_output_count) |count| {
             target.packed_output = try gpa.alloc(u8, count);
         }
@@ -247,7 +261,7 @@ const LosslessWorkingSet = struct {
                 .allocation_bytes_max = allocation_bytes_remaining,
             },
         };
-        _ = try vp8l_decoder.decodeARGBAlloc(
+        try vp8l_decoder.decodeARGBAllocDiscardSummary(
             gpa,
             source.bitstream,
             target.argb_pixels,
@@ -257,9 +271,13 @@ const LosslessWorkingSet = struct {
 
     fn deinit(self: *LosslessWorkingSet) void {
         if (self.packed_output) |out| self.gpa.free(out);
-        if (self.entropy_image.len > 0) self.gpa.free(self.entropy_image);
-        if (self.transform_pixels.len > 0) self.gpa.free(self.transform_pixels);
-        if (self.argb_pixels.len > 0) self.gpa.free(self.argb_pixels);
+        if (self.pixel_storage.len > 0) {
+            self.gpa.free(self.pixel_storage);
+        } else {
+            if (self.entropy_image.len > 0) self.gpa.free(self.entropy_image);
+            if (self.transform_pixels.len > 0) self.gpa.free(self.transform_pixels);
+            if (self.argb_pixels.len > 0) self.gpa.free(self.argb_pixels);
+        }
     }
 
     fn takePackedOutput(self: *LosslessWorkingSet) []u8 {
@@ -274,13 +292,47 @@ fn decodeLossy(
     source: ImageSource,
     decode_options: options.DecoderOptions,
 ) errors.Error!image.OwnedBuffer {
-    const dimensions = source.dimensions;
-    const format = decode_options.output_format;
-
     var allocation_bytes: u64 = 0;
-    const output_len = try outputByteLength(dimensions, format);
-    const output_count = try reserveElements(u8, output_len, &allocation_bytes, decode_options);
+    const output_len = try outputByteLength(source.dimensions, decode_options.output_format);
+    const output_count = try reserveElements(
+        u8,
+        output_len,
+        &allocation_bytes,
+        decode_options,
+    );
+    const out = try gpa.alloc(u8, output_count);
+    errdefer gpa.free(out);
 
+    const stride: u32 = @intCast(try rowByteLength(
+        source.dimensions,
+        decode_options.output_format,
+    ));
+    const dest = image.Buffer{
+        .pixels = out,
+        .dimensions = source.dimensions,
+        .stride = stride,
+        .format = decode_options.output_format,
+    };
+    try decodeLossyToBuffer(gpa, source, dest, decode_options, allocation_bytes);
+
+    return .{
+        .gpa = gpa,
+        .buffer = dest,
+    };
+}
+
+fn decodeLossyToBuffer(
+    gpa: std.mem.Allocator,
+    source: ImageSource,
+    dest: image.Buffer,
+    decode_options: options.DecoderOptions,
+    allocation_bytes_initial: u64,
+) errors.Error!void {
+    assert(dest.dimensions.width == source.dimensions.width);
+    assert(dest.dimensions.height == source.dimensions.height);
+    assert(dest.format == decode_options.output_format);
+
+    var allocation_bytes = allocation_bytes_initial;
     var parsed: vp8_frame_header.Parsed = undefined;
     try vp8_frame_header.parse(source.bitstream, &parsed);
     const frame_allocation_bytes = try vp8_decoder.allocationBytesParsed(&parsed, .{
@@ -297,12 +349,33 @@ fn decodeLossy(
     });
     defer frame.deinit();
 
-    const out = try gpa.alloc(u8, output_count);
-    errdefer gpa.free(out);
+    var alpha_plane: ?[]u8 = null;
+    defer if (alpha_plane) |plane| gpa.free(plane);
+    if (dest.format.channelCount() == 4) {
+        if (source.alpha) |alpha_payload| {
+            const pixel_count: usize = @intCast(try source.dimensions.pixelCount());
+            const alpha_count = try reserveElements(
+                u8,
+                pixel_count,
+                &allocation_bytes,
+                decode_options,
+            );
+            const plane = try gpa.alloc(u8, alpha_count);
+            errdefer gpa.free(plane);
+            _ = try alpha.decodePlaneAllocWithOptions(
+                gpa,
+                alpha_payload,
+                source.dimensions,
+                plane,
+                .{
+                    .allocation_bytes_max = decode_options.limits.allocation_bytes_max - allocation_bytes,
+                },
+            );
+            alpha_plane = plane;
+        }
+    }
 
-    const stride: u32 = @intCast(try rowByteLength(dimensions, format));
-
-    color.upsampleFancy(format, .{
+    color.upsampleFancy(dest.format, .{
         .luma = frame.luma,
         .chroma_u = frame.chroma_u,
         .chroma_v = frame.chroma_v,
@@ -310,41 +383,18 @@ fn decodeLossy(
         .chroma_stride = frame.chroma_stride,
         .width = frame.width,
         .height = frame.height,
-    }, out, stride);
+    }, dest.pixels, dest.stride);
 
-    // `upsampleFancy` writes opaque alpha; compose the decoded ALPH plane over
-    // it when the file carries one and the output format has an alpha channel.
-    // RGB output drops alpha, matching libwebp.
-    if (format.channelCount() == 4) {
-        if (source.alpha) |alpha_payload| {
-            const pixel_count: usize = @intCast(try dimensions.pixelCount());
-            const alpha_count = try reserveElements(u8, pixel_count, &allocation_bytes, decode_options);
-            const alpha_plane = try gpa.alloc(u8, alpha_count);
-            defer gpa.free(alpha_plane);
-            _ = try alpha.decodePlaneAllocWithOptions(
-                gpa,
-                alpha_payload,
-                dimensions,
-                alpha_plane,
-                .{
-                    .allocation_bytes_max = decode_options.limits.allocation_bytes_max - allocation_bytes,
-                },
-            );
-            composeAlpha(out, format, stride, dimensions, alpha_plane);
-        }
+    if (alpha_plane) |plane| {
+        composeAlpha(
+            dest.pixels,
+            dest.format,
+            dest.stride,
+            source.dimensions,
+            plane,
+        );
     }
-
-    return .{
-        .gpa = gpa,
-        .buffer = .{
-            .pixels = out,
-            .dimensions = dimensions,
-            .stride = stride,
-            .format = format,
-        },
-    };
 }
-
 /// Overwrites the alpha channel of a freshly converted lossy frame with the
 /// decoded ALPH plane (one byte per pixel, row-major). The plane is placed
 /// verbatim; lossy WebP carries straight (non-premultiplied) alpha, so RGB is
@@ -356,23 +406,22 @@ fn composeAlpha(
     dimensions: image.Dimensions,
     alpha_plane: []const u8,
 ) void {
-    const channels = 4;
+    assert(format.channelCount() == 4);
+    const width: usize = @intCast(dimensions.width);
+    const height: usize = @intCast(dimensions.height);
+    assert(alpha_plane.len == width * height);
     const alpha_offset: usize = switch (format) {
+        .rgb => unreachable,
         .rgba, .bgra => 3,
         .argb => 0,
-        .rgb => unreachable,
     };
-
-    const width: usize = dimensions.width;
-    const height: usize = dimensions.height;
-    assert(alpha_plane.len == width * height);
 
     var y: usize = 0;
     while (y < height) : (y += 1) {
-        const out_row = out[y * stride ..][0 .. width * channels];
+        const out_row = out[y * @as(usize, stride) ..][0 .. width * 4];
         const alpha_row = alpha_plane[y * width ..][0..width];
-        for (alpha_row, 0..) |sample, x| {
-            out_row[x * channels + alpha_offset] = sample;
+        for (alpha_row, 0..) |value, x| {
+            out_row[x * 4 + alpha_offset] = value;
         }
     }
 }
@@ -409,6 +458,13 @@ fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {
     if (pixel_count > std.math.maxInt(u64) - 257) return error.AllocationLimitExceeded;
 
     return pixel_count + 257;
+}
+fn transformPixelCapacityForStream(
+    pixel_count: u64,
+    stream: []const u8,
+) errors.Error!u64 {
+    if (stream.len > 0 and (stream[0] & 1) == 0) return 0;
+    return transformPixelCapacity(pixel_count);
 }
 
 fn outputByteLength(
@@ -790,11 +846,20 @@ test "static decode applies allocation limit to meta-prefix group storage" {
     }, .{});
     defer std.testing.allocator.free(encoded);
 
+    const pixel_count = try dimensions.pixelCount();
+    const working_pixel_count =
+        pixel_count + try transformPixelCapacity(pixel_count) + pixel_count;
+    const pre_group_bytes =
+        @as(u64, @sizeOf(vp8l_pixel.Pixel)) * working_pixel_count +
+        @as(u64, image.PixelFormat.rgba.channelCount()) * pixel_count;
+    const group_limit =
+        pre_group_bytes + @as(u64, @sizeOf(vp8l_image_data.PrefixCodeGroup)) - 1;
+
     try std.testing.expectError(
         error.AllocationLimitExceeded,
         decodeStatic(std.testing.allocator, encoded, .{
             .limits = .{
-                .allocation_bytes_max = 2_000,
+                .allocation_bytes_max = group_limit,
             },
         }),
     );
@@ -939,7 +1004,7 @@ test "decodeStaticInto matches decodeStatic on a lossless corpus file" {
     try std.testing.expectEqualSlices(u8, expected.buffer.pixels, dest.pixels);
 }
 
-test "decodeStaticInto matches decodeStatic on a lossy corpus file" {
+test "decodeStaticInto writes every lossy format without touching slack" {
     const corpus = @import("testing/corpus.zig");
 
     const bytes = corpus.readFileAlloc(std.testing.allocator, "test.webp", .{}) catch |err| switch (err) {
@@ -948,20 +1013,89 @@ test "decodeStaticInto matches decodeStatic on a lossy corpus file" {
     };
     defer std.testing.allocator.free(bytes);
 
-    var expected = try decodeStatic(std.testing.allocator, bytes, .{});
-    defer expected.deinit();
+    const formats = [_]image.PixelFormat{ .rgb, .rgba, .bgra, .argb };
+    const sentinel: u8 = 0xa5;
+    for (formats) |format| {
+        var expected = try decodeStatic(std.testing.allocator, bytes, .{
+            .output_format = format,
+        });
+        defer expected.deinit();
 
-    const dest_pixels = try std.testing.allocator.alloc(u8, expected.buffer.pixels.len);
+        const row_bytes: usize = @intCast(try expected.buffer.rowBytes());
+        const stride = row_bytes + 5;
+        const height: usize = @intCast(expected.buffer.dimensions.height);
+        const tail_bytes = 7;
+        const dest_pixels = try std.testing.allocator.alloc(
+            u8,
+            stride * height + tail_bytes,
+        );
+        defer std.testing.allocator.free(dest_pixels);
+        @memset(dest_pixels, sentinel);
+
+        const dest = image.Buffer{
+            .pixels = dest_pixels,
+            .dimensions = expected.buffer.dimensions,
+            .stride = @intCast(stride),
+            .format = format,
+        };
+        try decodeStaticInto(std.testing.allocator, bytes, dest, .{
+            .output_format = .bgra,
+        });
+
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            const expected_row = expected.buffer.pixels[y * row_bytes ..][0..row_bytes];
+            const actual_row = dest_pixels[y * stride ..][0..row_bytes];
+            try std.testing.expectEqualSlices(u8, expected_row, actual_row);
+            for (dest_pixels[y * stride + row_bytes ..][0 .. stride - row_bytes]) |value| {
+                try std.testing.expectEqual(sentinel, value);
+            }
+        }
+        for (dest_pixels[stride * height ..]) |value| {
+            try std.testing.expectEqual(sentinel, value);
+        }
+    }
+}
+
+test "decodeStaticInto does not charge caller-owned lossy output" {
+    const corpus = @import("testing/corpus.zig");
+
+    const bytes = corpus.readFileAlloc(std.testing.allocator, "test.webp", .{}) catch |err| switch (err) {
+        error.CorpusUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(bytes);
+
+    const source = try parseStaticSource(std.testing.allocator, bytes, .{});
+    var parsed: vp8_frame_header.Parsed = undefined;
+    try vp8_frame_header.parse(source.bitstream, &parsed);
+    const frame_allocation_bytes = try vp8_decoder.allocationBytesParsed(&parsed, .{
+        .apply_loop_filter = true,
+    });
+
+    const output_len: usize = @intCast(try outputByteLength(source.dimensions, .rgba));
+    const dest_pixels = try std.testing.allocator.alloc(u8, output_len);
     defer std.testing.allocator.free(dest_pixels);
     const dest = image.Buffer{
         .pixels = dest_pixels,
-        .dimensions = expected.buffer.dimensions,
-        .stride = expected.buffer.stride,
+        .dimensions = source.dimensions,
+        .stride = @intCast(try rowByteLength(source.dimensions, .rgba)),
         .format = .rgba,
     };
 
-    try decodeStaticInto(std.testing.allocator, bytes, dest, .{});
-    try std.testing.expectEqualSlices(u8, expected.buffer.pixels, dest.pixels);
+    try decodeStaticInto(std.testing.allocator, bytes, dest, .{
+        .limits = .{
+            .allocation_bytes_max = frame_allocation_bytes,
+        },
+    });
+    try std.testing.expectError(
+        error.AllocationLimitExceeded,
+        decodeStatic(std.testing.allocator, bytes, .{
+            .limits = .{
+                .allocation_bytes_max = frame_allocation_bytes,
+            },
+        }),
+    );
 }
 
 test "decodeStaticInto honors stride and leaves padding untouched" {

@@ -88,12 +88,17 @@ and features without decoding pixels.
 
 Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered:
 lossy decode gained a vectorized YUV→RGB conversion and a table-driven VP8
-boolean reader (≈1.3× aggregate, byte-exact), and every public entry point is
-covered by a limits/malicious-input contract matrix, allocation-failure
-injection (still and animated), encode-side fuzz targets, and deterministic
-bounded mutation exploration of every fuzz seed. Untrusted input fails with
-documented errors under caller-set `ResourceLimits`, never with panics or
-unbounded allocation. Details and dated results live in `PROGRESS.MD`.
+boolean reader (≈1.3× aggregate, byte-exact). VP8L color-cache lookups no longer
+copy the fixed 8192-byte cache for each cache symbol; focused cache-heavy
+lossless stills improved by **2.08–3.55×**. Single-symbol Huffman trees also
+skip unused root-table initialization and copies, narrowing the full-corpus
+lossless-alpha gap by **1.14×**. Decoded bytes are unchanged. Every public entry
+point is covered by a limits/malicious-input contract matrix,
+allocation-failure injection (still and animated), encode-side fuzz targets,
+and deterministic bounded mutation exploration of every fuzz seed. Untrusted
+input fails with documented errors under caller-set `ResourceLimits`, never
+with panics or unbounded allocation. Details and dated results live in
+`PROGRESS.MD`.
 
 ## Goals
 

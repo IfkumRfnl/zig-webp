@@ -1164,7 +1164,8 @@ start from codegen/profile evidence for a whole-stream entropy-state redesign
 with a local bit-buffer/table cursor and checked tail. It must require at least
 a **1.20× full-lossless summed-time** improvement before retaining a duplicated
 safety-critical kernel, and must not reopen plan 021's bulk-refill/unchecked
-lookup. Plan 029's completed output-sink result is recorded in `PROGRESS.MD`.
+lookup. Plan 029's completed output-sink result and the subsequent fixed-array
+cache-receiver and table-free single-symbol fixes are recorded in `PROGRESS.MD`.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,

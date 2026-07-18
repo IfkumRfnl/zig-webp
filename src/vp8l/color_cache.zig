@@ -19,10 +19,9 @@ pub const Cache = struct {
         if (bits == 0) return error.InvalidVP8LImageData;
         if (bits > huffman.color_cache_bits_max) return error.InvalidVP8LImageData;
 
-        self.* = .{
-            .bits = bits,
-            .size = @as(u16, 1) << bits,
-        };
+        self.bits = bits;
+        self.size = @as(u16, 1) << bits;
+        @memset(self.entries[0..self.size], 0);
     }
 
     pub fn insert(self: *Cache, value: pixel.Pixel) void {
@@ -34,7 +33,7 @@ pub const Cache = struct {
         self.entries[hash(self.bits, value)] = value;
     }
 
-    pub fn lookup(self: Cache, index: u16) errors.Error!pixel.Pixel {
+    pub fn lookup(self: *const Cache, index: u16) errors.Error!pixel.Pixel {
         assert(self.bits > 0);
         assert(self.bits <= huffman.color_cache_bits_max);
         assert(self.size > 0);
