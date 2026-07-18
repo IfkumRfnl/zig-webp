@@ -250,6 +250,27 @@ fn decodeImage(
         }
     }
 
+    if (cache == null) {
+        if (prefix_codes.red.single_symbol != null) {
+            if (prefix_codes.blue.single_symbol != null) {
+                if (prefix_codes.alpha.single_symbol != null) {
+                    return decodeLoop(
+                        collect_summary,
+                        false,
+                        false,
+                        true,
+                        reader,
+                        dimensions,
+                        {},
+                        prefix_codes,
+                        undefined,
+                        output,
+                    );
+                }
+            }
+        }
+    }
+
     return decodeImageWithSelector(
         collect_summary,
         reader,
@@ -267,6 +288,22 @@ fn constantLiteral(prefix_codes: image_data.PrefixCodeGroup) ?pixel.Pixel {
     const alpha_symbol = prefix_codes.alpha.single_symbol orelse return null;
     if (green_symbol >= huffman.literal_alphabet_size) return null;
 
+    return pixel.fromChannels(
+        @intCast(alpha_symbol),
+        @intCast(red_symbol),
+        @intCast(green_symbol),
+        @intCast(blue_symbol),
+    );
+}
+
+inline fn constantChannelLiteral(
+    prefix_codes: *const image_data.PrefixCodeGroup,
+    green_symbol: u16,
+) pixel.Pixel {
+    assert(green_symbol < huffman.literal_alphabet_size);
+    const red_symbol = prefix_codes.red.single_symbol.?;
+    const blue_symbol = prefix_codes.blue.single_symbol.?;
+    const alpha_symbol = prefix_codes.alpha.single_symbol.?;
     return pixel.fromChannels(
         @intCast(alpha_symbol),
         @intCast(red_symbol),
@@ -298,13 +335,13 @@ fn decodeImageWithSelector(
 
     return switch (selector) {
         .single => |prefix_codes| if (cache) |color_cache_pointer|
-            decodeLoop(collect_summary, true, false, reader, dimensions, color_cache_pointer, prefix_codes, undefined, output)
+            decodeLoop(collect_summary, true, false, false, reader, dimensions, color_cache_pointer, prefix_codes, undefined, output)
         else
-            decodeLoop(collect_summary, false, false, reader, dimensions, {}, prefix_codes, undefined, output),
+            decodeLoop(collect_summary, false, false, false, reader, dimensions, {}, prefix_codes, undefined, output),
         .spatial => |spatial| if (cache) |color_cache_pointer|
-            decodeLoop(collect_summary, true, true, reader, dimensions, color_cache_pointer, undefined, spatial, output)
+            decodeLoop(collect_summary, true, true, false, reader, dimensions, color_cache_pointer, undefined, spatial, output)
         else
-            decodeLoop(collect_summary, false, true, reader, dimensions, {}, undefined, spatial, output),
+            decodeLoop(collect_summary, false, true, false, reader, dimensions, {}, undefined, spatial, output),
     };
 }
 
@@ -312,6 +349,7 @@ fn decodeLoop(
     comptime collect_summary: bool,
     comptime has_cache: bool,
     comptime spatial: bool,
+    comptime constant_channels: bool,
     reader: *bit_reader.BitReader,
     dimensions: image.Dimensions,
     cache: if (has_cache) *color_cache.Cache else void,
@@ -320,6 +358,7 @@ fn decodeLoop(
     output: []pixel.Pixel,
 ) errors.Error!DecodeSummary {
     assert(output.len == try dimensions.pixelCount());
+    if (spatial) assert(!constant_channels);
 
     var summary = DecodeSummary{
         .pixel_count = 0,
@@ -353,7 +392,10 @@ fn decodeLoop(
         reader.fill();
         const green_symbol = try prefix_codes.green.decodeBuffered(reader);
         if (green_symbol < huffman.literal_alphabet_size) {
-            const value = try readLiteral(reader, prefix_codes, green_symbol);
+            const value = if (constant_channels)
+                constantChannelLiteral(prefix_codes, green_symbol)
+            else
+                try readLiteral(reader, prefix_codes, green_symbol);
             output[output_index] = value;
             if (has_cache) cache.insert(value);
 
