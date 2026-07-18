@@ -185,9 +185,10 @@ does not move.
   advantage on many tiny VP8L and ALPH inputs; this is a decisive VP8
   throughput win, not a claim of universal per-file superiority.
 
-Verification: the 493-test Debug suite passed in 16 shards with zero failures
-or leaks; the paired benchmark's digest gate passed 135/135. The local CI and
-oracle gates are recorded with the delivery commit below.
+Verification: `zig build ci` passed; the 493-test Debug suite also passed in
+16 shards with zero failures or leaks. The paired benchmark digest gate passed
+**135/135**, and `compare-rgb-corpus` matched libwebp on all **88** VP8 stills
+(43 non-VP8 files skipped, zero failures).
 
 ### 2026-07-15 — Plan 029 direct VP8L decode-into output
 
