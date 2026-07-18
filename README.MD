@@ -86,14 +86,21 @@ complete: the manual ≥2-browser render check of the two sample animations unde
 lossy `VP8 `. The installed `zig-webp-info` tool prints WebP container structure
 and features without decoding pixels.
 
-Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered:
-lossy decode gained a vectorized YUV→RGB conversion and a table-driven VP8
-boolean reader (≈1.3× aggregate, byte-exact). VP8L color-cache lookups no longer
-copy the fixed 8192-byte cache for each cache symbol; focused cache-heavy
-lossless stills improved by **2.08–3.55×**. Single-symbol Huffman trees also
-skip unused root-table initialization and copies, narrowing the full-corpus
-lossless-alpha gap by **1.14×**. Decoded bytes are unchanged. Every public entry
-point is covered by a limits/malicious-input contract matrix,
+Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered.
+Lossy decode now combines vector YUV→RGB conversion, table-driven VP8 boolean
+renormalization, four-lane inverse DCT, compact residual metadata, and SIMD
+horizontal/vertical loop filtering. A pinned 135-file paired run against pure
+Rust `image-webp` measured the 70 lossy opaque stills at **0.9415× per-file
+geomean** and **0.8208× summed decode time** (Zig/Rust; lower is faster), with
+digest-identical output. VP8L color-cache lookups no longer copy the fixed
+8192-byte cache for each cache symbol; focused cache-heavy lossless stills
+improved by **2.08–3.55×**. VP8L also gained buffered entropy reads, vector/run
+inverse transforms, reduced scratch, direct caller-owned `decodeStaticInto`
+output, and direct palette expansion into compressed `ALPH` planes. The dated
+all-file geomean still favors Rust on many tiny VP8L/ALPH inputs; the aggregate
+lead is a VP8 throughput result, not a universal per-file claim. Decoded bytes
+are unchanged.
+Every public entry point is covered by a limits/malicious-input contract matrix,
 allocation-failure injection (still and animated), encode-side fuzz targets,
 and deterministic bounded mutation exploration of every fuzz seed. Untrusted
 input fails with documented errors under caller-set `ResourceLimits`, never

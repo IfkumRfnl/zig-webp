@@ -351,16 +351,16 @@ Deliverable: dated performance reports following the honest-benchmarking rules
 in `AGENTS.md`. The gating comparison is against `libwebp` (the conformance
 oracle and the same-lineage SIMD baseline this library is measured against),
 recorded same-machine via `tools/webp-bench.sh`. Comparisons against
-`image-webp` (Rust) and the pure-Go references are **optional supplementary
-reports**, deferred: they are independent-implementation references, not the
-authoritative baseline, and timing them needs external Rust/Go toolchains that
-are not part of this project's environment; they can be run later without
-reopening the step.
+`image-webp` (Rust) and the pure-Go references remain **supplementary reports**:
+they are independent implementations, not conformance oracles. The optional
+`tools/webp-rust-bench.sh` harness now provides digest-gated, same-machine
+decode-into comparisons when the local Rust toolchain/reference checkout is
+available; neither is a package or CI dependency.
 
-Step 10 is delivered. The dated baseline, the vectorized color-conversion
-result, the VP8 boolean-reader renormalization result, the rejected experiments,
-and the future levers are recorded in `PROGRESS.MD` (this section stays
-forward-looking per `AGENTS.md`).
+Step 10 is delivered. Dated baselines, the vectorized color conversion and
+inverse DCT, full-edge SIMD loop filtering, VP8 boolean-reader renormalization,
+VP8L entropy/transform/output work, rejected experiments, and future levers are
+recorded in `PROGRESS.MD` (this section stays forward-looking per `AGENTS.md`).
 
 ### 11. Robustness Hardening
 
