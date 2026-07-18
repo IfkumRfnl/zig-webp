@@ -467,7 +467,7 @@ fn reconstructMacroblock(scratch: *Scratch, context: ReconstructContext) void {
         );
         for (0..tokens.chroma_block_count) |index| {
             const block = &@field(context.coefficients, field)[index];
-            if (!blockHasNonzero(&block.coefficients)) continue;
+            if (!blockHasNonzero(block)) continue;
             const block_row: i32 = @intCast(4 * (index / 2));
             const block_column: i32 = @intCast(4 * (index % 2));
             transform.addInverseDct(
@@ -517,7 +517,7 @@ fn reconstructFullLuma(scratch: *Scratch, context: ReconstructContext) void {
     // runs after the Y2 scatter so DC-only blocks are not dropped.
     for (0..tokens.luma_block_count) |index| {
         const block = &context.coefficients.luma[index];
-        if (!blockHasNonzero(&block.coefficients)) continue;
+        if (!blockHasNonzero(block)) continue;
         addLumaResidual(scratch, index, block);
     }
 }
@@ -553,7 +553,7 @@ fn reconstructSubblockLuma(scratch: *Scratch, context: ReconstructContext) void 
         // The residual must land before the next subblock predicts from
         // these pixels.
         const block = &context.coefficients.luma[index];
-        if (blockHasNonzero(&block.coefficients)) {
+        if (blockHasNonzero(block)) {
             addLumaResidual(scratch, index, block);
         }
     }
@@ -569,11 +569,8 @@ fn addLumaResidual(scratch: *Scratch, index: usize, block: *const tokens.Block) 
     );
 }
 
-fn blockHasNonzero(coefficients: *const [tokens.coefficient_count]i16) bool {
-    for (coefficients) |coefficient| {
-        if (coefficient != 0) return true;
-    }
-    return false;
+fn blockHasNonzero(block: *const tokens.Block) bool {
+    return block.last_position > 1 or block.coefficients[0] != 0;
 }
 
 // --- Tests -------------------------------------------------------------
