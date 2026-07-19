@@ -1,7 +1,9 @@
 //! Public static image decode composition.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
+const native_endian = builtin.cpu.arch.endian();
 
 const alpha = @import("alpha.zig");
 const bit_writer = @import("bit_writer.zig");
@@ -630,25 +632,28 @@ fn writeRgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void 
     }
 }
 
+const output_vector_pixels = 8;
+const OutputPixelVector = @Vector(output_vector_pixels, vp8l_pixel.Pixel);
+
 fn writeRgbaRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
-    const width: usize = @intCast(dest.dimensions.width);
-    const stride: usize = @intCast(dest.stride);
-    var y: usize = 0;
-    while (y < dest.dimensions.height) : (y += 1) {
-        const source_row = argb_pixels[y * width ..][0..width];
-        const target_row = dest.pixels[y * stride ..][0 .. width * 4];
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.red(value);
-            target_row[x * 4 + 1] = vp8l_pixel.green(value);
-            target_row[x * 4 + 2] = vp8l_pixel.blue(value);
-            target_row[x * 4 + 3] = vp8l_pixel.alpha(value);
-        }
-    }
+    writeFourByteRows(.rgba, dest, argb_pixels);
 }
 
 fn writeBgraRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
+    writeFourByteRows(.bgra, dest, argb_pixels);
+}
+
+fn writeArgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
+    writeFourByteRows(.argb, dest, argb_pixels);
+}
+
+fn writeFourByteRows(
+    comptime format: image.PixelFormat,
+    dest: image.Buffer,
+    argb_pixels: []const vp8l_pixel.Pixel,
+) void {
+    comptime assert(format.channelCount() == 4);
+
     const width: usize = @intCast(dest.dimensions.width);
     const stride: usize = @intCast(dest.stride);
     var y: usize = 0;
@@ -656,32 +661,52 @@ fn writeBgraRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void
         const source_row = argb_pixels[y * width ..][0..width];
         const target_row = dest.pixels[y * stride ..][0 .. width * 4];
         var x: usize = 0;
+        while (x + output_vector_pixels <= width) : (x += output_vector_pixels) {
+            const source: OutputPixelVector =
+                source_row[x..][0..output_vector_pixels].*;
+            const packed_pixels = packOutputPixels(format, source);
+            @memcpy(
+                target_row[x * 4 ..][0 .. output_vector_pixels * 4],
+                std.mem.asBytes(&packed_pixels),
+            );
+        }
         while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.blue(value);
-            target_row[x * 4 + 1] = vp8l_pixel.green(value);
-            target_row[x * 4 + 2] = vp8l_pixel.red(value);
-            target_row[x * 4 + 3] = vp8l_pixel.alpha(value);
+            writePixel(target_row[x * 4 ..][0..4], format, source_row[x]);
         }
     }
 }
 
-fn writeArgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
-    const width: usize = @intCast(dest.dimensions.width);
-    const stride: usize = @intCast(dest.stride);
-    var y: usize = 0;
-    while (y < dest.dimensions.height) : (y += 1) {
-        const source_row = argb_pixels[y * width ..][0..width];
-        const target_row = dest.pixels[y * stride ..][0 .. width * 4];
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.alpha(value);
-            target_row[x * 4 + 1] = vp8l_pixel.red(value);
-            target_row[x * 4 + 2] = vp8l_pixel.green(value);
-            target_row[x * 4 + 3] = vp8l_pixel.blue(value);
-        }
+fn packOutputPixels(
+    comptime format: image.PixelFormat,
+    source: OutputPixelVector,
+) OutputPixelVector {
+    comptime assert(format.channelCount() == 4);
+
+    const eight: @Vector(output_vector_pixels, u5) = @splat(8);
+    const sixteen: @Vector(output_vector_pixels, u5) = @splat(16);
+    const twenty_four: @Vector(output_vector_pixels, u5) = @splat(24);
+    const byte_swapped =
+        ((source & @as(OutputPixelVector, @splat(0xff00_0000))) >> twenty_four) |
+        ((source & @as(OutputPixelVector, @splat(0x00ff_0000))) >> eight) |
+        ((source & @as(OutputPixelVector, @splat(0x0000_ff00))) << eight) |
+        ((source & @as(OutputPixelVector, @splat(0x0000_00ff))) << twenty_four);
+
+    if (comptime native_endian == .little) {
+        return switch (format) {
+            .rgba => (source & @as(OutputPixelVector, @splat(0xff00_ff00))) |
+                ((source & @as(OutputPixelVector, @splat(0x00ff_0000))) >> sixteen) |
+                ((source & @as(OutputPixelVector, @splat(0x0000_00ff))) << sixteen),
+            .bgra => source,
+            .argb => byte_swapped,
+            .rgb => comptime unreachable,
+        };
     }
+    return switch (format) {
+        .rgba => (source << eight) | (source >> twenty_four),
+        .bgra => byte_swapped,
+        .argb => source,
+        .rgb => comptime unreachable,
+    };
 }
 
 fn writePixel(out: []u8, format: image.PixelFormat, value: vp8l_pixel.Pixel) void {
@@ -1282,6 +1307,69 @@ test "decodeStaticInto writes every lossless format without touching slack" {
             }
             for (dest_pixels[required_len..]) |byte| {
                 try std.testing.expectEqual(sentinel, byte);
+            }
+        }
+    }
+}
+
+test "four-byte row vectors match scalar conversion exhaustively" {
+    const formats = [_]image.PixelFormat{ .rgba, .bgra, .argb };
+    const widths = [_]u32{ 1, 7, 8, 9, 15, 16, 17 };
+    const sentinel: u8 = 0xa5;
+
+    inline for (formats) |format| {
+        for (widths) |width| {
+            const dimensions = try image.Dimensions.init(width, 2);
+            const width_usize: usize = @intCast(width);
+            const row_bytes = width_usize * 4;
+            const stride = row_bytes + 5;
+            var alpha_value: u16 = 0;
+            while (alpha_value <= 255) : (alpha_value += 1) {
+                var source: [17 * 2]vp8l_pixel.Pixel = undefined;
+                for (source[0 .. width_usize * 2], 0..) |*pixel, pixel_index| {
+                    pixel.* = vp8l_pixel.fromChannels(
+                        @intCast(alpha_value),
+                        @truncate(pixel_index * 73 + alpha_value),
+                        @truncate(pixel_index * 29 + alpha_value * 3),
+                        @truncate(pixel_index * 11 + alpha_value * 7),
+                    );
+                }
+
+                var expected: [17 * 2 * 4]u8 = undefined;
+                writePixels(
+                    expected[0 .. row_bytes * 2],
+                    format,
+                    source[0 .. width_usize * 2],
+                );
+
+                var storage: [1 + (17 * 4 + 5) * 2 + 7]u8 = @splat(sentinel);
+                const target = storage[1..][0 .. stride * 2 + 7];
+                writeFourByteRows(format, .{
+                    .pixels = target,
+                    .dimensions = dimensions,
+                    .stride = @intCast(stride),
+                    .format = format,
+                }, source[0 .. width_usize * 2]);
+
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected[0..row_bytes],
+                    target[0..row_bytes],
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected[row_bytes .. row_bytes * 2],
+                    target[stride..][0..row_bytes],
+                );
+                for (target[row_bytes..stride]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
+                for (target[stride + row_bytes .. stride * 2]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
+                for (target[stride * 2 ..]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
             }
         }
     }
