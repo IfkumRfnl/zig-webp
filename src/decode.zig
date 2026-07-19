@@ -1585,13 +1585,13 @@ test "lossless decodeStaticInto budgets probed reconstruction scratch" {
     defer std.testing.allocator.free(encoded);
 
     const pixel_count = try dimensions.pixelCount();
-    // The direct decodeInto path does not charge caller-owned output. For this
-    // tiny stream, the demuxer's temporary chunk-list allocation is the limit.
-    // Owned decode charges only its final output, not another ARGB image.
+    // Force the bounded fallback with a provably unaligned caller buffer. This
+    // keeps the allocation boundary about reconstruction scratch on every
+    // target instead of depending on the platform's stack alignment.
     const output_bytes = pixel_count * @sizeOf(vp8l_pixel.Pixel);
-    var dest_pixels: [8 * 8 * 4]u8 = undefined;
+    var dest_storage: [8 * 8 * 4 + 1]u8 align(@alignOf(vp8l_pixel.Pixel)) = undefined;
     const dest = image.Buffer{
-        .pixels = &dest_pixels,
+        .pixels = dest_storage[1..],
         .dimensions = dimensions,
         .stride = 8 * 4,
         .format = .rgba,
