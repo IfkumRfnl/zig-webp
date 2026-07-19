@@ -277,38 +277,46 @@ fn readPrefixCode(
     assert(alphabet_size > 0);
     assert(alphabet_size <= huffman.green_alphabet_size_max);
 
-    const code_lengths = buffers.code_lengths[0..alphabet_size];
-    @memset(code_lengths, 0);
-
     const simple_code = try reader.readBit();
     if (simple_code == 1) {
-        try readSimpleCodeLengths(reader, code_lengths);
-    } else {
-        try readNormalCodeLengths(reader, alphabet_size, code_lengths, buffers);
+        const symbols = try readSimpleSymbols(reader, alphabet_size);
+        return huffman.SymbolTable.buildSimple(entries, symbols.first, symbols.second);
     }
 
+    const code_lengths = buffers.code_lengths[0..alphabet_size];
+    @memset(code_lengths, 0);
+    try readNormalCodeLengths(reader, alphabet_size, code_lengths, buffers);
     return huffman.SymbolTable.build(entries, code_lengths);
 }
 
-fn readSimpleCodeLengths(
+const SimpleSymbols = struct {
+    first: u16,
+    second: ?u16,
+};
+
+fn readSimpleSymbols(
     reader: *bit_reader.BitReader,
-    code_lengths: []u8,
-) errors.Error!void {
-    assert(code_lengths.len > 0);
-    assert(code_lengths.len <= huffman.green_alphabet_size_max);
+    alphabet_size: u16,
+) errors.Error!SimpleSymbols {
+    assert(alphabet_size > 0);
+    assert(alphabet_size <= huffman.green_alphabet_size_max);
 
     const symbol_count = @as(u2, try reader.readBit()) + 1;
     const is_first_8bits = try reader.readBit();
     const symbol0_bits: u6 = if (is_first_8bits == 1) 8 else 1;
     const symbol0 = try reader.readBits(symbol0_bits);
-    if (symbol0 >= code_lengths.len) return error.InvalidVP8LImageData;
-    code_lengths[@intCast(symbol0)] = 1;
+    if (symbol0 >= alphabet_size) return error.InvalidVP8LImageData;
 
-    if (symbol_count == 2) {
-        const symbol1 = try reader.readBits(8);
-        if (symbol1 >= code_lengths.len) return error.InvalidVP8LImageData;
-        code_lengths[@intCast(symbol1)] = 1;
-    }
+    const symbol1: ?u16 = if (symbol_count == 2) symbol: {
+        const value = try reader.readBits(8);
+        if (value >= alphabet_size) return error.InvalidVP8LImageData;
+        break :symbol @intCast(value);
+    } else null;
+
+    return .{
+        .first = @intCast(symbol0),
+        .second = symbol1,
+    };
 }
 
 fn readNormalCodeLengths(

@@ -213,6 +213,47 @@ pub fn Table(comptime options: TableOptions) type {
             return self.entries_ptr[0..self.entries_len];
         }
 
+        /// Builds the canonical table for VP8L's compact one/two-symbol encoding.
+        pub fn buildSimple(
+            entries_buffer: []Entry,
+            symbol0: u16,
+            symbol1: ?u16,
+        ) Error!Self {
+            if (entries_buffer.len < root_entry_count) return error.OutputTooLarge;
+            if (symbol0 >= alphabet_size_max) return error.InvalidHuffmanTree;
+
+            const second = symbol1 orelse {
+                return .{
+                    .entries_ptr = entries_buffer.ptr,
+                    .entries_len = 0,
+                    .single_symbol = symbol0,
+                };
+            };
+            if (second >= alphabet_size_max) return error.InvalidHuffmanTree;
+            if (second == symbol0) {
+                return .{
+                    .entries_ptr = entries_buffer.ptr,
+                    .entries_len = 0,
+                    .single_symbol = symbol0,
+                };
+            }
+
+            const symbol_low = @min(symbol0, second);
+            const symbol_high = @max(symbol0, second);
+            const entry_low = Entry.symbol(symbol_low, 1);
+            const entry_high = Entry.symbol(symbol_high, 1);
+            var index: usize = 0;
+            while (index < root_entry_count) : (index += 2) {
+                entries_buffer[index] = entry_low;
+                entries_buffer[index + 1] = entry_high;
+            }
+
+            return .{
+                .entries_ptr = entries_buffer.ptr,
+                .entries_len = root_entry_count,
+            };
+        }
+
         pub fn build(entries_buffer: []Entry, code_lengths: []const u8) Error!Self {
             if (code_lengths.len == 0) return error.InvalidHuffmanTree;
             if (code_lengths.len > alphabet_size_max) return error.InvalidHuffmanTree;
@@ -698,6 +739,27 @@ test "VP8L Huffman table decodes canonical two-symbol codes" {
     buffered_reader.fill();
     try std.testing.expectEqual(@as(u16, 0), try table.decodeBuffered(&buffered_reader));
     try std.testing.expectEqual(@as(u16, 1), try table.decodeBuffered(&buffered_reader));
+}
+
+test "VP8L Huffman simple builder preserves canonical symbol order" {
+    var entries: [SymbolTable.entry_count_limit]Entry = undefined;
+    const table = try SymbolTable.buildSimple(&entries, 42, 7);
+    try std.testing.expectEqual(SymbolTable.root_entry_count_max, table.entriesSlice().len);
+    try std.testing.expectEqual(@as(?u16, null), table.single_symbol);
+
+    const encoded = [_]u8{0b0000_0010};
+    var reader = bit_reader.BitReader.init(&encoded);
+    try std.testing.expectEqual(@as(u16, 7), try table.decode(&reader));
+    try std.testing.expectEqual(@as(u16, 42), try table.decode(&reader));
+
+    const duplicate = try SymbolTable.buildSimple(&entries, 42, 42);
+    try std.testing.expectEqual(@as(?u16, 42), duplicate.single_symbol);
+    try std.testing.expectEqual(@as(usize, 0), duplicate.entriesSlice().len);
+
+    try std.testing.expectError(
+        error.InvalidHuffmanTree,
+        SymbolTable.buildSimple(&entries, SymbolTable.alphabet_size_limit, null),
+    );
 }
 
 test "VP8L Huffman table decodes reversed canonical bit order" {
