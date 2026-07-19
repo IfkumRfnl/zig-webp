@@ -30,8 +30,9 @@ plane over lossy color — byte-exact against `dwebp -pam` for every lossy file,
 including lossy+alpha. The public `decodeStatic` entry point decodes both
 lossless and lossy stills to packed RGBA/BGRA/ARGB/RGB, and `decodeStaticInto`
 performs the same decode into a caller-owned pixel buffer, honoring its stride
-and format. The lossless into path writes reconstructed pixels directly into
-that buffer without allocating or budgeting a second packed output plane.
+and format. For aligned, tightly packed four-byte lossless output, VP8L now
+reconstructs directly in the final storage and converts channel order in place;
+RGB, padded, and unaligned destinations retain the bounded scratch fallback.
 Animated WebP decode is available too: `decodeAnimation`
 returns every composited frame, and
 `AnimationDecoder` streams them one at a time over a reused canvas — both
@@ -95,11 +96,15 @@ geomean** and **0.8208× summed decode time** (Zig/Rust; lower is faster), with
 digest-identical output. VP8L color-cache lookups no longer copy the fixed
 8192-byte cache for each cache symbol; focused cache-heavy lossless stills
 improved by **2.08–3.55×**. VP8L also gained buffered entropy reads, vector/run
-inverse transforms, reduced scratch, direct caller-owned `decodeStaticInto`
-output, and direct palette expansion into compressed `ALPH` planes. The dated
-all-file geomean still favors Rust on many tiny VP8L/ALPH inputs; the aggregate
-lead is a VP8 throughput result, not a universal per-file claim. Decoded bytes
-are unchanged.
+inverse transforms, tighter scratch, compact Huffman setup, fixed-block palette
+expansion, and direct reconstruction into eligible final output storage.
+
+A later three-run, pinned 135-file comparison against Rust `image-webp`
+measured summed Zig/Rust decode-into ratios of **0.9315× lossy opaque**,
+**0.9324× lossy+alpha**, **1.0874× lossless opaque**, and **1.0492×
+lossless+alpha**. Overall summed time was **0.9465×**, but Rust still leads both
+lossless buckets. These are per-class results, not a universal-performance
+claim; exact protocol and rejected experiments are recorded in `PROGRESS.MD`.
 Every public entry point is covered by a limits/malicious-input contract matrix,
 allocation-failure injection (still and animated), encode-side fuzz targets,
 and deterministic bounded mutation exploration of every fuzz seed. Untrusted

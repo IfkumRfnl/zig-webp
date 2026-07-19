@@ -395,7 +395,6 @@ const LosslessWorkingSet = struct {
             if (self.argb_pixels_owned) self.gpa.free(self.argb_pixels);
         }
     }
-
 };
 
 fn decodeLossy(
@@ -731,9 +730,7 @@ fn convertPixelsInPlaceFormat(
     comptime assert(format.channelCount() == 4);
 
     var pixel_index: usize = 0;
-    while (pixel_index + output_vector_pixels <= pixels.len) :
-        (pixel_index += output_vector_pixels)
-    {
+    while (pixel_index + output_vector_pixels <= pixels.len) : (pixel_index += output_vector_pixels) {
         const source: OutputPixelVector =
             pixels[pixel_index..][0..output_vector_pixels].*;
         pixels[pixel_index..][0..output_vector_pixels].* =

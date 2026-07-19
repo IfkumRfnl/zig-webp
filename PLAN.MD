@@ -1159,13 +1159,17 @@ Completed step status and the 1.0.0 release history live in `PROGRESS.MD`.
 The remaining roadmap is post-1.0 **step 13** (C ABI): the design is recorded
 above; implementation remains future work.
 
-Separately from feature step 13, the next post-1.0 VP8L performance plan should
+Separately from feature step 13, the next post-1.0 VP8L performance plan must
 start from codegen/profile evidence for a whole-stream entropy-state redesign
-with a local bit-buffer/table cursor and checked tail. It must require at least
-a **1.20× full-lossless summed-time** improvement before retaining a duplicated
-safety-critical kernel, and must not reopen plan 021's bulk-refill/unchecked
-lookup. Plan 029's completed output-sink result and the subsequent fixed-array
-cache-receiver and table-free single-symbol fixes are recorded in `PROGRESS.MD`.
+with a local bit-buffer/table cursor and checked tail. The 2026-07-18 campaign
+closed local output packing, transform fusion, scratch probing, Huffman root
+width, pair-table, fixed-green, unchecked lookup, and meta-prefix representation
+variants without producing an every-class Rust win. A replacement kernel must
+make both lossless class sums lower than Rust on the pinned 135-file harness,
+improve full-lossless summed time by at least 5%, preserve 135/135 digest
+identity, and keep every unaffected codec control within 1%. It must not reopen
+plan 021's unsafe bulk-refill/unchecked lookup. The completed direct final-output
+reconstruction and exact residual ratios are recorded in `PROGRESS.MD`.
 
 Step 9 (animation and metadata encode) is broken into reviewable slices,
 mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,

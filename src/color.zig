@@ -22,7 +22,6 @@ const assert = std.debug.assert;
 const errors = @import("errors.zig");
 const image = @import("image.zig");
 
-
 // Fixed-point precision for the YUV->RGB conversion (`YUV_FIX2` in libwebp).
 const yuv_fix2 = 6;
 // Mask covering the valid pre-shift range [0, 256 << yuv_fix2); a value with
@@ -241,7 +240,6 @@ inline fn upsampleInteriorPair(comptime format: image.PixelFormat, lines: LinePa
         storePixel(format, sub(lines.bottom_dst.?, 2 * x, channels), bottom_y[2 * x], uv1);
     }
 }
-
 
 // Packs u into the low 16 bits and v into the high 16 bits of a u32.
 inline fn loadUV(u: u8, v: u8) u32 {
