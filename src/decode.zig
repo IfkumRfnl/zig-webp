@@ -19,6 +19,8 @@ const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
 const vp8l_image_data = @import("vp8l/image_data.zig");
+const vp8l_meta_prefix = @import("vp8l/meta_prefix.zig");
+const vp8l_transform = @import("vp8l/transform.zig");
 
 /// Shared demux prologue for the public static decode entry points: parses
 /// the container, rejects animations, and locates the still bitstream. The
@@ -261,13 +263,13 @@ const LosslessWorkingSet = struct {
             &.{};
         const transform_count = try reserveElements(
             vp8l_pixel.Pixel,
-            try transformPixelCapacityForStream(pixel_count, vp8l_stream),
+            try transformPixelCapacityForStream(source.dimensions, vp8l_stream),
             &allocation_bytes,
             decode_options,
         );
         const entropy_count = try reserveElements(
             vp8l_pixel.Pixel,
-            if (pixel_count < 16384) 0 else pixel_count,
+            if (pixel_count < 16384) 0 else try entropyPixelCapacity(source.dimensions),
             &allocation_bytes,
             decode_options,
         );
@@ -514,17 +516,49 @@ fn reserveBytes(
     try decode_options.limits.validateAllocationBytes(allocation_bytes.*);
 }
 
-fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {
-    if (pixel_count > std.math.maxInt(u64) - 257) return error.AllocationLimitExceeded;
-
-    return pixel_count + 257;
+fn blockImagePixelCapacity(
+    dimensions: image.Dimensions,
+    block_bits: u4,
+) errors.Error!u64 {
+    const block_size = @as(u64, 1) << @intCast(block_bits);
+    const width: u64 = dimensions.width;
+    const height: u64 = dimensions.height;
+    const block_width = @divFloor(width, block_size) + @intFromBool(width % block_size != 0);
+    const block_height = @divFloor(height, block_size) + @intFromBool(height % block_size != 0);
+    return std.math.mul(u64, block_width, block_height) catch
+        error.AllocationLimitExceeded;
 }
+
+// Predictor and color are the only block transforms and each kind may occur
+// once. Their minimum block size is 4x4. A color-indexing transform contributes
+// at most 256 pixels and can only shrink the width seen by later transforms, so
+// two block images at the original dimensions plus one table covers every order.
+fn transformPixelCapacity(dimensions: image.Dimensions) errors.Error!u64 {
+    const block_count = try blockImagePixelCapacity(
+        dimensions,
+        vp8l_transform.block_bits_min,
+    );
+    const two_block_images = std.math.mul(u64, block_count, 2) catch
+        return error.AllocationLimitExceeded;
+    return std.math.add(
+        u64,
+        two_block_images,
+        vp8l_transform.color_table_size_max,
+    ) catch error.AllocationLimitExceeded;
+}
+
+// The main image can only be narrower after color indexing. The minimum
+// meta-prefix block size is 4x4, so original dimensions are conservative.
+fn entropyPixelCapacity(dimensions: image.Dimensions) errors.Error!u64 {
+    return blockImagePixelCapacity(dimensions, vp8l_meta_prefix.prefix_bits_min);
+}
+
 fn transformPixelCapacityForStream(
-    pixel_count: u64,
+    dimensions: image.Dimensions,
     stream: []const u8,
 ) errors.Error!u64 {
     if (stream.len > 0 and (stream[0] & 1) == 0) return 0;
-    return transformPixelCapacity(pixel_count);
+    return transformPixelCapacity(dimensions);
 }
 
 fn outputByteLength(
@@ -1251,6 +1285,32 @@ test "decodeStaticInto writes every lossless format without touching slack" {
             }
         }
     }
+}
+
+test "VP8L scratch capacities cover rounded blocks and format maxima" {
+    const rounded = try image.Dimensions.init(5, 9);
+    try std.testing.expectEqual(@as(u64, 6), try entropyPixelCapacity(rounded));
+    try std.testing.expectEqual(@as(u64, 268), try transformPixelCapacity(rounded));
+
+    const maximum = try image.Dimensions.init(
+        vp8l_header.dimension_limit,
+        vp8l_header.dimension_limit,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 16_777_216),
+        try entropyPixelCapacity(maximum),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 33_554_688),
+        try transformPixelCapacity(maximum),
+    );
+
+    const single = try image.Dimensions.init(1, 1);
+    try std.testing.expectEqual(@as(u64, 258), try transformPixelCapacity(single));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        try transformPixelCapacityForStream(single, &.{0}),
+    );
 }
 
 test "lossless decodeStaticInto budgets probed reconstruction scratch" {
