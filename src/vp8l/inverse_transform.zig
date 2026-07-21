@@ -11,6 +11,7 @@ const transform = @import("transform.zig");
 const predictor_mode_count = 14;
 const predictor_black = pixel.fromChannels(255, 0, 0, 0);
 const grouped_color_indexing_pixel_min = 100_000;
+const grouped_color_indexing_green_pixel_min = 100_000;
 
 pub fn applyTransform(
     transform_value: transform.Transform,
@@ -204,6 +205,133 @@ pub fn applyColorTableDeltas(color_table: []pixel.Pixel) void {
         previous = value;
     }
 }
+fn ColorIndexLookup(comptime width_bits: u3, comptime Value: type) type {
+    const values_per_source = @as(usize, 1) << width_bits;
+    return [256][values_per_source]Value;
+}
+
+fn buildColorIndexLookup(
+    comptime width_bits: u3,
+    comptime Value: type,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    comptime valueFromPixel: fn (pixel.Pixel) Value,
+) ColorIndexLookup(width_bits, Value) {
+    comptime assert(width_bits >= 1);
+    comptime assert(width_bits <= 3);
+
+    const values_per_source = @as(usize, 1) << width_bits;
+    const index_bits: u4 = @intCast(@as(u8, 8) >> width_bits);
+    const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
+    var lookup: ColorIndexLookup(width_bits, Value) = undefined;
+    for (0..256) |packed_value| {
+        for (0..values_per_source) |lane| {
+            const shift: u3 = @intCast(lane * index_bits);
+            const color_index = (@as(u8, @intCast(packed_value)) >> shift) & index_mask;
+            lookup[packed_value][lane] = if (color_index < color_table_size)
+                valueFromPixel(color_table[color_index])
+            else
+                std.mem.zeroes(Value);
+        }
+    }
+    return lookup;
+}
+
+fn colorIndexPixel(value: pixel.Pixel) pixel.Pixel {
+    return value;
+}
+
+fn colorIndexGreen(value: pixel.Pixel) u8 {
+    return pixel.green(value);
+}
+
+noinline fn applyColorIndexingTransformGreenFixed(
+    comptime width_bits: u3,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    packed_pixels: []const pixel.Pixel,
+    output: []u8,
+) void {
+    const values_per_source = @as(usize, 1) << width_bits;
+    const lookup = buildColorIndexLookup(
+        width_bits,
+        u8,
+        color_table_size,
+        color_table,
+        colorIndexGreen,
+    );
+    const output_width: usize = @intCast(dimensions.width);
+    const source_width = (output_width + values_per_source - 1) / values_per_source;
+    const full_block_count = output_width / values_per_source;
+    const tail_count = output_width % values_per_source;
+    const height: usize = @intCast(dimensions.height);
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+        var source_x: usize = 0;
+        while (source_x < full_block_count) : (source_x += 1) {
+            const packed_indices = pixel.green(packed_pixels[source_row_start + source_x]);
+            const output_start = output_row_start + source_x * values_per_source;
+            output[output_start..][0..values_per_source].* = lookup[packed_indices];
+        }
+        if (tail_count > 0) {
+            const packed_indices =
+                pixel.green(packed_pixels[source_row_start + full_block_count]);
+            const output_start = output_row_start + full_block_count * values_per_source;
+            @memcpy(output[output_start..][0..tail_count], lookup[packed_indices][0..tail_count]);
+        }
+    }
+}
+
+noinline fn applyColorIndexingTransformFixed(
+    comptime width_bits: u3,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    pixels: []pixel.Pixel,
+) void {
+    const values_per_source = @as(usize, 1) << width_bits;
+    const lookup = buildColorIndexLookup(
+        width_bits,
+        pixel.Pixel,
+        color_table_size,
+        color_table,
+        colorIndexPixel,
+    );
+    const output_width: usize = @intCast(dimensions.width);
+    const source_width = (output_width + values_per_source - 1) / values_per_source;
+    const full_block_count = output_width / values_per_source;
+    const tail_count = output_width % values_per_source;
+    var y: usize = @intCast(dimensions.height);
+
+    while (y > 0) {
+        y -= 1;
+        const source_row_start = y * source_width;
+        const output_row_start = y * output_width;
+
+        if (tail_count > 0) {
+            const packed_indices =
+                pixel.green(pixels[source_row_start + full_block_count]);
+            const output_start = output_row_start + full_block_count * values_per_source;
+            @memcpy(
+                pixels[output_start..][0..tail_count],
+                lookup[packed_indices][0..tail_count],
+            );
+        }
+
+        var source_x = full_block_count;
+        while (source_x > 0) {
+            source_x -= 1;
+            const packed_indices = pixel.green(pixels[source_row_start + source_x]);
+            const output_start = output_row_start + source_x * values_per_source;
+            pixels[output_start..][0..values_per_source].* = lookup[packed_indices];
+        }
+    }
+}
+
 pub fn applyColorIndexingTransformGreen(
     color_indexing: transform.ColorIndexing,
     color_table: []const pixel.Pixel,
@@ -230,6 +358,37 @@ pub fn applyColorIndexingTransformGreen(
         @intCast(@as(u8, 8) >> width_bits);
     const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
     const pixels_per_source: usize = @as(usize, 1) << width_bits;
+
+    if (pixel_count >= grouped_color_indexing_green_pixel_min and width_bits > 0) {
+        switch (width_bits) {
+            1 => applyColorIndexingTransformGreenFixed(
+                1,
+                color_indexing.color_table_size,
+                color_table,
+                dimensions,
+                packed_pixels,
+                output,
+            ),
+            2 => applyColorIndexingTransformGreenFixed(
+                2,
+                color_indexing.color_table_size,
+                color_table,
+                dimensions,
+                packed_pixels,
+                output,
+            ),
+            3 => applyColorIndexingTransformGreenFixed(
+                3,
+                color_indexing.color_table_size,
+                color_table,
+                dimensions,
+                packed_pixels,
+                output,
+            ),
+            else => unreachable,
+        }
+        return;
+    }
 
     if (width_bits > 0) {
         var lookup: [256][8]u8 = undefined;
@@ -313,7 +472,7 @@ pub fn applyColorIndexingTransform(
         @intCast(@as(u8, 8) >> width_bits);
     const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
 
-    if (pixel_count < grouped_color_indexing_pixel_min or width_bits < 2) {
+    if (pixel_count < grouped_color_indexing_pixel_min or width_bits == 0) {
         var output_index: usize = @intCast(pixel_count);
         while (output_index > 0) {
             output_index -= 1;
@@ -338,34 +497,29 @@ pub fn applyColorIndexingTransform(
         return;
     }
 
-    const pixels_per_source: usize = @as(usize, 1) << width_bits;
-    var y: usize = @intCast(dimensions.height);
-    while (y > 0) {
-        y -= 1;
-        const source_row_start = y * source_width;
-        const output_row_start = y * output_width;
-
-        var source_x = source_width;
-        while (source_x > 0) {
-            source_x -= 1;
-            const source_index = source_row_start + source_x;
-            assert(source_index < source_pixel_count);
-            const packed_indices = pixel.green(pixels[source_index]);
-
-            const output_start = source_x * pixels_per_source;
-            const output_end = @min(output_start + pixels_per_source, output_width);
-            var output_x = output_end;
-            while (output_x > output_start) {
-                output_x -= 1;
-                const shift: u3 = @intCast((output_x - output_start) * index_bits);
-                const color_index = (packed_indices >> shift) & index_mask;
-                pixels[output_row_start + output_x] =
-                    if (color_index < color_indexing.color_table_size)
-                        color_table[color_index]
-                    else
-                        pixel.fromChannels(0, 0, 0, 0);
-            }
-        }
+    switch (width_bits) {
+        1 => applyColorIndexingTransformFixed(
+            1,
+            color_indexing.color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        2 => applyColorIndexingTransformFixed(
+            2,
+            color_indexing.color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        3 => applyColorIndexingTransformFixed(
+            3,
+            color_indexing.color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        else => unreachable,
     }
 }
 
@@ -1155,6 +1309,251 @@ test "VP8L inverse color transform validates block metadata and buffers" {
             .image = try image.Dimensions.init(1, 1),
         }, &transform_data, dimensions, &.{}),
     );
+}
+
+fn applyColorIndexingReference(
+    width_bits: u3,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    packed_pixels: []const pixel.Pixel,
+    output_pixels: []pixel.Pixel,
+    output_green: []u8,
+) void {
+    const values_per_source = @as(usize, 1) << width_bits;
+    const index_bits: u4 = @intCast(@as(u8, 8) >> width_bits);
+    const index_mask: u8 = @truncate((@as(u16, 1) << index_bits) - 1);
+    const width: usize = @intCast(dimensions.width);
+    const source_width = (width + values_per_source - 1) / values_per_source;
+    const height: usize = @intCast(dimensions.height);
+
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            const packed_value = pixel.green(packed_pixels[y * source_width + x / values_per_source]);
+            const lane = x % values_per_source;
+            const shift: u3 = @intCast(lane * index_bits);
+            const color_index = (packed_value >> shift) & index_mask;
+            const output_index = y * width + x;
+            if (color_index < color_table_size) {
+                output_pixels[output_index] = color_table[color_index];
+                output_green[output_index] = pixel.green(color_table[color_index]);
+            } else {
+                output_pixels[output_index] = pixel.fromChannels(0, 0, 0, 0);
+                output_green[output_index] = 0;
+            }
+        }
+    }
+}
+
+fn applyColorIndexingFixedForTest(
+    width_bits: u3,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    pixels: []pixel.Pixel,
+) void {
+    switch (width_bits) {
+        1 => applyColorIndexingTransformFixed(
+            1,
+            color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        2 => applyColorIndexingTransformFixed(
+            2,
+            color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        3 => applyColorIndexingTransformFixed(
+            3,
+            color_table_size,
+            color_table,
+            dimensions,
+            pixels,
+        ),
+        else => unreachable,
+    }
+}
+
+fn applyColorIndexingGreenFixedForTest(
+    width_bits: u3,
+    color_table_size: u16,
+    color_table: []const pixel.Pixel,
+    dimensions: image.Dimensions,
+    packed_pixels: []const pixel.Pixel,
+    output: []u8,
+) void {
+    switch (width_bits) {
+        1 => applyColorIndexingTransformGreenFixed(
+            1,
+            color_table_size,
+            color_table,
+            dimensions,
+            packed_pixels,
+            output,
+        ),
+        2 => applyColorIndexingTransformGreenFixed(
+            2,
+            color_table_size,
+            color_table,
+            dimensions,
+            packed_pixels,
+            output,
+        ),
+        3 => applyColorIndexingTransformGreenFixed(
+            3,
+            color_table_size,
+            color_table,
+            dimensions,
+            packed_pixels,
+            output,
+        ),
+        else => unreachable,
+    }
+}
+
+test "VP8L fixed palette blocks match scalar authority across table bands" {
+    const height = 3;
+    const width_max = 256 * 8 + 7;
+    const pixel_count_max = width_max * height;
+    const source_count_max = ((width_max + 7) / 8) * height;
+    var color_table: [16]pixel.Pixel = undefined;
+    for (&color_table, 0..) |*entry, index| {
+        const value: u8 = @intCast(index);
+        entry.* = pixel.fromChannels(value +% 1, value *% 17, value *% 29, value *% 43);
+    }
+
+    var source_pixels: [source_count_max]pixel.Pixel = undefined;
+    var actual: [pixel_count_max]pixel.Pixel = undefined;
+    var expected: [pixel_count_max]pixel.Pixel = undefined;
+    var actual_green: [pixel_count_max]u8 = undefined;
+    var expected_green: [pixel_count_max]u8 = undefined;
+
+    var table_size: u16 = 1;
+    while (table_size <= 16) : (table_size += 1) {
+        const width_bits = colorTableWidthBits(table_size);
+        const values_per_source = @as(usize, 1) << width_bits;
+        const width = 256 * values_per_source + values_per_source - 1;
+        const dimensions = try image.Dimensions.init(@intCast(width), height);
+        const source_width = (width + values_per_source - 1) / values_per_source;
+        const source_count = source_width * height;
+        const pixel_count = width * height;
+
+        for (source_pixels[0..source_count], 0..) |*entry, source_index| {
+            const packed_value: u8 = @truncate(source_index + source_index / source_width * 31);
+            entry.* = pixel.fromChannels(0xaa, 0xbb, packed_value, 0xcc);
+        }
+        @memcpy(actual[0..source_count], source_pixels[0..source_count]);
+        applyColorIndexingReference(
+            width_bits,
+            table_size,
+            &color_table,
+            dimensions,
+            source_pixels[0..source_count],
+            expected[0..pixel_count],
+            expected_green[0..pixel_count],
+        );
+        applyColorIndexingFixedForTest(
+            width_bits,
+            table_size,
+            &color_table,
+            dimensions,
+            actual[0..pixel_count],
+        );
+        applyColorIndexingGreenFixedForTest(
+            width_bits,
+            table_size,
+            &color_table,
+            dimensions,
+            source_pixels[0..source_count],
+            actual_green[0..pixel_count],
+        );
+
+        try expectPixelsEqual(expected[0..pixel_count], actual[0..pixel_count]);
+        try std.testing.expectEqualSlices(
+            u8,
+            expected_green[0..pixel_count],
+            actual_green[0..pixel_count],
+        );
+    }
+}
+
+test "VP8L fixed palette blocks preserve tails and multirow in-place sources" {
+    const height = 2;
+    var color_table: [16]pixel.Pixel = undefined;
+    for (&color_table, 0..) |*entry, index| {
+        const value: u8 = @intCast(index);
+        entry.* = pixel.fromChannels(value, value +% 33, value +% 77, value +% 129);
+    }
+    var source_pixels: [16]pixel.Pixel = undefined;
+    var actual: [64]pixel.Pixel = undefined;
+    var expected: [64]pixel.Pixel = undefined;
+    var actual_green: [64]u8 = undefined;
+    var expected_green: [64]u8 = undefined;
+
+    const table_sizes = [_]u16{ 1, 2, 3, 4, 5, 16 };
+    for (table_sizes) |table_size| {
+        const width_bits = colorTableWidthBits(table_size);
+        const values_per_source = @as(usize, 1) << width_bits;
+        const widths = [_]usize{
+            1,
+            values_per_source - 1,
+            values_per_source,
+            values_per_source + 1,
+            2 * values_per_source - 1,
+            2 * values_per_source,
+            2 * values_per_source + 1,
+        };
+        for (widths) |width| {
+            const dimensions = try image.Dimensions.init(@intCast(width), height);
+            const source_width = (width + values_per_source - 1) / values_per_source;
+            const source_count = source_width * height;
+            const pixel_count = width * height;
+            for (source_pixels[0..source_count], 0..) |*entry, source_index| {
+                const packed_value: u8 = if ((source_index & 1) == 0)
+                    0xff
+                else
+                    @truncate(source_index * 73);
+                entry.* = pixel.fromChannels(1, 2, packed_value, 3);
+            }
+            @memcpy(actual[0..source_count], source_pixels[0..source_count]);
+            applyColorIndexingReference(
+                width_bits,
+                table_size,
+                &color_table,
+                dimensions,
+                source_pixels[0..source_count],
+                expected[0..pixel_count],
+                expected_green[0..pixel_count],
+            );
+            applyColorIndexingFixedForTest(
+                width_bits,
+                table_size,
+                &color_table,
+                dimensions,
+                actual[0..pixel_count],
+            );
+            applyColorIndexingGreenFixedForTest(
+                width_bits,
+                table_size,
+                &color_table,
+                dimensions,
+                source_pixels[0..source_count],
+                actual_green[0..pixel_count],
+            );
+            try expectPixelsEqual(expected[0..pixel_count], actual[0..pixel_count]);
+            try std.testing.expectEqualSlices(
+                u8,
+                expected_green[0..pixel_count],
+                actual_green[0..pixel_count],
+            );
+        }
+    }
 }
 
 test "VP8L inverse color table reconstruction accumulates channel deltas" {

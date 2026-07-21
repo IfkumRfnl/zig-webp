@@ -1,7 +1,9 @@
 //! Public static image decode composition.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
+const native_endian = builtin.cpu.arch.endian();
 
 const alpha = @import("alpha.zig");
 const bit_writer = @import("bit_writer.zig");
@@ -19,6 +21,8 @@ const vp8l_decoder = @import("vp8l/decoder.zig");
 const vp8l_header = @import("vp8l/header.zig");
 const vp8l_pixel = @import("vp8l/pixel.zig");
 const vp8l_image_data = @import("vp8l/image_data.zig");
+const vp8l_meta_prefix = @import("vp8l/meta_prefix.zig");
+const vp8l_transform = @import("vp8l/transform.zig");
 
 /// Shared demux prologue for the public static decode entry points: parses
 /// the container, rejects animations, and locates the still bitstream. The
@@ -161,16 +165,46 @@ fn decodeLosslessWithScratch(
 ) errors.Error!image.OwnedBuffer {
     const dimensions = source.dimensions;
     const output_len = try outputByteLength(dimensions, decode_options.output_format);
+    var allocation_bytes: u64 = 0;
+    const output_count = try reserveElements(
+        u8,
+        output_len,
+        &allocation_bytes,
+        decode_options,
+    );
+    const out = try gpa.alloc(u8, output_count);
+    errdefer gpa.free(out);
 
+    const output_pixels = alignedOutputPixels(out, decode_options.output_format);
     var working_set: LosslessWorkingSet = undefined;
-    try working_set.init(gpa, source, decode_options, output_len, pixel_scratch);
+    if (output_pixels) |pixels| {
+        try working_set.init(
+            gpa,
+            source,
+            decode_options,
+            pixels,
+            output_len,
+            pixel_scratch,
+        );
+    } else {
+        try working_set.init(
+            gpa,
+            source,
+            decode_options,
+            null,
+            output_len,
+            pixel_scratch,
+        );
+    }
     defer working_set.deinit();
 
-    const out = working_set.packed_output.?;
-    writePixels(out, decode_options.output_format, working_set.argb_pixels);
+    if (output_pixels) |pixels| {
+        convertPixelsInPlace(decode_options.output_format, pixels);
+    } else {
+        writePixels(out, decode_options.output_format, working_set.argb_pixels);
+    }
 
     const stride: u32 = @intCast(try rowByteLength(dimensions, decode_options.output_format));
-    _ = working_set.takePackedOutput();
     return .{
         .gpa = gpa,
         .buffer = .{
@@ -212,11 +246,23 @@ fn decodeLosslessIntoWithScratch(
     decode_options: options.DecoderOptions,
     pixel_scratch: []vp8l_pixel.Pixel,
 ) errors.Error!void {
+    const output_pixels = directOutputPixels(dest);
     var working_set: LosslessWorkingSet = undefined;
-    try working_set.init(gpa, source, decode_options, null, pixel_scratch);
+    try working_set.init(
+        gpa,
+        source,
+        decode_options,
+        output_pixels,
+        0,
+        pixel_scratch,
+    );
     defer working_set.deinit();
 
-    writePixelsInto(dest, working_set.argb_pixels);
+    if (output_pixels) |pixels| {
+        convertPixelsInPlace(dest.format, pixels);
+    } else {
+        writePixelsInto(dest, working_set.argb_pixels);
+    }
 }
 
 const LosslessWorkingSet = struct {
@@ -224,16 +270,17 @@ const LosslessWorkingSet = struct {
     pixel_storage: []vp8l_pixel.Pixel,
     pixel_storage_owned: bool,
     argb_pixels: []vp8l_pixel.Pixel,
+    argb_pixels_owned: bool,
     transform_pixels: []vp8l_pixel.Pixel,
     entropy_image: []vp8l_pixel.Pixel,
-    packed_output: ?[]u8,
 
     fn init(
         target: *LosslessWorkingSet,
         gpa: std.mem.Allocator,
         source: ImageSource,
         decode_options: options.DecoderOptions,
-        packed_output_len: ?u64,
+        argb_pixels_external: ?[]vp8l_pixel.Pixel,
+        output_allocation_bytes: u64,
         pixel_scratch: []vp8l_pixel.Pixel,
     ) errors.Error!void {
         target.* = .{
@@ -241,15 +288,25 @@ const LosslessWorkingSet = struct {
             .pixel_storage = &.{},
             .pixel_storage_owned = false,
             .argb_pixels = &.{},
+            .argb_pixels_owned = false,
             .transform_pixels = &.{},
             .entropy_image = &.{},
-            .packed_output = null,
         };
         errdefer target.deinit();
 
         const pixel_count = try source.dimensions.pixelCount();
         var allocation_bytes: u64 = 0;
-        const argb_count = try reserveElements(
+        _ = try reserveElements(
+            u8,
+            output_allocation_bytes,
+            &allocation_bytes,
+            decode_options,
+        );
+        const argb_count = if (argb_pixels_external) |pixels| blk: {
+            if (pixels.len != pixel_count) return error.OutputTooLarge;
+            target.argb_pixels = pixels;
+            break :blk pixels.len;
+        } else try reserveElements(
             vp8l_pixel.Pixel,
             pixel_count,
             &allocation_bytes,
@@ -261,22 +318,18 @@ const LosslessWorkingSet = struct {
             &.{};
         const transform_count = try reserveElements(
             vp8l_pixel.Pixel,
-            try transformPixelCapacityForStream(pixel_count, vp8l_stream),
+            try transformPixelCapacityForStream(source.dimensions, vp8l_stream),
             &allocation_bytes,
             decode_options,
         );
         const entropy_count = try reserveElements(
             vp8l_pixel.Pixel,
-            if (pixel_count < 16384) 0 else pixel_count,
+            if (pixel_count < 16384) 0 else try entropyPixelCapacity(source.dimensions),
             &allocation_bytes,
             decode_options,
         );
-        const packed_output_count: ?usize = if (packed_output_len) |len|
-            try reserveElements(u8, len, &allocation_bytes, decode_options)
-        else
-            null;
 
-        var pixel_storage_count = argb_count;
+        var pixel_storage_count: usize = if (argb_pixels_external == null) argb_count else 0;
         if (transform_count > std.math.maxInt(usize) - pixel_storage_count) {
             return error.AllocationLimitExceeded;
         }
@@ -288,28 +341,32 @@ const LosslessWorkingSet = struct {
 
         if (pixel_storage_count <= pixel_scratch.len) {
             target.pixel_storage = pixel_scratch[0..pixel_storage_count];
-            target.argb_pixels = target.pixel_storage[0..argb_count];
-            const transform_start = argb_count;
+            if (argb_pixels_external == null) {
+                target.argb_pixels = target.pixel_storage[0..argb_count];
+            }
+            const transform_start = if (argb_pixels_external == null) argb_count else 0;
             target.transform_pixels =
                 target.pixel_storage[transform_start..][0..transform_count];
             const entropy_start = transform_start + transform_count;
             target.entropy_image = target.pixel_storage[entropy_start..][0..entropy_count];
         } else if (pixel_count < 16384 and source.bitstream.len >= 128) {
-            target.argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
+            if (argb_pixels_external == null) {
+                target.argb_pixels = try gpa.alloc(vp8l_pixel.Pixel, argb_count);
+                target.argb_pixels_owned = true;
+            }
             target.transform_pixels = try gpa.alloc(vp8l_pixel.Pixel, transform_count);
             target.entropy_image = try gpa.alloc(vp8l_pixel.Pixel, entropy_count);
         } else {
             target.pixel_storage = try gpa.alloc(vp8l_pixel.Pixel, pixel_storage_count);
             target.pixel_storage_owned = true;
-            target.argb_pixels = target.pixel_storage[0..argb_count];
-            const transform_start = argb_count;
+            if (argb_pixels_external == null) {
+                target.argb_pixels = target.pixel_storage[0..argb_count];
+            }
+            const transform_start = if (argb_pixels_external == null) argb_count else 0;
             target.transform_pixels =
                 target.pixel_storage[transform_start..][0..transform_count];
             const entropy_start = transform_start + transform_count;
             target.entropy_image = target.pixel_storage[entropy_start..][0..entropy_count];
-        }
-        if (packed_output_count) |count| {
-            target.packed_output = try gpa.alloc(u8, count);
         }
 
         const allocation_bytes_remaining =
@@ -330,20 +387,13 @@ const LosslessWorkingSet = struct {
     }
 
     fn deinit(self: *LosslessWorkingSet) void {
-        if (self.packed_output) |out| self.gpa.free(out);
         if (self.pixel_storage_owned) {
             self.gpa.free(self.pixel_storage);
         } else if (self.pixel_storage.len == 0) {
             if (self.entropy_image.len > 0) self.gpa.free(self.entropy_image);
             if (self.transform_pixels.len > 0) self.gpa.free(self.transform_pixels);
-            if (self.argb_pixels.len > 0) self.gpa.free(self.argb_pixels);
+            if (self.argb_pixels_owned) self.gpa.free(self.argb_pixels);
         }
-    }
-
-    fn takePackedOutput(self: *LosslessWorkingSet) []u8 {
-        const out = self.packed_output.?;
-        self.packed_output = null;
-        return out;
     }
 };
 
@@ -514,17 +564,49 @@ fn reserveBytes(
     try decode_options.limits.validateAllocationBytes(allocation_bytes.*);
 }
 
-fn transformPixelCapacity(pixel_count: u64) errors.Error!u64 {
-    if (pixel_count > std.math.maxInt(u64) - 257) return error.AllocationLimitExceeded;
-
-    return pixel_count + 257;
+fn blockImagePixelCapacity(
+    dimensions: image.Dimensions,
+    block_bits: u4,
+) errors.Error!u64 {
+    const block_size = @as(u64, 1) << @intCast(block_bits);
+    const width: u64 = dimensions.width;
+    const height: u64 = dimensions.height;
+    const block_width = @divFloor(width, block_size) + @intFromBool(width % block_size != 0);
+    const block_height = @divFloor(height, block_size) + @intFromBool(height % block_size != 0);
+    return std.math.mul(u64, block_width, block_height) catch
+        error.AllocationLimitExceeded;
 }
+
+// Predictor and color are the only block transforms and each kind may occur
+// once. Their minimum block size is 4x4. A color-indexing transform contributes
+// at most 256 pixels and can only shrink the width seen by later transforms, so
+// two block images at the original dimensions plus one table covers every order.
+fn transformPixelCapacity(dimensions: image.Dimensions) errors.Error!u64 {
+    const block_count = try blockImagePixelCapacity(
+        dimensions,
+        vp8l_transform.block_bits_min,
+    );
+    const two_block_images = std.math.mul(u64, block_count, 2) catch
+        return error.AllocationLimitExceeded;
+    return std.math.add(
+        u64,
+        two_block_images,
+        vp8l_transform.color_table_size_max,
+    ) catch error.AllocationLimitExceeded;
+}
+
+// The main image can only be narrower after color indexing. The minimum
+// meta-prefix block size is 4x4, so original dimensions are conservative.
+fn entropyPixelCapacity(dimensions: image.Dimensions) errors.Error!u64 {
+    return blockImagePixelCapacity(dimensions, vp8l_meta_prefix.prefix_bits_min);
+}
+
 fn transformPixelCapacityForStream(
-    pixel_count: u64,
+    dimensions: image.Dimensions,
     stream: []const u8,
 ) errors.Error!u64 {
     if (stream.len > 0 and (stream[0] & 1) == 0) return 0;
-    return transformPixelCapacity(pixel_count);
+    return transformPixelCapacity(dimensions);
 }
 
 fn outputByteLength(
@@ -548,6 +630,30 @@ fn rowByteLength(
     if (row_bytes > std.math.maxInt(u32)) return error.OutputTooLarge;
 
     return row_bytes;
+}
+
+fn alignedOutputPixels(
+    out: []u8,
+    format: image.PixelFormat,
+) ?[]vp8l_pixel.Pixel {
+    if (format.channelCount() != @sizeOf(vp8l_pixel.Pixel)) return null;
+    if (out.len % @sizeOf(vp8l_pixel.Pixel) != 0) return null;
+    if (@intFromPtr(out.ptr) % @alignOf(vp8l_pixel.Pixel) != 0) return null;
+
+    const aligned: []align(@alignOf(vp8l_pixel.Pixel)) u8 = @alignCast(out);
+    return std.mem.bytesAsSlice(vp8l_pixel.Pixel, aligned);
+}
+
+fn directOutputPixels(dest: image.Buffer) ?[]vp8l_pixel.Pixel {
+    if (dest.format.channelCount() != @sizeOf(vp8l_pixel.Pixel)) return null;
+
+    const row_bytes = @as(u64, dest.dimensions.width) * @sizeOf(vp8l_pixel.Pixel);
+    if (dest.stride != row_bytes) return null;
+    const output_len_u64 = row_bytes * @as(u64, dest.dimensions.height);
+    if (output_len_u64 > dest.pixels.len) return null;
+    const output_len: usize = @intCast(output_len_u64);
+
+    return alignedOutputPixels(dest.pixels[0..output_len], dest.format);
 }
 
 fn writePixels(
@@ -596,25 +702,88 @@ fn writeRgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void 
     }
 }
 
-fn writeRgbaRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
-    const width: usize = @intCast(dest.dimensions.width);
-    const stride: usize = @intCast(dest.stride);
-    var y: usize = 0;
-    while (y < dest.dimensions.height) : (y += 1) {
-        const source_row = argb_pixels[y * width ..][0..width];
-        const target_row = dest.pixels[y * stride ..][0 .. width * 4];
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.red(value);
-            target_row[x * 4 + 1] = vp8l_pixel.green(value);
-            target_row[x * 4 + 2] = vp8l_pixel.blue(value);
-            target_row[x * 4 + 3] = vp8l_pixel.alpha(value);
-        }
+const output_vector_pixels = 8;
+const OutputPixelVector = @Vector(output_vector_pixels, vp8l_pixel.Pixel);
+
+fn convertPixelsInPlace(
+    format: image.PixelFormat,
+    pixels: []vp8l_pixel.Pixel,
+) void {
+    if (comptime native_endian == .little) {
+        if (format == .bgra) return;
+    } else {
+        if (format == .argb) return;
     }
+
+    switch (format) {
+        .rgba => convertPixelsInPlaceFormat(.rgba, pixels),
+        .bgra => convertPixelsInPlaceFormat(.bgra, pixels),
+        .argb => convertPixelsInPlaceFormat(.argb, pixels),
+        .rgb => unreachable,
+    }
+}
+
+fn convertPixelsInPlaceFormat(
+    comptime format: image.PixelFormat,
+    pixels: []vp8l_pixel.Pixel,
+) void {
+    comptime assert(format.channelCount() == 4);
+
+    var pixel_index: usize = 0;
+    while (pixel_index + output_vector_pixels <= pixels.len) : (pixel_index += output_vector_pixels) {
+        const source: OutputPixelVector =
+            pixels[pixel_index..][0..output_vector_pixels].*;
+        pixels[pixel_index..][0..output_vector_pixels].* =
+            packOutputPixels(format, source);
+    }
+    while (pixel_index < pixels.len) : (pixel_index += 1) {
+        pixels[pixel_index] = packOutputPixel(format, pixels[pixel_index]);
+    }
+}
+
+fn packOutputPixel(
+    comptime format: image.PixelFormat,
+    source: vp8l_pixel.Pixel,
+) vp8l_pixel.Pixel {
+    comptime assert(format.channelCount() == 4);
+
+    if (comptime native_endian == .little) {
+        return switch (format) {
+            .rgba => (source & 0xff00_ff00) |
+                ((source & 0x00ff_0000) >> 16) |
+                ((source & 0x0000_00ff) << 16),
+            .bgra => source,
+            .argb => @byteSwap(source),
+            .rgb => comptime unreachable,
+        };
+    }
+    return switch (format) {
+        .rgba => (source << 8) | (source >> 24),
+        .bgra => @byteSwap(source),
+        .argb => source,
+        .rgb => comptime unreachable,
+    };
+}
+
+fn writeRgbaRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
+    writeFourByteRows(.rgba, dest, argb_pixels);
 }
 
 fn writeBgraRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
+    writeFourByteRows(.bgra, dest, argb_pixels);
+}
+
+fn writeArgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
+    writeFourByteRows(.argb, dest, argb_pixels);
+}
+
+fn writeFourByteRows(
+    comptime format: image.PixelFormat,
+    dest: image.Buffer,
+    argb_pixels: []const vp8l_pixel.Pixel,
+) void {
+    comptime assert(format.channelCount() == 4);
+
     const width: usize = @intCast(dest.dimensions.width);
     const stride: usize = @intCast(dest.stride);
     var y: usize = 0;
@@ -622,32 +791,52 @@ fn writeBgraRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void
         const source_row = argb_pixels[y * width ..][0..width];
         const target_row = dest.pixels[y * stride ..][0 .. width * 4];
         var x: usize = 0;
+        while (x + output_vector_pixels <= width) : (x += output_vector_pixels) {
+            const source: OutputPixelVector =
+                source_row[x..][0..output_vector_pixels].*;
+            const packed_pixels = packOutputPixels(format, source);
+            @memcpy(
+                target_row[x * 4 ..][0 .. output_vector_pixels * 4],
+                std.mem.asBytes(&packed_pixels),
+            );
+        }
         while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.blue(value);
-            target_row[x * 4 + 1] = vp8l_pixel.green(value);
-            target_row[x * 4 + 2] = vp8l_pixel.red(value);
-            target_row[x * 4 + 3] = vp8l_pixel.alpha(value);
+            writePixel(target_row[x * 4 ..][0..4], format, source_row[x]);
         }
     }
 }
 
-fn writeArgbRows(dest: image.Buffer, argb_pixels: []const vp8l_pixel.Pixel) void {
-    const width: usize = @intCast(dest.dimensions.width);
-    const stride: usize = @intCast(dest.stride);
-    var y: usize = 0;
-    while (y < dest.dimensions.height) : (y += 1) {
-        const source_row = argb_pixels[y * width ..][0..width];
-        const target_row = dest.pixels[y * stride ..][0 .. width * 4];
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const value = source_row[x];
-            target_row[x * 4] = vp8l_pixel.alpha(value);
-            target_row[x * 4 + 1] = vp8l_pixel.red(value);
-            target_row[x * 4 + 2] = vp8l_pixel.green(value);
-            target_row[x * 4 + 3] = vp8l_pixel.blue(value);
-        }
+fn packOutputPixels(
+    comptime format: image.PixelFormat,
+    source: OutputPixelVector,
+) OutputPixelVector {
+    comptime assert(format.channelCount() == 4);
+
+    const eight: @Vector(output_vector_pixels, u5) = @splat(8);
+    const sixteen: @Vector(output_vector_pixels, u5) = @splat(16);
+    const twenty_four: @Vector(output_vector_pixels, u5) = @splat(24);
+    const byte_swapped =
+        ((source & @as(OutputPixelVector, @splat(0xff00_0000))) >> twenty_four) |
+        ((source & @as(OutputPixelVector, @splat(0x00ff_0000))) >> eight) |
+        ((source & @as(OutputPixelVector, @splat(0x0000_ff00))) << eight) |
+        ((source & @as(OutputPixelVector, @splat(0x0000_00ff))) << twenty_four);
+
+    if (comptime native_endian == .little) {
+        return switch (format) {
+            .rgba => (source & @as(OutputPixelVector, @splat(0xff00_ff00))) |
+                ((source & @as(OutputPixelVector, @splat(0x00ff_0000))) >> sixteen) |
+                ((source & @as(OutputPixelVector, @splat(0x0000_00ff))) << sixteen),
+            .bgra => source,
+            .argb => byte_swapped,
+            .rgb => comptime unreachable,
+        };
     }
+    return switch (format) {
+        .rgba => (source << eight) | (source >> twenty_four),
+        .bgra => byte_swapped,
+        .argb => source,
+        .rgb => comptime unreachable,
+    };
 }
 
 fn writePixel(out: []u8, format: image.PixelFormat, value: vp8l_pixel.Pixel) void {
@@ -1253,6 +1442,132 @@ test "decodeStaticInto writes every lossless format without touching slack" {
     }
 }
 
+test "four-byte row vectors match scalar conversion exhaustively" {
+    const formats = [_]image.PixelFormat{ .rgba, .bgra, .argb };
+    const widths = [_]u32{ 1, 7, 8, 9, 15, 16, 17 };
+    const sentinel: u8 = 0xa5;
+
+    inline for (formats) |format| {
+        for (widths) |width| {
+            const dimensions = try image.Dimensions.init(width, 2);
+            const width_usize: usize = @intCast(width);
+            const row_bytes = width_usize * 4;
+            const stride = row_bytes + 5;
+            var alpha_value: u16 = 0;
+            while (alpha_value <= 255) : (alpha_value += 1) {
+                var source: [17 * 2]vp8l_pixel.Pixel = undefined;
+                for (source[0 .. width_usize * 2], 0..) |*pixel, pixel_index| {
+                    pixel.* = vp8l_pixel.fromChannels(
+                        @intCast(alpha_value),
+                        @truncate(pixel_index * 73 + alpha_value),
+                        @truncate(pixel_index * 29 + alpha_value * 3),
+                        @truncate(pixel_index * 11 + alpha_value * 7),
+                    );
+                }
+
+                var expected: [17 * 2 * 4]u8 = undefined;
+                writePixels(
+                    expected[0 .. row_bytes * 2],
+                    format,
+                    source[0 .. width_usize * 2],
+                );
+
+                var in_place = source;
+                const in_place_pixels = in_place[0 .. width_usize * 2];
+                convertPixelsInPlace(format, in_place_pixels);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected[0 .. row_bytes * 2],
+                    std.mem.sliceAsBytes(in_place_pixels),
+                );
+
+                var storage: [1 + (17 * 4 + 5) * 2 + 7]u8 = @splat(sentinel);
+                const target = storage[1..][0 .. stride * 2 + 7];
+                writeFourByteRows(format, .{
+                    .pixels = target,
+                    .dimensions = dimensions,
+                    .stride = @intCast(stride),
+                    .format = format,
+                }, source[0 .. width_usize * 2]);
+
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected[0..row_bytes],
+                    target[0..row_bytes],
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected[row_bytes .. row_bytes * 2],
+                    target[stride..][0..row_bytes],
+                );
+                for (target[row_bytes..stride]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
+                for (target[stride + row_bytes .. stride * 2]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
+
+                for (target[stride * 2 ..]) |byte| {
+                    try std.testing.expectEqual(sentinel, byte);
+                }
+            }
+        }
+    }
+}
+
+test "direct VP8L output requires tight aligned four-byte storage" {
+    const dimensions = try image.Dimensions.init(2, 1);
+    var storage: [2 * 4 + 7]u8 align(@alignOf(vp8l_pixel.Pixel)) = undefined;
+
+    const eligible = image.Buffer{
+        .pixels = &storage,
+        .dimensions = dimensions,
+        .stride = 2 * 4,
+        .format = .rgba,
+    };
+    const pixels = directOutputPixels(eligible) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), pixels.len);
+
+    var padded = eligible;
+    padded.stride += 4;
+    try std.testing.expectEqual(null, directOutputPixels(padded));
+
+    var rgb = eligible;
+    rgb.format = .rgb;
+    rgb.stride = 2 * 3;
+    try std.testing.expectEqual(null, directOutputPixels(rgb));
+
+    var unaligned = eligible;
+    unaligned.pixels = storage[1..];
+    try std.testing.expectEqual(null, directOutputPixels(unaligned));
+}
+
+test "VP8L scratch capacities cover rounded blocks and format maxima" {
+    const rounded = try image.Dimensions.init(5, 9);
+    try std.testing.expectEqual(@as(u64, 6), try entropyPixelCapacity(rounded));
+    try std.testing.expectEqual(@as(u64, 268), try transformPixelCapacity(rounded));
+
+    const maximum = try image.Dimensions.init(
+        vp8l_header.dimension_limit,
+        vp8l_header.dimension_limit,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 16_777_216),
+        try entropyPixelCapacity(maximum),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 33_554_688),
+        try transformPixelCapacity(maximum),
+    );
+
+    const single = try image.Dimensions.init(1, 1);
+    try std.testing.expectEqual(@as(u64, 258), try transformPixelCapacity(single));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        try transformPixelCapacityForStream(single, &.{0}),
+    );
+}
+
 test "lossless decodeStaticInto budgets probed reconstruction scratch" {
     const dimensions = try image.Dimensions.init(8, 8);
     var vp8l_payload: [32]u8 = undefined;
@@ -1270,33 +1585,31 @@ test "lossless decodeStaticInto budgets probed reconstruction scratch" {
     defer std.testing.allocator.free(encoded);
 
     const pixel_count = try dimensions.pixelCount();
-    // The stream's transform-present bit is clear, it uses the inline single
-    // prefix group, and the image is below the entropy scratch threshold.
-    // The only budgeted reconstruction storage is one ARGB word per pixel.
-    // At 8x8 this also exceeds the demuxer's temporary chunk-list capacity.
-    const scratch_bytes = pixel_count * @sizeOf(vp8l_pixel.Pixel);
-    var dest_pixels: [8 * 8 * 4]u8 = undefined;
+    // Force the bounded fallback with a provably unaligned caller buffer. This
+    // keeps the allocation boundary about reconstruction scratch on every
+    // target instead of depending on the platform's stack alignment.
+    const output_bytes = pixel_count * @sizeOf(vp8l_pixel.Pixel);
+    var dest_storage: [8 * 8 * 4 + 1]u8 align(@alignOf(vp8l_pixel.Pixel)) = undefined;
     const dest = image.Buffer{
-        .pixels = &dest_pixels,
+        .pixels = dest_storage[1..],
         .dimensions = dimensions,
         .stride = 8 * 4,
         .format = .rgba,
     };
 
     try decodeStaticInto(std.testing.allocator, encoded, dest, .{
-        .limits = .{ .allocation_bytes_max = scratch_bytes },
+        .limits = .{ .allocation_bytes_max = output_bytes },
     });
     try std.testing.expectError(error.AllocationLimitExceeded, decodeStaticInto(
         std.testing.allocator,
         encoded,
         dest,
-        .{ .limits = .{ .allocation_bytes_max = scratch_bytes - 1 } },
+        .{ .limits = .{ .allocation_bytes_max = output_bytes - 1 } },
     ));
-    try std.testing.expectError(error.AllocationLimitExceeded, decodeStatic(
-        std.testing.allocator,
-        encoded,
-        .{ .limits = .{ .allocation_bytes_max = scratch_bytes } },
-    ));
+    var decoded = try decodeStatic(std.testing.allocator, encoded, .{
+        .limits = .{ .allocation_bytes_max = output_bytes },
+    });
+    decoded.deinit();
 }
 
 test "lossless decodeStaticInto survives allocation failure at every site" {

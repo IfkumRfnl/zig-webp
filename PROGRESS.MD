@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-15
+Last updated: 2026-07-18
 
 ## Current Position
 
@@ -135,6 +135,59 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-18 — Rust comparison campaign and direct VP8L reconstruction
+
+Six byte-exact changes were retained after alternating, CPU-pinned
+baseline/candidate gates:
+
+- VP8L scratch capacity is tighter, simple Huffman tables avoid unnecessary
+  setup, fixed-size palette blocks expand through bounded lookup kernels, and
+  four-byte packed output uses vector conversion.
+- Four-channel VP8 color conversion uses a scalar kernel that compiled faster
+  than the prior generic vector expression while preserving the scalar RGB
+  path and all 135/135 decoded digests.
+- The largest VP8L change removes the separate numeric ARGB reconstruction
+  allocation when final storage is aligned, tightly packed, and four bytes per
+  pixel. Entropy decode and inverse transforms run directly in that storage,
+  followed by an in-place channel-order conversion. Owned output uses the same
+  path when its actual allocation is suitably aligned; RGB, padded, and
+  unaligned caller buffers retain the original bounded fallback.
+
+The direct-storage A/B improved `lossless_big_random_alpha.webp` by **11.5%**
+for allocating decode and **8.7%** for `decodeStaticInto`. Across
+`lossless1.webp` through `lossless4.webp`, summed medians improved **43.7%**
+allocating and **62.3%** caller-owned. The 149-row committed corpus digest was
+byte-identical; focused alignment, stride, tail, format, allocation-limit, and
+in-place/scalar-authority tests passed.
+
+**Final Rust comparison.** Linux x86_64, one pinned AMD EPYC 7663 core,
+ReleaseFast, Zig 0.16.0, Rust 1.96.1, `image-webp` `f4d80bd`, 25 samples, 3
+warmups, 3000 ms per file. Three independent 135-file reports validated
+**135/135** digest-identical stills with **0 skips**. Each file uses the median
+of the three reported medians before class aggregation:
+
+| codec / alpha | files | Zig wins | geomean Zig/Rust | summed Zig/Rust |
+| --- | ---: | ---: | ---: | ---: |
+| lossy / opaque | 70 | 39 | **0.9637×** | **0.9315×** |
+| lossy / alpha | 18 | 16 | **0.8798×** | **0.9324×** |
+| lossless / opaque | 24 | 3 | 1.2173× | 1.0874× |
+| lossless / alpha | 23 | 4 | 1.1820× | 1.0492× |
+
+All classes together used **1064.3992 ms** in Zig versus **1124.5729 ms** in
+Rust (**0.9465×**, 5.35% less summed time). The requested every-class Rust win
+was **not** reached: lossless opaque remains 8.74% slower by summed time and
+lossless+alpha 4.92% slower. The latter residual is almost entirely
+`lossless_big_random_alpha.webp` (116.5339 ms versus 110.8448 ms).
+
+Rejected, fully reverted candidates included adaptive/wider and paired Huffman
+tables, infallible and fixed-green decode specializations, meta-prefix u16 and
+unchecked lookup paths, literal/copy/cache variants, fused subtract-green
+output, arithmetic/byte-shuffle/SSSE3 reorder kernels, exact prefix scratch
+probing, and constant-channel specialization. Several removed branches or
+memory passes in assembly but failed alternating performance gates or regressed
+controls. Further work should start from a whole-stream entropy-state redesign,
+not another local table-width or output-pack variant.
 
 ### 2026-07-15 — Full-edge VP8 SIMD and caller-owned VP8L alpha output
 

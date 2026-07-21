@@ -18,6 +18,13 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
   same-machine QEMU baselines at `29be0df` measured Debug 18m24s vs
   ReleaseSafe 4m23s (unsharded) and 215s (~3m35s) sharded; PR #97's
   big-endian CI job passed in 3m9s.
+- VP8L reconstructs directly into aligned, tightly packed four-byte final
+  output storage and converts channel order in place, avoiding a full ARGB
+  scratch allocation and copy. RGB, padded, and unaligned destinations retain
+  the bounded fallback.
+- Lossless decode also uses tighter scratch bounds, cheaper simple-Huffman
+  setup, fixed-block palette expansion, and vector four-byte conversion; lossy
+  four-channel color conversion uses a faster byte-exact scalar kernel.
 
 ## [1.0.0] — 2026-07-08
 
