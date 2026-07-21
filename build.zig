@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
             .name = "zig-webp-encode-lossy-report",
             .source = "tools/zig-webp-encode-lossy-report.zig",
             .step = "encode-lossy-report",
-            .description = "Report lossy (VP8) encoder size + luma PSNR over the encode corpus",
+            .description = "Report lossy (VP8) encoder size + luma PSNR/SSIM over the encode corpus",
             .install = false,
             .cwd_repo_root = true,
         },
