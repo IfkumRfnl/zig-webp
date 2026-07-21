@@ -14,6 +14,9 @@
 
 ## Status
 
+- **Execution status**: REJECTED — missed the `< 1.40×` `lossless2`/`lossless3`
+  oracle gate at 1.4550× and grew the 77-source aggregate to 1.0018×;
+  production source reverted. See the 2026-07-21 record in `PROGRESS.MD`.
 - **Priority**: P2
 - **Effort**: L
 - **Risk**: MED (encoder output changes by design; round-trip exactness and size-regression gates protect it)
