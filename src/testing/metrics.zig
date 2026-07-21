@@ -96,8 +96,8 @@ const ssim_c2: f64 = (0.03 * 255.0) * (0.03 * 255.0);
 /// RGB(A) buffers.
 ///
 /// Implements textbook Wang et al. 2004 with a uniform box window — **not**
-/// libwebp's Gaussian-kernel SSIM (`cwebp -print_ssim`). Numbers from this
-/// function are an internal encoder A/B axis only; they are not directly
+/// libwebp's different weighted SSIM variant (`cwebp -print_ssim`). Numbers
+/// from this function are an internal encoder A/B axis only; they are not
 /// comparable to cwebp's reported SSIM.
 ///
 /// Windowing: when both `width` and `height` are ≥ 8, mean SSIM over every
