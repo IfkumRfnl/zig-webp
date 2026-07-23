@@ -3,7 +3,7 @@
 `zig-webp` is a zero-dependency, Zig-only WebP implementation targeting Zig
 0.16.0.
 
-Version `1.0.0` (Tier-1 public API frozen and semver-governed). See
+Version `1.0.1` (Tier-1 public API frozen and semver-governed). See
 [`CHANGELOG.MD`](CHANGELOG.MD) for the release scope and
 [`RELEASING.MD`](RELEASING.MD) for the release gates and how each is checked.
 
