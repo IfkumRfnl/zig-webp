@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-18
+Last updated: 2026-07-21
 
 ## Current Position
 
@@ -111,7 +111,8 @@ the synthetic matrix from `src/testing/synth.zig` (edge dimensions, content,
 and alpha cases, generated at test time) and the committed CC0 photographs in
 `testdata/photos/` (decoded to pristine pixels). No hashes are needed — for
 lossless the source pixels are the oracle. `src/testing/metrics.zig` provides
-MSE/PSNR helpers for the lossy quality gates. The `zig build encode-report` tool
+MSE/PSNR helpers for the lossy quality gates, plus windowed luma SSIM for
+internal A/B reporting (not gated; not cwebp-comparable). The `zig build encode-report` tool
 prints encoded size, bits-per-pixel, and the round-trip verdict per source
 (committed baseline `testdata/encode-corpus-sizes.tsv`), and
 `tools/webp-oracle.sh compare-encode-corpus REPORT.tsv` pairs those sizes against
@@ -135,6 +136,22 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-21 — Windowed luma SSIM on the lossy encode report
+
+`src/testing/metrics.zig` gained textbook Wang et al. 2004 luma SSIM
+(`ssimLuma`: BT.601 luma, 8×8 box windows on a stride-4 grid when both
+extents are ≥ 8, otherwise one whole-image window; population variance /
+covariance). This is an internal encoder A/B axis only — **not** comparable
+to `cwebp -print_ssim` (different kernel). The step-8b matched-size PSNR gate
+(+0.08 dB vs `cwebp -q 75 -m 4` on the photo-only harness) is unchanged.
+
+`zig build encode-lossy-report` now appends a `luma_ssim` column and prints
+mean SSIM in the stderr summary. The PSNR mean divides by a separate
+finite-row count (the historical "37.13 dB" headline divided the finite-only
+sum by all 34 sources). First numbers on the unchanged 34-source corpus at
+q75: **mean luma SSIM 0.989985**; **mean luma PSNR 42.08 dB over 30 finite
+rows** (34 total sources, 4 with `inf` PSNR / exact SSIM 1.0).
 
 ### 2026-07-18 — Rust comparison campaign and direct VP8L reconstruction
 

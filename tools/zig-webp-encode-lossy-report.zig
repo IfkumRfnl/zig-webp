@@ -6,9 +6,12 @@
 //! For each source it encodes with the step 8a baseline encoder at a fixed
 //! quality, decodes the result back, and emits a TSV row: family, name,
 //! dimensions, source format, raw pixel bytes, encoded bytes, bits-per-pixel,
-//! and BT.601 luma PSNR (the metric the step 8b quality gate will use). Size is
-//! reported, not gated; the values feed the `compare-encode-lossy` oracle and
-//! the PROGRESS.MD oracle row.
+//! BT.601 luma PSNR (the metric the step 8b quality gate uses), and textbook
+//! windowed luma SSIM (an internal A/B axis; not comparable to
+//! `cwebp -print_ssim`). Size and SSIM are reported, not gated. This is a
+//! human/internal A/B report for PROGRESS.MD notes; it does **not** feed
+//! `tools/webp-oracle.sh compare-encode-lossy`, which walks a corpus directory
+//! and pairs sizes against `cwebp` on its own.
 //!
 //! Usage: zig-webp-encode-lossy-report [--with-corpus] [OUTPUT.tsv]
 //! With no OUTPUT.tsv the report goes to stdout.
@@ -34,9 +37,11 @@ const report_limits = webp.ResourceLimits{
 
 const Stats = struct {
     sources: u32 = 0,
+    finite_psnr_sources: u32 = 0,
     raw_bytes: u64 = 0,
     encoded_bytes: u64 = 0,
     luma_psnr_sum: f64 = 0,
+    luma_ssim_sum: f64 = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -52,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             ctx.usageError(
                 "usage: zig-webp-encode-lossy-report [--with-corpus] [OUTPUT.tsv]\n" ++
-                    "Reports the lossy (VP8) encoder's size and PSNR over the encode corpus.\n",
+                    "Reports the lossy (VP8) encoder's size, PSNR, and SSIM over the encode corpus.\n",
             );
         }
     }
@@ -60,8 +65,8 @@ pub fn main(init: std.process.Init) !void {
     var report: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer report.deinit();
     try report.writer.print(
-        "# zig-webp lossy (VP8) encode report at quality {d}: size and luma PSNR per source.\n" ++
-            "family\tname\twidth\theight\tformat\traw_bytes\tencoded_bytes\tbpp\tluma_psnr_db\n",
+        "# zig-webp lossy (VP8) encode report at quality {d}: size, luma PSNR, and luma SSIM per source.\n" ++
+            "family\tname\twidth\theight\tformat\traw_bytes\tencoded_bytes\tbpp\tluma_psnr_db\tluma_ssim\n",
         .{quality},
     );
 
@@ -84,15 +89,19 @@ pub fn main(init: std.process.Init) !void {
         try ctx.writeStdout(report.written());
     }
 
-    const mean_psnr: f64 = if (stats.sources == 0)
+    const mean_psnr: f64 = if (stats.finite_psnr_sources == 0)
         0
     else
-        stats.luma_psnr_sum / @as(f64, @floatFromInt(stats.sources));
-    var summary_buffer: [256]u8 = undefined;
+        stats.luma_psnr_sum / @as(f64, @floatFromInt(stats.finite_psnr_sources));
+    const mean_ssim: f64 = if (stats.sources == 0)
+        0
+    else
+        stats.luma_ssim_sum / @as(f64, @floatFromInt(stats.sources));
+    var summary_buffer: [384]u8 = undefined;
     const summary = try std.fmt.bufPrint(
         &summary_buffer,
-        "encode-lossy-report: {d} sources, {d} -> {d} bytes, mean luma PSNR {d:.2} dB\n",
-        .{ stats.sources, stats.raw_bytes, stats.encoded_bytes, mean_psnr },
+        "encode-lossy-report: {d} sources ({d} finite PSNR), {d} -> {d} bytes, mean luma PSNR {d:.2} dB, mean luma SSIM {d:.6}\n",
+        .{ stats.sources, stats.finite_psnr_sources, stats.raw_bytes, stats.encoded_bytes, mean_psnr, mean_ssim },
     );
     try ctx.writeStderr(summary);
 }
@@ -140,7 +149,8 @@ fn reportWebpDir(
 }
 
 /// Encodes `buffer` lossily at the fixed quality, decodes it back to RGBA, and
-/// writes one TSV row with the encoded size and luma PSNR versus the source.
+/// writes one TSV row with the encoded size, luma PSNR, and luma SSIM versus
+/// the source.
 fn reportBuffer(
     writer: *std.Io.Writer,
     gpa: std.mem.Allocator,
@@ -173,20 +183,32 @@ fn reportBuffer(
     else
         @as(f64, @floatFromInt(encoded.len * 8)) / @as(f64, @floatFromInt(pixel_count));
     const luma_psnr = webp.testing.metrics.psnrLuma(source_rgba, decoded.buffer.pixels, 4);
+    const luma_ssim = webp.testing.metrics.ssimLuma(
+        source_rgba,
+        decoded.buffer.pixels,
+        width,
+        height,
+        4,
+    );
 
     stats.sources += 1;
     stats.raw_bytes += raw_bytes;
     stats.encoded_bytes += encoded.len;
-    if (!std.math.isInf(luma_psnr)) stats.luma_psnr_sum += luma_psnr;
+    stats.luma_ssim_sum += luma_ssim;
+    if (!std.math.isInf(luma_psnr)) {
+        stats.luma_psnr_sum += luma_psnr;
+        stats.finite_psnr_sources += 1;
+    }
 
     try writer.print("{s}\t{s}\t{d}\t{d}\t{s}\t{d}\t{d}\t{d:.4}\t", .{
         family, name, width, height, formatName(buffer.format), raw_bytes, encoded.len, bpp,
     });
     if (std.math.isInf(luma_psnr)) {
-        try writer.writeAll("inf\n");
+        try writer.writeAll("inf\t");
     } else {
-        try writer.print("{d:.3}\n", .{luma_psnr});
+        try writer.print("{d:.3}\t", .{luma_psnr});
     }
+    try writer.print("{d:.6}\n", .{luma_ssim});
 }
 
 /// Packs an image buffer of any supported format into tightly packed RGBA.
