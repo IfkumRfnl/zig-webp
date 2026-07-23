@@ -45,7 +45,8 @@ wasm32-wasi under wasmtime (`zig build test -Dtarget=wasm32-wasi
 library for wasm32-wasi and wasm32-freestanding plus the wasi unit tests.
 The library is thread-compatible: no global mutable state, so
 distinct decode/encode jobs may run on distinct threads. Internal
-parallelism is deferred to step 10.
+parallelism is a step 14 design decision (design recorded below; nothing
+is implemented).
 
 ## Toolchain Policy
 
@@ -1090,6 +1091,163 @@ C ABI stability before any C artifact exists.
   at all versus keeping C on `parseFeatures` + still decode/encode. Deferred
   until a concrete FFI caller needs remux/chunk surgery.
 
+### 14. Threading (post-1.0 design)
+
+Forward-looking design only, like step 13. This step records the opt-in
+concurrency model a later implementation plan must execute. Nothing here
+authorizes worker code, `std.Io` plumbing, or CI matrix changes today.
+
+#### 1. Goals and non-goals
+
+**Goal.** Where the recorded profile supports it, beat default
+single-threaded `dwebp` wall-clock on large lossy stills (the `bryce`
+class) and scale animation encode across frames. **Non-goals**: threading
+as default behavior; wasm threads; threading VP8L lossless decode — the
+profiled bottleneck is the serial entropy loop at roughly 66%–95% of VP8L
+decode (`PROGRESS.MD`, 2026-07-11 tile-run attribution), which workers
+cannot split, and the 2026-07-18 scalar campaign record stands.
+
+#### 2. API shape and concurrency provider
+
+**Decision.** New sibling entry points taking a caller-supplied `std.Io`
+first parameter (e.g. `decodeStaticIo(io, gpa, bytes, options)`,
+`encodeAnimationFromBuffersIo(...)`), plus one additive defaulted options
+field `worker_count_max: u8 = 1` (1 = scalar path; ignored by the non-Io
+entry points). The application constructs, owns, and deinitializes the
+provider (typically `std.Io.Threaded`); the library never constructs,
+caches, or hides one. Zig 0.16's own guidance: "the application is
+responsible for choosing the `Io` implementation and library code should
+accept an `Io` parameter" (`std/Io/Threaded.zig:1695-1704`). Existing
+entry points keep their exact signatures and single-threaded semantics.
+Tier: the new surface lands **Tier 2** and is promoted to Tier 1 only
+after the first implementation slice survives its gates. Tier-1 rule
+quoted from `src/root.zig`: "additions to `errors.Error` are not
+breaking; removals or renames of Tier 1 names are" — new names and a
+defaulted options field are additive, so nothing here breaks Tier 1.
+
+**Rejected.** An options-only `thread_count_max` on the existing entry
+points: it names no provider, forcing a hidden internal scheduler behind
+frozen signatures — exactly what the stdlib guidance warns against.
+
+#### 3. Determinism contract
+
+Output is byte-identical for every worker count (as libwebp's `-mt` is).
+Normative rules: workers write disjoint, pre-assigned output and scratch
+regions; merge/reduction order is fixed by shard index, never completion
+order; no dependence on time, RNG, or pointer order. CI runs the SHA-256
+corpus gates through the threaded path at ≥ 2 workers via a test-only
+option matrix: the corpus tests iterate `worker_count_max` over {1, 2, 4}
+on the Io entry points with a test-constructed `std.Io.Threaded`.
+
+#### 4. Budget accounting
+
+`ResourceLimits.allocation_bytes_max` (`src/limits.zig`) stays one global
+per-call budget. Per-worker scratch is reserved from it before any worker
+starts (reserve-before-spawn); if reserving worker K's scratch would
+exceed the budget, the call proceeds with K−1 workers, degrading to the
+scalar path at 1. A call that succeeds single-threaded MUST never fail
+with `error.AllocationLimitExceeded` because threading was requested.
+
+#### 5. Failure and lifetime semantics
+
+Normative rules, not open questions:
+
+- **Deterministic error precedence.** Each worker records its error in
+  its own shard slot; after all workers are joined, the entry point scans
+  slots in shard order and returns the lowest-index error. The result
+  never depends on scheduling races.
+- **Cancellation.** The first fatal error (or an explicit cancel) sets a
+  shared atomic flag; workers poll it at bounded intervals (row/frame
+  boundaries) and exit early. Cancel is cooperative and keeps the
+  byte-exact and budget contracts: a canceled call returns the
+  shard-ordered error, never partial success.
+- **Join-before-return.** Every started worker is awaited (or canceled
+  and awaited) before the entry point returns success or error; no thread
+  or reference into caller-owned buffers outlives the call.
+- **Scratch cleanup.** Per-worker scratch is freed on success, error, and
+  mid-flight cancel, and is charged/uncharged against
+  `allocation_bytes_max` symmetrically on every path.
+- **Partial-spawn failure.** If starting worker N fails
+  (`Io.Group.concurrent` → `error.ConcurrencyUnavailable`, or allocation
+  failure), the started workers keep their shards and are joined normally,
+  unspawned shards run inline on the calling thread, and their reserved
+  scratch is freed or reused — spawn failure degrades, it never leaks
+  threads or budget charges, and never fails a call that would succeed
+  single-threaded.
+
+#### 6. Concurrency primitive
+
+**Decision.** Caller-supplied `std.Io` plus a per-call `std.Io.Group`
+using `Group.concurrent`/`await`/`cancel` (`std/Io.zig`). The library
+owns each call's group and always awaits or cancels it before returning
+(decision 5); the application owns the provider's lifetime. **Rejected:**
+internal raw `std.Thread.spawn` — the library would own thread creation,
+join bookkeeping, and partial-spawn cleanup itself, duplicating what
+`Io.Group` guarantees, and callers could not bound or share the pool with
+the rest of their application. Also rejected:
+`std.Io.Threaded.global_single_threaded` as a scheduler — it "does not
+support concurrency or cancelation" (`std/Io/Threaded.zig:1703`).
+wasm and single-threaded targets stay on the scalar path either way.
+
+#### 7. Structure per codec path
+
+1. **Lossy decode pipeline split.** Entropy/token decode
+   (`src/vp8/tokens.zig` + bool reader) feeding reconstruction and loop
+   filter (`src/vp8/decoder.zig`, `src/vp8/loop_filter.zig`) over a
+   bounded row queue — the libwebp `-mt` shape. Token decode is serial
+   per partition and reconstruction consumes rows in order, so the
+   ceiling is ≈ 2× (two stages). Workload: `bryce.webp` at 796.6 ms after
+   the accepted plan-022 SIMD work (`PROGRESS.MD`, 2026-07-15 entry).
+2. **Animation encode frame parallelism.**
+   `encodeAnimationFromBuffers` (`src/animation_encode.zig`) encodes each
+   frame's bitstream independently (the caller fixes rect/blend/dispose),
+   so per-frame encode parallelizes with a serial 9a mux barrier.
+   **Caveat (binding):** `encodeAnimationMinimized`
+   (`src/animation_optimize.zig`) re-decodes each frame it just encoded
+   to track the reconstructed canvas (`PROGRESS.MD` step-9c entry; the
+   2026-07-04 unplanned finding in `plans/README.md`), so its rect and
+   dispose decisions are frame-serial. The parallel slice targets the
+   buffers path only; the minimized path stays serial until a later plan
+   restructures that optimizer barrier explicitly.
+3. **Lossy encode wavefront.** RD decisions in `src/vp8/encoder.zig` are
+   row-causal through reconstructed neighbors; macroblock-row wavefront
+   parallelism needs a deterministic reduction and is the most complex
+   candidate. Deferred to its own plan.
+4. **ALPH/color overlap.** `src/alpha.zig` decode is independent of VP8
+   reconstruction until composition, so the planes can overlap; the
+   ceiling is max(color, alpha) wall-clock. Small and cheap.
+
+**Build order.** (2) on the buffers path first, then (1), then (4);
+(3) only with a dedicated plan. VP8L decode is excluded (decision 1).
+
+#### 8. Platform matrix
+
+linux/macos native: threads available. wasm32-wasi, wasm32-freestanding,
+and `builtin.single_threaded` builds: a compile-time capability check
+keeps the scalar path as the only path (the Io entry points still
+compile; the worker count clamps to 1 and no `concurrent` call is made);
+`zig build wasm-check` and the wasmtime suite stay green. Big-endian is
+unaffected, but CI must run one threaded configuration (the native matrix
+at 2 workers, decision 3).
+
+#### 9. Acceptance gates for the implementation plans
+
+- Byte-exact SHA-256 corpus output at 1/2/4 workers.
+- No allocation outside the budget: `checkAllAllocationFailures` extended
+  over the reservation and spawn path.
+- A dated bench row showing wall-clock below single-threaded `dwebp` on
+  at least the `bryce` class.
+- `zig build wasm-check` green; big-endian suite unchanged.
+- Tests exercising partial-spawn degrade, cancel plus join-before-return,
+  and scratch cleanup on every error path.
+
+#### 10. Open questions left open
+
+- Whether the Io-taking entry points later subsume the non-Io ones or
+  stay siblings permanently — decide at Tier-1 promotion time.
+- Shard granularity for the pipeline split (row vs macroblock-row batch)
+  and queue depth — measure, do not guess.
+
 ## Near-Term Work Items
 
 Steps 0 through 7 are complete and the VP8 lossy encoder (step 8) is now
@@ -1156,8 +1314,9 @@ This order keeps early work testable and prevents the project from becoming
 one large codec file that is difficult to audit or optimize.
 
 Completed step status and the 1.0.0 release history live in `PROGRESS.MD`.
-The remaining roadmap is post-1.0 **step 13** (C ABI): the design is recorded
-above; implementation remains future work.
+The remaining roadmap is post-1.0 **step 13** (C ABI) and **step 14**
+(threading): both designs are recorded above; implementing either remains
+future work — no C artifact and no threading code exist today.
 
 Separately from feature step 13, the next post-1.0 VP8L performance plan must
 start from codegen/profile evidence for a whole-stream entropy-state redesign
