@@ -52,4 +52,8 @@
 - Do not copy reference implementation code. Reimplement from the specs and
   validate behavior with tests.
 - Run `zig build ci` (or `zig fmt .` plus `zig build check` plus `zig build test`) before handing work back.
+  Exception: changes touching only Markdown/docs need no build gate — confirm
+  via `git status` that no `.zig`, `build.zig`, or `build.zig.zon` files
+  changed. When a plan or checklist hard-codes `zig build ci` as a done
+  criterion, that still wins.
 - Do not commit generated build output such as `.zig-cache/` or `zig-out/`.
