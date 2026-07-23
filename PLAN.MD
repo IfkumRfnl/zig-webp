@@ -45,7 +45,8 @@ wasm32-wasi under wasmtime (`zig build test -Dtarget=wasm32-wasi
 library for wasm32-wasi and wasm32-freestanding plus the wasi unit tests.
 The library is thread-compatible: no global mutable state, so
 distinct decode/encode jobs may run on distinct threads. Internal
-parallelism is deferred to step 10.
+parallelism is a step 14 design decision (design recorded below; nothing
+is implemented).
 
 ## Toolchain Policy
 
@@ -115,12 +116,11 @@ Do not vendor the reference clone contents into git or the Zig package.
 
 ## Cross-Cutting Practices
 
-These run continuously from now on rather than as scheduled steps.
+These run continuously rather than as scheduled steps.
 
-- Fuzzing starts now, not at the end. Demux, VP8L decode, and alpha decode
-  are already public entry points and get fuzz smoke targets before VP8
-  decoder work begins. Every new decode entry point lands with a fuzz target
-  in the same change. Fuzz findings become committed regression tests.
+- Fuzzing is continuous: every public decode and encode entry point carries
+  a fuzz target that lands in the same change as the entry point. Fuzz
+  findings become committed regression tests.
 - CI runs on every pull request: `zig fmt --check .`, `zig build test`, and a
   corpus regression mode that compares decoded output against committed
   SHA-256 hashes of known-good planes, so CI does not require `dwebp`. Full
@@ -130,10 +130,10 @@ These run continuously from now on rather than as scheduled steps.
   result in `PROGRESS.MD`: corpus, file counts, byte-exact or gate metric,
   and skips.
 
-## Proposed Module Layout
+## Module Layout
 
-Files marked `(planned: …)` do not exist yet; every other path is on disk
-today. Run `find src -name '*.zig' | sort` for the live tree.
+Every path below is on disk today; run `find src -name '*.zig' | sort` for
+the live tree. CLI, report, and oracle tools live under `tools/`.
 
 ```text
 src/root.zig
@@ -142,47 +142,58 @@ src/demux.zig
 src/mux.zig
 src/features.zig
 src/image.zig
-src/vp8l/pixel.zig
 src/color.zig
 src/bit_reader.zig
 src/bit_writer.zig
 src/alpha.zig
 src/animation.zig
 src/animation_decode.zig
+src/animation_encode.zig
+src/animation_optimize.zig
 src/metadata.zig
 src/options.zig
 src/limits.zig
 src/errors.zig
 src/decode.zig
+src/encode.zig
 src/vp8/bool_reader.zig
 src/vp8/bool_writer.zig
+src/vp8/cost.zig
 src/vp8/decoder.zig
-src/vp8/encoder.zig        (planned: step 8)
+src/vp8/encoder.zig
+src/vp8/forward_transform.zig
 src/vp8/frame_header.zig
+src/vp8/header.zig
+src/vp8/loop_filter.zig
 src/vp8/modes.zig
 src/vp8/prediction.zig
-src/vp8/transform.zig
-src/vp8/loop_filter.zig
 src/vp8/quant.zig
-src/vp8/tokens.zig
+src/vp8/segment.zig
 src/vp8/token_probs.zig
-src/vp8l/decoder.zig
-src/vp8l/encoder.zig       (planned: step 7)
-src/vp8l/huffman.zig
-src/vp8l/lz77.zig          (planned: step 7)
-src/vp8l/transform.zig
-src/vp8l/inverse_transform.zig
+src/vp8/tokens.zig
+src/vp8/transform.zig
 src/vp8l/color_cache.zig
+src/vp8l/decoder.zig
+src/vp8l/encoder.zig
 src/vp8l/entropy.zig
+src/vp8l/forward_transform.zig
 src/vp8l/header.zig
+src/vp8l/huffman.zig
+src/vp8l/huffman_writer.zig
 src/vp8l/image_data.zig
+src/vp8l/inverse_transform.zig
+src/vp8l/lz77.zig
 src/vp8l/meta_prefix.zig
+src/vp8l/pixel.zig
 src/vp8l/prefix_groups.zig
+src/vp8l/transform.zig
 src/testing.zig
 src/testing/corpus.zig
+src/testing/encode_corpus.zig
 src/testing/fuzz.zig
+src/testing/hardening.zig
 src/testing/metrics.zig
-tools/zig-webp-bench.zig   (step 10 benchmark harness)
+src/testing/synth.zig
 ```
 
 Fuzz targets live alongside the tests of the module they exercise, using
@@ -195,136 +206,42 @@ single-frame codec internals.
 
 ## Implementation Order
 
-### 0–5. Completed Foundations
+### 0–9. Completed Foundations
 
-Step 0 (project foundation), step 1 (RIFF/WebP container), step 2 (core
-bitstream infrastructure), step 3 (VP8L lossless decoder), step 4 (alpha
-chunk decode), and step 5 (VP8 lossy decoder, including alpha composition over
-lossy color and the lossy path through the public `decodeStatic`) are complete
-for their static scopes. See `PROGRESS.MD` for what each delivered, the dated
-corpus results, and the step 5 acceptance gate. The step 5 spec below is
-retained as the record of that gate.
+Steps 0 through 9 are complete. The delivered scope, acceptance-gate
+results, and dated corpus/oracle rows live in `PROGRESS.MD`; the summary
+below is the roadmap record:
 
-### 5. VP8 Lossy Decoder
-
-VP8 reconstruction is exactly specified: RFC 6386 fixes the boolean decoder,
-dequantization, intra prediction, inverse DCT/WHT, and loop filter to the
-bit. Only YUV-to-RGB conversion is implementation-defined. Build and validate
-the decoder in two layers so exactness is never blurred by conversion
-choices.
-
-Reconstruction layer (bit-exact, no tolerances):
-
-- Parse WebP's VP8 key-frame payloads and reject non-key-frame states WebP
-  forbids.
-- Implement frame header parsing, segmentation, quantization, coefficient
-  probability updates, token partitions, macroblock modes, and skip flags.
-- Implement intra prediction for luma and chroma modes.
-- Implement inverse DCT and WHT using exact integer rules.
-- Implement normal and simple loop filters.
-- Add a `compare-yuv` oracle mode (mirroring the alpha tooling) that diffs
-  decoded YUV420 planes byte-for-byte against `dwebp -yuv` for every lossy
-  corpus file. Any mismatch is a bug, never a tolerance.
-
-Conversion layer (separately tested):
-
-- Implement YUV420-to-RGB conversion and chroma upsampling as its own module
-  with explicit mode options; the mode mirroring `libwebp`'s default fancy
-  upsampling is validated against `dwebp -pam` output for that mode.
-- Compose decoded alpha planes over lossy color and validate VP8X alpha flag
-  rules (the remainder of step 4).
-
-Acceptance gate: byte-exact YUV planes against `dwebp -yuv` for all lossy
-files in `libwebp-test-data` plus a generated `cwebp` corpus, and byte-exact
-RGBA against `dwebp -pam` in the matching upsampling mode, including
-lossy+alpha files.
-
-### 6. Extended Decode and Animation
-
-- Enforce `VP8X` feature flags and extended chunk ordering rules.
-- Decode animated WebP: `ANIM`, `ANMF`, frame rectangles, frame durations,
-  dispose methods, blend methods, background color, and loop count.
-- Reuse the static VP8/VP8L/alpha decoders per frame.
-- Provide both frame iteration and fully composited output APIs.
-- Preserve metadata extraction for still and animated files.
-
-Acceptance gate: composited animation frames match `libwebp`'s `anim_dump`
-output byte-for-byte on the animated corpus files, and all static and
-animated decode features are usable from the public API.
-
-### 7. VP8L Lossless Encoder
-
-Start with correctness and valid output, then improve compression.
-
-- Implement RIFF/VP8L muxing for still images.
-- Implement VP8L bit writer, canonical Huffman writer, and basic literal
-  output.
-- Add simple LZ77 matches and distance mapping.
-- Add subtract-green transform.
-- Add palette/color-indexing transform for low-color images.
-- Add predictor and color transforms.
-- Add entropy image / multiple Huffman groups after the single-group encoder
-  is stable.
-- Add optional color cache and near-lossless preprocessing.
-
-Acceptance gates, measured on a defined encode corpus (the decoded ARGB of
-all VP8L files in `libwebp-test-data` plus the `libwebp` gallery images):
-
-- Validity: 100% of encoded files decode without error by both `dwebp` and
-  this library, and round-trip bit-exactly to the source pixels.
-- Size: median compressed size at most 1.10x `cwebp -lossless` at default
-  settings, recorded per file. The PNG comparison is reported, not gated:
-  measure against a named PNG encoder at stated settings (stock `libpng`
-  defaults, plus `oxipng -o 2` where available) on the same pixels.
-
-### 8. VP8 Lossy Encoder
-
-This is the largest single work item in the project: expect it to cost
-roughly as much as steps 0 through 7 combined. It must not start until the
-VP8 decoder, bit writers, muxer, and lossless encoder are solid, and it is
-planned, built, and reviewed as three separately gated phases.
-
-#### 8a. Valid-bitstream baseline
-
-- Implement RGB/RGBA to YUV420 conversion, including exact transparent-RGB
-  handling.
-- Implement forward DCT/WHT, quantization, coefficient coding, and boolean
-  arithmetic output, with a deliberately simple fixed mode decision.
-- Gate: every encoded corpus image decodes without error by both `dwebp` and
-  this library, and this library's decoder reproduces the encoder's own
-  reconstruction bit-for-bit at the YUV layer.
-
-#### 8b. Quality
-
-- Implement real macroblock mode decision with rate-distortion scoring,
-  segmentation, skip decisions, token cost estimation, and loop filter
-  selection.
-- Gate: at matched output size on the photo corpus, mean luma PSNR within
-  1.0 dB of `cwebp -q 75 -m 4`. This threshold is an initial target; revise
-  it only with recorded data and rationale, per the honest-benchmarking
-  rules in `AGENTS.md`.
-
-#### 8c. Controls and parity features
-
-- Add method/quality presets compatible with `cwebp` concepts.
-- Add target-size and target-PSNR modes after regular quality mode is stable.
-- Add sharp-YUV or equivalent high-quality chroma conversion.
-- Add alpha encoding via `ALPH` for lossy+alpha output.
-- Gate: the preset matrix encodes the corpus without validity regressions,
-  and target-size mode lands within 5% of the requested size.
-
-### 9. Animation and Metadata Encode
-
-- Encode `VP8X`, `ANIM`, and `ANMF`.
-- Support lossless and lossy frame codecs.
-- Implement sub-rectangle detection, frame differencing, blend/dispose
-  strategy, keyframe insertion, loop count, and background color.
-- Encode raw metadata chunks and preserve user-specified chunk order where
-  the spec permits it.
-
-Acceptance gate: encoded animations are accepted by `webpmux` and
-`webpinfo`, decode through `libwebp`'s `anim_dump` to frames matching this
-library's own composition, and render in at least two major browsers.
+- **Step 0** — project foundation; **step 1** — RIFF/WebP container;
+  **step 2** — core bitstream infrastructure.
+- **Step 3** — VP8L lossless decoder and **step 4** — alpha chunk decode,
+  byte-exact against `dwebp` on the corpus.
+- **Step 5** — VP8 lossy decoder: bit-exact key-frame reconstruction and
+  loop filtering (`dwebp -yuv` byte-exact), a separately tested
+  fancy-upsampling YUV→RGB conversion layer (`dwebp -pam` byte-exact), and
+  alpha composition over lossy color.
+- **Step 6** — extended decode and animation: VP8X flag/ordering rules,
+  `decodeAnimation` / `AnimationDecoder`, and metadata extraction;
+  composited frames byte-exact against `anim_dump`.
+- **Step 7** — VP8L lossless encoder: subtract-green, color, predictor, and
+  palette transforms, LZ77, color cache, and meta-prefix groups; bit-exact
+  round-trips with median size 1.04× `cwebp -lossless` (gate ≤ 1.10×).
+  Optional near-lossless preprocessing was not implemented — a quality
+  refinement, never a gate — and remains available future work.
+- **Step 8** — VP8 lossy encoder in three gated phases (8a valid bitstream,
+  8b quality, 8c controls): rate-distortion intra mode decision with
+  B_PRED, skip coding, loop-filter selection, adaptive segmentation, a
+  `method` (0..6) effort knob, lossy+alpha via `ALPH`, target-size /
+  target-PSNR modes, and sharp YUV. Gates: matched-size photo-corpus luma
+  PSNR within 1.0 dB of `cwebp -q 75 -m 4` (measured +0.08 dB); target-size
+  within 5%; no validity regressions across the preset matrix.
+- **Step 9** — animation and metadata encode: `encodeAnimation` (container
+  mux), `encodeAnimationFromBuffers` (pixel frames),
+  `encodeAnimationMinimized` (sub-rect detection, inter-frame differencing,
+  dispose/keyframe strategy, quality-derived lossy tolerance), and
+  still-encode metadata. Output is accepted by `webpinfo`/`webpmux`,
+  `anim_dump` matches this library's own composition byte-for-byte, and the
+  manual two-browser render check passed.
 
 ### 10. Performance Work
 
@@ -407,7 +324,6 @@ input.
 - Release `1.0.0` only after the 8b and 8c gates, animation encode, metadata,
   hardening, docs, and the compatibility matrix in `RELEASING.MD`
   ("Compatibility matrix (1.0 gate)") are all met.
-
 
 ### 13. C ABI (post-1.0)
 
@@ -1090,154 +1006,188 @@ C ABI stability before any C artifact exists.
   at all versus keeping C on `parseFeatures` + still decode/encode. Deferred
   until a concrete FFI caller needs remux/chunk surgery.
 
+### 14. Threading (post-1.0 design)
+
+Forward-looking design only, like step 13. This step records the opt-in
+concurrency model a later implementation plan must execute. Nothing here
+authorizes worker code, `std.Io` plumbing, or CI matrix changes today.
+
+#### 1. Goals and non-goals
+
+**Goal.** Where the recorded profile supports it, beat default
+single-threaded `dwebp` wall-clock on large lossy stills (the `bryce`
+class) and scale animation encode across frames. **Non-goals**: threading
+as default behavior; wasm threads; threading VP8L lossless decode — the
+profiled bottleneck is the serial entropy loop at roughly 66%–95% of VP8L
+decode (`PROGRESS.MD`, 2026-07-11 tile-run attribution), which workers
+cannot split, and the 2026-07-18 scalar campaign record stands.
+
+#### 2. API shape and concurrency provider
+
+**Decision.** New sibling entry points taking a caller-supplied `std.Io`
+first parameter (e.g. `decodeStaticIo(io, gpa, bytes, options)`,
+`encodeAnimationFromBuffersIo(...)`), plus one additive defaulted options
+field `worker_count_max: u8 = 1` (1 = scalar path; ignored by the non-Io
+entry points). The application constructs, owns, and deinitializes the
+provider (typically `std.Io.Threaded`); the library never constructs,
+caches, or hides one. Zig 0.16's own guidance: "the application is
+responsible for choosing the `Io` implementation and library code should
+accept an `Io` parameter" (`std/Io/Threaded.zig:1695-1704`). Existing
+entry points keep their exact signatures and single-threaded semantics.
+Tier: the new surface lands **Tier 2** and is promoted to Tier 1 only
+after the first implementation slice survives its gates. Tier-1 rule
+quoted from `src/root.zig`: "additions to `errors.Error` are not
+breaking; removals or renames of Tier 1 names are" — new names and a
+defaulted options field are additive, so nothing here breaks Tier 1.
+
+**Rejected.** An options-only `thread_count_max` on the existing entry
+points: it names no provider, forcing a hidden internal scheduler behind
+frozen signatures — exactly what the stdlib guidance warns against.
+
+#### 3. Determinism contract
+
+Output is byte-identical for every worker count (as libwebp's `-mt` is).
+Normative rules: workers write disjoint, pre-assigned output and scratch
+regions; merge/reduction order is fixed by shard index, never completion
+order; no dependence on time, RNG, or pointer order. CI runs the SHA-256
+corpus gates through the threaded path at ≥ 2 workers via a test-only
+option matrix: the corpus tests iterate `worker_count_max` over {1, 2, 4}
+on the Io entry points with a test-constructed `std.Io.Threaded`.
+
+#### 4. Budget accounting
+
+`ResourceLimits.allocation_bytes_max` (`src/limits.zig`) stays one global
+per-call budget. Per-worker scratch is reserved from it before any worker
+starts (reserve-before-spawn); if reserving worker K's scratch would
+exceed the budget, the call proceeds with K−1 workers, degrading to the
+scalar path at 1. A call that succeeds single-threaded MUST never fail
+with `error.AllocationLimitExceeded` because threading was requested.
+
+#### 5. Failure and lifetime semantics
+
+Normative rules, not open questions:
+
+- **Deterministic error precedence.** Each worker records its error in
+  its own shard slot; after all workers are joined, the entry point scans
+  slots in shard order and returns the lowest-index error. The result
+  never depends on scheduling races.
+- **Cancellation.** The first fatal error (or an explicit cancel) sets a
+  shared atomic flag; workers poll it at bounded intervals (row/frame
+  boundaries) and exit early. Cancel is cooperative and keeps the
+  byte-exact and budget contracts: a canceled call returns the
+  shard-ordered error, never partial success.
+- **Join-before-return.** Every started worker is awaited (or canceled
+  and awaited) before the entry point returns success or error; no thread
+  or reference into caller-owned buffers outlives the call.
+- **Scratch cleanup.** Per-worker scratch is freed on success, error, and
+  mid-flight cancel, and is charged/uncharged against
+  `allocation_bytes_max` symmetrically on every path.
+- **Partial-spawn failure.** If starting worker N fails
+  (`Io.Group.concurrent` → `error.ConcurrencyUnavailable`, or allocation
+  failure), the started workers keep their shards and are joined normally,
+  unspawned shards run inline on the calling thread, and their reserved
+  scratch is freed or reused — spawn failure degrades, it never leaks
+  threads or budget charges, and never fails a call that would succeed
+  single-threaded.
+
+#### 6. Concurrency primitive
+
+**Decision.** Caller-supplied `std.Io` plus a per-call `std.Io.Group`
+using `Group.concurrent`/`await`/`cancel` (`std/Io.zig`). The library
+owns each call's group and always awaits or cancels it before returning
+(decision 5); the application owns the provider's lifetime. **Rejected:**
+internal raw `std.Thread.spawn` — the library would own thread creation,
+join bookkeeping, and partial-spawn cleanup itself, duplicating what
+`Io.Group` guarantees, and callers could not bound or share the pool with
+the rest of their application. Also rejected:
+`std.Io.Threaded.global_single_threaded` as a scheduler — it "does not
+support concurrency or cancelation" (`std/Io/Threaded.zig:1703`).
+wasm and single-threaded targets stay on the scalar path either way.
+
+#### 7. Structure per codec path
+
+1. **Lossy decode pipeline split.** Entropy/token decode
+   (`src/vp8/tokens.zig` + bool reader) feeding reconstruction and loop
+   filter (`src/vp8/decoder.zig`, `src/vp8/loop_filter.zig`) over a
+   bounded row queue — the libwebp `-mt` shape. Token decode is serial
+   per partition and reconstruction consumes rows in order, so the
+   ceiling is ≈ 2× (two stages). Workload: `bryce.webp` at 796.6 ms after
+   the accepted plan-022 SIMD work (`PROGRESS.MD`, 2026-07-15 entry).
+2. **Animation encode frame parallelism.**
+   `encodeAnimationFromBuffers` (`src/animation_encode.zig`) encodes each
+   frame's bitstream independently (the caller fixes rect/blend/dispose),
+   so per-frame encode parallelizes with a serial 9a mux barrier.
+   **Caveat (binding):** `encodeAnimationMinimized`
+   (`src/animation_optimize.zig`) re-decodes each frame it just encoded
+   to track the reconstructed canvas (`PROGRESS.MD` step-9c entry; the
+   2026-07-04 unplanned finding in `plans/README.md`), so its rect and
+   dispose decisions are frame-serial. The parallel slice targets the
+   buffers path only; the minimized path stays serial until a later plan
+   restructures that optimizer barrier explicitly.
+3. **Lossy encode wavefront.** RD decisions in `src/vp8/encoder.zig` are
+   row-causal through reconstructed neighbors; macroblock-row wavefront
+   parallelism needs a deterministic reduction and is the most complex
+   candidate. Deferred to its own plan.
+4. **ALPH/color overlap.** `src/alpha.zig` decode is independent of VP8
+   reconstruction until composition, so the planes can overlap; the
+   ceiling is max(color, alpha) wall-clock. Small and cheap.
+
+**Build order.** (2) on the buffers path first, then (1), then (4);
+(3) only with a dedicated plan. VP8L decode is excluded (decision 1).
+
+#### 8. Platform matrix
+
+linux/macos native: threads available. wasm32-wasi, wasm32-freestanding,
+and `builtin.single_threaded` builds: a compile-time capability check
+keeps the scalar path as the only path (the Io entry points still
+compile; the worker count clamps to 1 and no `concurrent` call is made);
+`zig build wasm-check` and the wasmtime suite stay green. Big-endian is
+unaffected, but CI must run one threaded configuration (the native matrix
+at 2 workers, decision 3).
+
+#### 9. Acceptance gates for the implementation plans
+
+- Byte-exact SHA-256 corpus output at 1/2/4 workers.
+- No allocation outside the budget: `checkAllAllocationFailures` extended
+  over the reservation and spawn path.
+- A dated bench row showing wall-clock below single-threaded `dwebp` on
+  at least the `bryce` class.
+- `zig build wasm-check` green; big-endian suite unchanged.
+- Tests exercising partial-spawn degrade, cancel plus join-before-return,
+  and scratch cleanup on every error path.
+
+#### 10. Open questions left open
+
+- Whether the Io-taking entry points later subsume the non-Io ones or
+  stay siblings permanently — decide at Tier-1 promotion time.
+- Shard granularity for the pipeline split (row vs macroblock-row batch)
+  and queue depth — measure, do not guess.
+
 ## Near-Term Work Items
 
-Steps 0 through 7 are complete and the VP8 lossy encoder (step 8) is now
-feature-complete through step 8c.
-Step 7 (VP8L lossless encoder) met both gates: every encode-corpus image
-round-trips bit-exactly and the median compressed size is 1.04x
-`cwebp -lossless` (see `PROGRESS.MD`). Its optional near-lossless preprocessing
-was not implemented — it is a quality refinement, not a gate — and remains
-available as future work.
+Steps 0 through 12 are complete and `1.0.x` is released; completed step
+status, gate results, and the release history live in `PROGRESS.MD`.
 
-Step 8a (the valid-bitstream baseline) is delivered: `src/vp8/encoder.zig` emits
-a `VP8 ` key frame with a fixed all-DC mode decision on top of forward RGB→YUV420
-conversion, forward DCT/WHT, forward quantization, and coefficient token coding.
-Every encode-corpus image decodes without error through both this library's
-decoder and `dwebp`, and the decoder reproduces the encoder's own reconstruction
-bit-for-bit at the YUV layer (the step 8a gate; see `PROGRESS.MD` and the
-2026-06-19 oracle row).
+The remaining roadmap is post-1.0 **step 13** (C ABI) and **step 14**
+(threading): both designs are recorded above; implementing either remains
+future work — no C artifact and no threading code exist today. Each
+implementation slice gets its own plan executed against the recorded
+design decisions and acceptance gates.
 
-Step 8b (quality) is broken into reviewable slices so the encoder stays
-auditable:
-
-1. **8b-1 (delivered).** Real per-macroblock intra mode selection for the 16x16
-   luma modes and the shared 8x8 chroma mode (DC/V/H/TM), scored by a
-   rate-distortion metric (reconstruction SSE plus a quantizer-scaled
-   coded-coefficient penalty). The self-consistency and `dwebp` validity gates
-   still hold and every photo improves in both PSNR and size over 8a; see the
-   2026-06-20 oracle row.
-2. **8b-2 (delivered).** B_PRED (per-subblock 4x4 luma intra) with proper VP8
-   token-cost estimation so the 16x16-vs-B_PRED choice is rate-accurate.
-   Delivered in two slices: **8b-2a** — a token bit-cost model (`src/vp8/cost.zig`,
-   `tokens.blockCost`) replacing the nonzero-count rate proxy; and **8b-2b** —
-   B_PRED itself, scored against the 16x16 modes with that cost model
-   (+1.5 dB at −6.6% bytes on the photo corpus; 2026-06-20 oracle rows).
-3. **8b-3a (delivered).** Macroblock skip coding (`mb_skip_coeff` for all-zero
-   residue, with `prob_skip_false` from the realized skip ratio) and in-loop
-   loop-filter level selection from the quantizer (libwebp's default strength),
-   the encoder filtering its own reconstruction in place so the self-consistency
-   gate still holds. +0.34 dB on the photo corpus at neutral size; `dwebp`
-   validity unchanged (0/135 invalid); see the 2026-06-21 oracle row.
-4. **8b-3b (delivered).** Segmentation (adaptive per-segment quantization): a
-   pre-pass (`src/vp8/segment.zig`) buckets macroblocks into up to four segments
-   by luma complexity (1-D k-means) and gives each segment its own quantizer
-   delta (finer for busier segments — the SSE-optimal direction), written via
-   `frame_header.writeSegmentation` and the per-macroblock segment map. This
-   slice carries the step-8b gate: at matched output size on the photo corpus the
-   mean luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact +0.08 dB,
-   beating it; see the 2026-06-21 oracle row). `dwebp` validity unchanged
-   (0/135 invalid).
-5. **8c (delivered).** Controls and parity features, completing the VP8 lossy
-   encoder. An options scaffold (inert `EncoderOptions` knobs + an `EncodeConfig`
-   struct, landed first so the slices could be built in parallel) then four
-   slices: **8c-1** a `method` (0..6) effort knob scaling the rate-distortion
-   search (method 4 byte-identical to 8b; 5–6 currently clamp to 4); **8c-2**
-   lossy+alpha via the `ALPH` chunk (lossless alpha, byte-exact round-trip);
-   **8c-3** target-size and target-PSNR modes (a bounded quantizer search — this
-   slice carries the step-8c ≤5% target-size gate, landing 0.32–2.83% off on the
-   photos); and **8c-4** sharp (iterative) RGB→YUV chroma. Each keeps its default
-   path byte-identical to 8b and holds `dwebp` validity (0/135 invalid); the
-   step-8c gate holds (the method-preset matrix has no validity regression and
-   target-size lands within 5%). See the five 2026-06-22 oracle rows in
-   `PROGRESS.MD`.
-
-This order keeps early work testable and prevents the project from becoming
-one large codec file that is difficult to audit or optimize.
-
-Completed step status and the 1.0.0 release history live in `PROGRESS.MD`.
-The remaining roadmap is post-1.0 **step 13** (C ABI): the design is recorded
-above; implementation remains future work.
-
-Separately from feature step 13, the next post-1.0 VP8L performance plan must
-start from codegen/profile evidence for a whole-stream entropy-state redesign
-with a local bit-buffer/table cursor and checked tail. The 2026-07-18 campaign
-closed local output packing, transform fusion, scratch probing, Huffman root
-width, pair-table, fixed-green, unchecked lookup, and meta-prefix representation
-variants without producing an every-class Rust win. A replacement kernel must
-make both lossless class sums lower than Rust on the pinned 135-file harness,
-improve full-lossless summed time by at least 5%, preserve 135/135 digest
-identity, and keep every unaffected codec control within 1%. It must not reopen
-plan 021's unsafe bulk-refill/unchecked lookup. The completed direct final-output
+Separately from the feature steps, the next post-1.0 VP8L performance plan
+must start from codegen/profile evidence for a whole-stream entropy-state
+redesign with a local bit-buffer/table cursor and checked tail. The
+2026-07-18 campaign closed local output packing, transform fusion, scratch
+probing, Huffman root width, pair-table, fixed-green, unchecked lookup, and
+meta-prefix representation variants without producing an every-class Rust
+win. A replacement kernel must make both lossless class sums lower than
+Rust on the pinned 135-file harness, improve full-lossless summed time by
+at least 5%, preserve 135/135 digest identity, and keep every unaffected
+codec control within 1%. It must not reopen plan 021's unsafe
+bulk-refill/unchecked lookup. The completed direct final-output
 reconstruction and exact residual ratios are recorded in `PROGRESS.MD`.
 
-Step 9 (animation and metadata encode) is broken into reviewable slices,
-mirroring the `encodeStatic` → `encodeLossy` precedent (container layer first,
-then pixels, then quality):
-
-1. **9a (delivered).** The animation **container mux**: `mux.encodeAnimation`
-   (public `encodeAnimation`) assembles already-encoded frame bitstreams into a
-   valid `VP8X`+`ANIM`+`ANMF` animation (optional per-frame `ALPH`, optional
-   `ICCP`/`EXIF`/`XMP `), validating every frame against the canvas and the
-   container rules. It does not encode pixels. Output round-trips through this
-   library's demux and is accepted by `webpinfo`/`webpmux`/`anim_dump` (see
-   `PROGRESS.MD` and the 2026-06-23 oracle row).
-2. **9b (delivered).** Public `encodeAnimationFromBuffers` from pixel buffers:
-   `src/animation_encode.zig` encodes each caller-supplied frame (lossy or
-   lossless, with alpha) into a `VP8 `/`VP8L` bitstream — reusing the still
-   encode machinery — and muxes them via 9a. The caller dictates each frame's
-   rectangle (full-canvas or sub-rect), blend, and dispose. Carries the step-9
-   gate that `anim_dump` of the output matches this library's own
-   `decodeAnimation` composition byte-for-byte (see `PROGRESS.MD` and the
-   2026-06-23 9b oracle row).
-3. **9c (delivered).** Frame optimization: public `encodeAnimationMinimized`
-   (in `src/animation_optimize.zig`) takes full-canvas frames + timing and
-   automatically derives a minimal `ANMF` layout — sub-rectangle detection
-   (minimal bounding box of the changed region), inter-frame differencing with a
-   blend-vs-replace strategy (lossless: equal-to-prev pixels made transparent
-   under `alpha_blend` when the result provably reconstructs exactly, else
-   verbatim `replace`; lossy: always verbatim `replace`), a one-frame-lookahead
-   dispose-to-background choice, and keyframe insertion (frame 0, full-canvas
-   changes, and a bounded interval) — then reuses the 9b per-frame encoder and
-   the 9a mux. The optimizer tracks the decoder's *reconstructed* canvas
-   (re-decoding each frame it emits and compositing with the exact
-   `animation_decode` rules), so lossy error never accumulates and the 9b gate
-   is preserved. **Slice 9c-2 extended this to lossy frames:** the change rect is
-   detected against a *source-quality carryover* canvas (not the noisy
-   reconstruction) using a per-channel content-change tolerance `T`
-   (`Options.tolerance`, defaulting to a quality-derived value — libwebp's
-   `QualityToMaxDiff`, ~5 at q=75), so lossy frames now shrink to a sub-rect
-   instead of staying full-canvas keyframes; bounded drift is capped by the
-   keyframe interval. Lossless frames use `T = 0` (exact) and an
-   identical-to-reconstruction carryover, so the byte-exact lossless gate is
-   unchanged. Gate (CI): all-lossless minimized round-trips are byte-exact;
-   a lossy moving-region animation shrinks ≥1 ANMF rect and decodes valid; the
-   optimized lossy mean luma PSNR stays within 0.5 dB of the naive full-canvas
-   encode; `anim_dump` parity holds for lossless and lossy samples; `webpinfo`
-   clean. Measured lossy result: ≈48% smaller than the naive full-canvas lossy
-   encode on the moving-sub-region sample, PSNR +0.14 dB (not a loss; the
-   inherited gradient is quantized once at the keyframe rather than re-noised
-   each frame) — see the 2026-06-23 9c-2 oracle row. Step 9 is now
-   feature-complete.
-4. **9d (delivered, still encode).** Metadata-from-pixels for **still** encode:
-   `EncoderOptions.metadata` (a `metadata.RawPayloads`) threads raw
-   `ICCP`/`EXIF`/`XMP ` into the `encodeLossless`/`encodeLossy` mux calls, so the
-   still encoders now emit an extended (`VP8X`) container with those chunks in
-   spec-canonical order (and coexisting with a lossy `ALPH`). They round-trip
-   byte-exactly through `demux`; with empty metadata the output is byte-identical
-   to the pre-9d path (asserted by test). Chunk-order honesty: the from-pixels
-   path emits spec-canonical order (there is no caller order to preserve there);
-   the `mux.encodeStaticFromDemux` remux path is what preserves unknown-chunk
-   order. Animation-level metadata is already handled by 9a's
-   `AnimationImage.metadata` (and 9b's `AnimationEncodeOptions.metadata`), so 9d
-   does not duplicate it.
-
-**Browser-render check (step-9 completion gate):** closed. 9c generated two
-minimized sample animations under `testdata/animation/`
-(`anim_minimized_lossless.webp`, `anim_minimized_lossy.webp` — a textured
-background with a moving sub-region). Both pass `anim_dump` parity and
-`webpinfo` cleanly. The "renders in ≥2 major browsers" gate is manual and
-intentionally **not** wired into CI; the operator-run result is recorded in
-`PROGRESS.MD`. Everything that can be
-automated (byte-exact lossless round-trip, `anim_dump` parity, `webpinfo`)
-remains gated.
+Smaller open refinements, in no required order: VP8L near-lossless
+preprocessing (the step-7 leftover; quality refinement, never gated) and
+real method 5–6 search depth in the lossy encoder (currently a documented
+clamp to method 4).

@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-21
+Last updated: 2026-07-23
 
 ## Current Position
 
@@ -77,6 +77,12 @@ Step 13 (C ABI) is design-complete only: plan 015 recorded the post-1.0 C
 export contracts in `PLAN.MD` (v1 still-image scope, naming/header, error
 model, memory ownership, size-aware struct init, acceptance gates, independent
 C ABI versioning). No C header, exports, or shared library ships yet.
+
+Step 14 (threading) is design-complete only: plan 027 recorded the opt-in
+concurrency model in `PLAN.MD` (caller-supplied `std.Io` with a per-call
+`Io.Group`, thread-count-independent byte-exact output, reserve-before-spawn
+budget accounting, failure/lifetime rules, per-path structure, and
+implementation acceptance gates). No threading code ships yet.
 
 ## Cross-Cutting Practices
 
@@ -614,59 +620,6 @@ Draft PR #103 therefore takes the **conservative production cut through
 `addInverseDct` remains the scalar path. The spike measurements stay on
 record below; the vector implementation is omitted from this draft.
 
-### 2026-07-11 — Compact VP8L Huffman `Entry` (accepted) + rejected 10-bit root
-
-Accepted compact Huffman payload at `fbe738c` (base of the plan-024 stack):
-`Entry` **6→4** bytes (**33%** denser; 8-bit root table **1.5KB→1KB**) by
-packing symbol / subtable offset into one `u16` discriminated by `op`, without
-changing table geometry. Rejected follow-on experiment `391f449` (branch
-`perf/vp8l-huffman-root10`) widened the primary root to **10** bits (+**3072**
-bytes per non-single table; +**15360** five-table scratch) but lost speed vs
-the accepted 8-bit compact base → **reject / no merge**. Accepted production cut for the cumulative draft is compact Huffman
-`fbe738c` (tile-run transforms retained; plan-024 IDCT `e9254a3` omitted);
-**no** general `image-webp` beat claimed.
-
-- **Correctness (accepted `fbe738c`).** **135/135** decode-into validated;
-  focused Huffman **11+5**; root compile; `zig build ci`;
-  `zig build wasm-check`; byte-exact corpus hashes.
-- **Speed (accepted `fbe738c`; ReleaseFast, AMD EPYC 7663, single thread;
-  two serial 135-file orderings of direct Zig medians vs `e45fafd` /
-  tile-run base; `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque
-  **1.0908×** / **1.0935×**; lossless alpha **1.3504×** / **1.3627×**;
-  lossy opaque **0.9911×** / **0.9897×** (noise); lossy alpha **1.1011×** /
-  **1.1170×** (ALPH uses VP8L). Gains are a **small-heavy aggregate**;
-  large-file variance exists (`photo_foliage.webp` ~**0.99×**,
-  `lossless_big_random_alpha.webp` **0.985×–1.070×**).
-- **Rejected `391f449`.** vs accepted 8-bit compact base: lossless opaque
-  **0.9620×**, lossless alpha **0.9261×** → slower; tests **481** pass;
-  **not** merged.
-
-### 2026-07-11 — VP8L predictor/color inverse transforms around tile runs
-
-Tile-run rewrite of predictor and color inverse transforms in
-`src/vp8l/inverse_transform.zig` (commit `1c97839`): hoist per-tile mode /
-color lookup across horizontal runs, comptime-specialize predictor modes
-0–13, keep scalar helpers as equivalence authority, and preserve
-right-edge top-right wrapping. Color-indexing left unchanged.
-
-- **Profiler attribution (base, temporary stage timers; profiler worktree
-  clean / no commit).** Entropy remains dominant at about **66%–95%** of
-  VP8L decode. When present, predictor is about **5.8%–16%** and color
-  about **4.3%–12.7%**; transforms are absent on small vec / one-color
-  files.
-- **Correctness.** Focused inverse-transform equivalence tests pass;
-  **135/135** decode-into validation; byte-exact corpus hashes;
-  `zig build ci`; `zig build wasm-check`.
-- **Speed (ReleaseFast, AMD EPYC 7663, single thread; two serial orderings
-  of direct Zig medians vs the plan-022 / constant-base reverse TSV;
-  `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque about
-  **1.046×–1.065×**; lossless alpha about **1.015×–1.031×**.
-  Representatives: `photo_foliage.webp` ~**1.04×–1.05×**,
-  `photo_portrait.webp` ~**1.12×–1.13×**,
-  `lossless_big_random_alpha.webp` ~**1.09×–1.17×**,
-  `lossless1.webp` ~**1.016×**. Entropy remains the bottleneck; this is
-  **not** a general codec speed claim.
-
 ### 2026-07-13 — Plan 017: `zig-webp-info` container-probe CLI
 
 Delivered `tools/zig-webp-info.zig` (`zig build info`, installed as
@@ -686,6 +639,7 @@ Validation: exercised against lossless, lossy, alpha, and animation
 fixtures under `testdata/`; `zig build info` with no args exits 2 with
 the usage line. `zig build check` compiles the tool; README lists it
 alongside the other installed CLIs.
+
 ### 2026-07-13 — Plan 015: C-ABI export layer design (PLAN.MD step 13)
 
 Plan 015 is complete as design-only work, reviewer-verified and delivered via
@@ -740,6 +694,59 @@ Recorded decisions (summary; full text in `PLAN.MD`):
 - **Independent C ABI versioning** — `ZWEBP_ABI_VERSION` /
   `zwebp_abi_version()` and soname follow the C major, not Zig package
   minors; C stability starts when the C ABI is released.
+
+### 2026-07-11 — Compact VP8L Huffman `Entry` (accepted) + rejected 10-bit root
+
+Accepted compact Huffman payload at `fbe738c` (base of the plan-024 stack):
+`Entry` **6→4** bytes (**33%** denser; 8-bit root table **1.5KB→1KB**) by
+packing symbol / subtable offset into one `u16` discriminated by `op`, without
+changing table geometry. Rejected follow-on experiment `391f449` (branch
+`perf/vp8l-huffman-root10`) widened the primary root to **10** bits (+**3072**
+bytes per non-single table; +**15360** five-table scratch) but lost speed vs
+the accepted 8-bit compact base → **reject / no merge**. Accepted production cut for the cumulative draft is compact Huffman
+`fbe738c` (tile-run transforms retained; plan-024 IDCT `e9254a3` omitted);
+**no** general `image-webp` beat claimed.
+
+- **Correctness (accepted `fbe738c`).** **135/135** decode-into validated;
+  focused Huffman **11+5**; root compile; `zig build ci`;
+  `zig build wasm-check`; byte-exact corpus hashes.
+- **Speed (accepted `fbe738c`; ReleaseFast, AMD EPYC 7663, single thread;
+  two serial 135-file orderings of direct Zig medians vs `e45fafd` /
+  tile-run base; `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque
+  **1.0908×** / **1.0935×**; lossless alpha **1.3504×** / **1.3627×**;
+  lossy opaque **0.9911×** / **0.9897×** (noise); lossy alpha **1.1011×** /
+  **1.1170×** (ALPH uses VP8L). Gains are a **small-heavy aggregate**;
+  large-file variance exists (`photo_foliage.webp` ~**0.99×**,
+  `lossless_big_random_alpha.webp` **0.985×–1.070×**).
+- **Rejected `391f449`.** vs accepted 8-bit compact base: lossless opaque
+  **0.9620×**, lossless alpha **0.9261×** → slower; tests **481** pass;
+  **not** merged.
+
+### 2026-07-11 — VP8L predictor/color inverse transforms around tile runs
+
+Tile-run rewrite of predictor and color inverse transforms in
+`src/vp8l/inverse_transform.zig` (commit `1c97839`): hoist per-tile mode /
+color lookup across horizontal runs, comptime-specialize predictor modes
+0–13, keep scalar helpers as equivalence authority, and preserve
+right-edge top-right wrapping. Color-indexing left unchanged.
+
+- **Profiler attribution (base, temporary stage timers; profiler worktree
+  clean / no commit).** Entropy remains dominant at about **66%–95%** of
+  VP8L decode. When present, predictor is about **5.8%–16%** and color
+  about **4.3%–12.7%**; transforms are absent on small vec / one-color
+  files.
+- **Correctness.** Focused inverse-transform equivalence tests pass;
+  **135/135** decode-into validation; byte-exact corpus hashes;
+  `zig build ci`; `zig build wasm-check`.
+- **Speed (ReleaseFast, AMD EPYC 7663, single thread; two serial orderings
+  of direct Zig medians vs the plan-022 / constant-base reverse TSV;
+  `--iters 5 --warmup 1 --budget-ms 500`).** Lossless opaque about
+  **1.046×–1.065×**; lossless alpha about **1.015×–1.031×**.
+  Representatives: `photo_foliage.webp` ~**1.04×–1.05×**,
+  `photo_portrait.webp` ~**1.12×–1.13×**,
+  `lossless_big_random_alpha.webp` ~**1.09×–1.17×**,
+  `lossless1.webp` ~**1.016×**. Entropy remains the bottleneck; this is
+  **not** a general codec speed claim.
 
 ### 2026-07-11 — Horizontal VP8 loop-filter SIMD (plan 023; vertical left scalar)
 

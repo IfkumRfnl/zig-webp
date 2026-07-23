@@ -19,98 +19,66 @@ are **Tier 2** internals with no stability promise. Additions to
 `errors.Error` are not breaking; removals or renames of Tier 1 names are.
 See the module doc comment in `src/root.zig` for the full Tier 1 list.
 
-Status: static decode is complete for lossless (VP8L), lossy (VP8), and ALPH
-alpha, all matching `dwebp` byte-for-byte on the local `libwebp-test-data`
-corpus (all four alpha filters, both uncompressed and VP8L-compressed alpha
-streams). The VP8 lossy decoder reconstructs and deblocks full key frames
-(byte-exact against plain `dwebp -yuv` for all 88 lossy corpus files plus
-locally generated `cwebp` files, both the simple and normal in-loop filters),
-converts to RGB with fancy chroma upsampling, and composes the decoded ALPH
-plane over lossy color — byte-exact against `dwebp -pam` for every lossy file,
-including lossy+alpha. The public `decodeStatic` entry point decodes both
-lossless and lossy stills to packed RGBA/BGRA/ARGB/RGB, and `decodeStaticInto`
-performs the same decode into a caller-owned pixel buffer, honoring its stride
-and format. For aligned, tightly packed four-byte lossless output, VP8L now
-reconstructs directly in the final storage and converts channel order in place;
-RGB, padded, and unaligned destinations retain the bounded scratch fallback.
-Animated WebP decode is available too: `decodeAnimation`
-returns every composited frame, and
-`AnimationDecoder` streams them one at a time over a reused canvas — both
-byte-exact against libwebp's `anim_dump` across a generated corpus spanning
-lossless/lossy/mixed frames, alpha, and every dispose/blend combination. The
-library also exposes bounded option and limit types, image buffers, metadata,
-animation-frame and feature probing, RIFF/WebP demux, static mux, and the
-VP8/VP8L bitstream infrastructure.
+Status: the full 1.0 roadmap is delivered — static and animated decode,
+static and animated encode, metadata, performance work, and hardening.
+Post-1.0, the C ABI (step 13) and internal threading (step 14) are
+design-complete in `PLAN.MD` but not implemented. Details and dated oracle
+results live in `PROGRESS.MD`.
 
-Static encode is implemented for both formats. `encodeLossless` turns a typed
-pixel buffer (RGBA/BGRA/ARGB/RGB, honoring stride) into a valid simple `VP8L`
-WebP file; the lossless encoder uses the step-7 transform/cache/group machinery
-and round-trips bit-exactly through this library's decoder. Both still encoders
-also take optional raw `ICCP`/`EXIF`/`XMP ` metadata
-(`EncoderOptions.metadata`); when present the output is an extended (`VP8X`)
-container with those chunks in spec-canonical order, round-tripping byte-exactly
-through `parseWebP` (with empty metadata the output is byte-identical to before).
-`encodeLossy` emits a valid `VP8 ` (or `VP8X` + `ALPH` + `VP8 `) WebP file with rate-distortion
-intra mode decision (the 16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock
-skip coding, the in-loop deblocking filter at a quantizer-derived level, and
-adaptive per-segment quantization (coefficient probabilities stay at the RFC
-defaults, one token partition). Step 8b met its quality gate — at matched output
-size the photo-corpus luma PSNR is within 1.0 dB of `cwebp -q 75 -m 4` (in fact
-+0.08 dB). Step 8c then completed the lossy encoder: a `method` (0..6) effort
-knob that scales the rate-distortion search, lossy+alpha via the `ALPH` chunk
-(lossless, byte-exact alpha), target-size and target-PSNR encode modes, and
-optional sharp (iterative) RGB→YUV chroma. Animation and metadata encode (step 9)
-is now feature-complete: `encodeAnimation` muxes already-encoded frame bitstreams
-into a valid animated WebP (`VP8X` + `ANIM` + `ANMF`, with optional per-frame
-`ALPH` and `ICCP`/`EXIF`/`XMP ` metadata) — the animated analogue of
-`encodeStatic` — accepted by `webpinfo`/`webpmux`/`anim_dump`.
-`encodeAnimationFromBuffers` builds on it to encode an ordered list of
-pixel-buffer frames (each full-canvas or sub-rect, lossy or lossless, with alpha)
-straight into an animated WebP, reusing the still encoders per frame; its output
-composites back through this library's `decodeAnimation` and matches libwebp's
-`anim_dump` byte-for-byte. `encodeAnimationMinimized` adds automatic frame
-optimization: it takes full-canvas frames and derives a minimal `ANMF` layout
-(sub-rectangle detection, inter-frame differencing with a blend-vs-replace
-strategy, dispose selection, and keyframe insertion) that composites back to the
-input canvases — byte-exact for lossless input, and within the codec's tolerance
-for lossy — tracking the decoder's reconstructed canvas so lossy error never
-accumulates. **Lossy frames are inter-frame optimized too:** the change rect is
-detected against a source-quality carryover canvas with a quality-derived
-content-change tolerance (`AnimationMinimizeOptions.tolerance`), so lossy
-animations shrink to sub-rects instead of full-canvas keyframes (≈48% smaller
-than a naive per-frame lossy encode on a moving-region sample, within ~0.1 dB of
-its luma PSNR). The still pixel
-encoders now also attach `ICCP`/`EXIF`/`XMP ` metadata (above). Step 9 is
-complete: the manual ≥2-browser render check of the two sample animations under
-`testdata/animation/` passed in Firefox and Chromium (2026-07-08, recorded in
-`PROGRESS.MD`). The installed `zig-webp-encode` tool re-encodes a still WebP as
-lossy `VP8 `. The installed `zig-webp-info` tool prints WebP container structure
-and features without decoding pixels.
+**Decode.** `decodeStatic` decodes lossless (VP8L), lossy (VP8), and
+lossy+alpha (`ALPH`) stills to packed RGBA/BGRA/ARGB/RGB, and
+`decodeStaticInto` performs the same decode into a caller-owned buffer,
+honoring its stride and format — byte-exact against `dwebp` on the full
+`libwebp-test-data` corpus (bit-exact YUV reconstruction with both loop
+filters, fancy chroma upsampling, alpha composition; for aligned, tightly
+packed four-byte lossless output, VP8L reconstructs directly in the final
+storage). `decodeAnimation` returns every composited frame and
+`AnimationDecoder` streams them one at a time over a reused canvas, both
+byte-exact against libwebp's `anim_dump` across lossless/lossy/mixed
+frames, alpha, and every dispose/blend combination. `parseFeatures` probes
+dimensions/format/alpha/animation/metadata without decoding pixels;
+`parseWebP` is a strict RIFF demux to chunk locations.
 
-Since `0.1.0`, the performance and hardening steps (10 and 11) are delivered.
-Lossy decode now combines vector YUV→RGB conversion, table-driven VP8 boolean
-renormalization, four-lane inverse DCT, compact residual metadata, and SIMD
-horizontal/vertical loop filtering. A pinned 135-file paired run against pure
-Rust `image-webp` measured the 70 lossy opaque stills at **0.9415× per-file
-geomean** and **0.8208× summed decode time** (Zig/Rust; lower is faster), with
-digest-identical output. VP8L color-cache lookups no longer copy the fixed
-8192-byte cache for each cache symbol; focused cache-heavy lossless stills
-improved by **2.08–3.55×**. VP8L also gained buffered entropy reads, vector/run
-inverse transforms, tighter scratch, compact Huffman setup, fixed-block palette
-expansion, and direct reconstruction into eligible final output storage.
+**Encode.** `encodeLossless` turns a typed pixel buffer into a valid VP8L
+WebP that round-trips bit-exactly through this library's decoder (median
+size 1.04× `cwebp -lossless` on the encode corpus). `encodeLossy` emits a
+valid `VP8 ` (or `VP8X` + `ALPH` + `VP8 `) file with rate-distortion intra
+mode decision (16x16/8x8 modes and per-subblock 4x4 B_PRED), macroblock
+skip coding, in-loop deblocking at a quantizer-derived level, adaptive
+per-segment quantization, a `method` (0..6) effort knob, lossless
+byte-exact `ALPH` alpha, target-size / target-PSNR modes, and optional
+sharp (iterative) RGB→YUV chroma — at matched output size the photo-corpus
+luma PSNR is within the 1.0 dB gate of `cwebp -q 75 -m 4` (in fact
++0.08 dB). Both still encoders attach optional raw `ICCP`/`EXIF`/`XMP `
+metadata in spec-canonical order. For animation, `encodeAnimation` muxes
+already-encoded frame bitstreams, `encodeAnimationFromBuffers` encodes an
+ordered list of pixel-buffer frames (full-canvas or sub-rect, lossy or
+lossless, with alpha), and `encodeAnimationMinimized` derives a minimal
+`ANMF` layout automatically (sub-rectangle detection, inter-frame
+differencing with a blend-vs-replace strategy, dispose selection, keyframe
+insertion; lossy frames use a quality-derived change tolerance, ≈48%
+smaller than a naive per-frame encode on a moving-region sample). Output is
+accepted by `webpinfo`/`webpmux`, matches `anim_dump` byte-for-byte, and
+rendered correctly in Firefox and Chromium.
 
-A later three-run, pinned 135-file comparison against Rust `image-webp`
-measured summed Zig/Rust decode-into ratios of **0.9315× lossy opaque**,
-**0.9324× lossy+alpha**, **1.0874× lossless opaque**, and **1.0492×
-lossless+alpha**. Overall summed time was **0.9465×**, but Rust still leads both
-lossless buckets. These are per-class results, not a universal-performance
-claim; exact protocol and rejected experiments are recorded in `PROGRESS.MD`.
-Every public entry point is covered by a limits/malicious-input contract matrix,
-allocation-failure injection (still and animated), encode-side fuzz targets,
-and deterministic bounded mutation exploration of every fuzz seed. Untrusted
-input fails with documented errors under caller-set `ResourceLimits`, never
-with panics or unbounded allocation. Details and dated results live in
-`PROGRESS.MD`.
+**Performance and hardening.** Lossy decode combines vector YUV→RGB
+conversion, table-driven VP8 boolean renormalization, vector inverse DCT,
+compact residual metadata, and SIMD loop filtering; VP8L adds buffered
+entropy reads, vector/run inverse transforms, compact Huffman setup, and
+direct reconstruction into eligible output storage. A pinned 135-file
+comparison against pure-Rust `image-webp` measured summed decode-into
+ratios of **0.9315×** (lossy opaque) and **0.9324×** (lossy+alpha), with
+Rust still ahead on the lossless classes (**1.0874×** opaque, **1.0492×**
+alpha) — per-class results, not a universal claim; the protocol and
+rejected experiments are recorded in `PROGRESS.MD`. Every public entry
+point is covered by a limits/malicious-input contract matrix,
+allocation-failure injection, fuzz targets with deterministic bounded
+mutation exploration, and caller-set `ResourceLimits`; untrusted input
+fails with documented errors, never panics or unbounded allocation.
+
+The installed `zig-webp-encode` tool re-encodes a still WebP as lossy
+`VP8 `; `zig-webp-info` prints container structure and features without
+decoding pixels.
 
 ## Goals
 
