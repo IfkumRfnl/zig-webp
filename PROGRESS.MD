@@ -137,6 +137,28 @@ Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms`
 
 ## Recently Completed
 
+### 2026-07-22 — 1.0.1 release verification
+
+The post-1.0 decode-performance and reporting release candidate passed the
+release procedure on Zig 0.16.0:
+
+- `zig build ci --summary all`: **18/18** steps and **509/509** tests passed,
+  including the committed decode hashes and target-size/target-PSNR gates
+  (**0.32–2.83%** size error; **38.01–38.08 dB** achieved).
+- `zig build encode-report -- --with-corpus`: **77** sources, **0**
+  round-trip mismatches; `compare-encode-corpus`: median **1.0368×** and
+  aggregate **1.0460×** versus `cwebp -lossless` (median gate ≤ 1.10×).
+- `zig build encode-lossy-report`: **34** sources, mean luma PSNR **42.08 dB**
+  over 30 finite rows and mean luma SSIM **0.989985**;
+  `compare-encode-lossy`: **135/135** outputs valid through `dwebp`.
+- `compare-anim-corpus`: **10/10** committed animations byte-exact against
+  `anim_dump`.
+
+The frozen Tier-1 API and production encode paths are unchanged from 1.0.0.
+The recorded matched-size method-4 result therefore remains **+0.08 dB**
+versus `cwebp -q 75 -m 4`; the browser animation gate did not require a
+repeat because animation encode output did not change.
+
 ### 2026-07-21 — Windowed luma SSIM on the lossy encode report
 
 `src/testing/metrics.zig` gained textbook Wang et al. 2004 luma SSIM

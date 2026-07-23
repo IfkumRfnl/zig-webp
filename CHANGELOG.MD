@@ -8,23 +8,27 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
 
 ## [Unreleased]
 
-### Changed
+## [1.0.1] — 2026-07-22
 
-- The `big-endian` CI job runs the full suite in ReleaseSafe split across
-  four parallel QEMU shard processes via
-  `zig build test -Dtest-shards=4 -Dtarget=powerpc64-linux
-  -Doptimize=ReleaseSafe -fqemu` (was: Debug, single process). Same 464
-  tests, safety checks still on; native jobs still run Debug. Local
-  same-machine QEMU baselines at `29be0df` measured Debug 18m24s vs
-  ReleaseSafe 4m23s (unsharded) and 215s (~3m35s) sharded; PR #97's
-  big-endian CI job passed in 3m9s.
+Post-1.0 performance and reporting release. The frozen Tier-1 API is
+unchanged.
+
+### Performance
+
 - VP8L reconstructs directly into aligned, tightly packed four-byte final
   output storage and converts channel order in place, avoiding a full ARGB
   scratch allocation and copy. RGB, padded, and unaligned destinations retain
   the bounded fallback.
-- Lossless decode also uses tighter scratch bounds, cheaper simple-Huffman
-  setup, fixed-block palette expansion, and vector four-byte conversion; lossy
+- Lossless decode uses tighter scratch bounds, cheaper simple-Huffman setup,
+  fixed-block palette expansion, and vector four-byte conversion. Lossy
   four-channel color conversion uses a faster byte-exact scalar kernel.
+
+### Tooling and CI
+
+- The lossy encode report includes textbook BT.601 luma SSIM over 8x8 windows
+  and computes its finite-PSNR mean using only finite rows.
+- The `big-endian` CI job runs the full suite in ReleaseSafe across four
+  parallel QEMU shards, retaining safety checks while reducing wall time.
 
 ## [1.0.0] — 2026-07-08
 
