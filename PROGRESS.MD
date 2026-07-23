@@ -153,6 +153,47 @@ sum by all 34 sources). First numbers on the unchanged 34-source corpus at
 q75: **mean luma SSIM 0.989985**; **mean luma PSNR 42.08 dB over 30 finite
 rows** (34 total sources, 4 with `inf` PSNR / exact SSIM 1.0).
 
+### 2026-07-21 — Plan 025 per-tile VP8L predictor selection rejected
+
+Implemented and measured 16×16 per-tile predictor mode selection in the VP8L
+lossless encoder (`applyPredictorTiled` + residual-cost tile pick vs global /
+identity, with a `tile_count`-byte side-information estimate; tiled mode image
+emitted via `writeLiteralSubImage`). Correctness held while the candidate was
+live: `zig build test` **507/507**, encode-report **34** and **77** sources with
+**0** round-trip mismatches.
+
+**Size (our encoder before → after):**
+
+| set | before bytes | after bytes | ratio |
+| --- | ---: | ---: | ---: |
+| 34-source committed baseline | 708428 | 692668 | **0.9778×** (shrink) |
+| 77-source local full report | 15545832 | 15574324 | **1.0018×** (grow) |
+| 4 CC0 photos | 659884 | 644086 | **0.9761×** |
+
+Photographic sources all shrank (foliage −3.67%, sky −2.63%, signage −1.76%,
+portrait −1.69%). `lossless1`/`2`/`3` each −8.65% (20508 → 18734). No file grew
+more than **+2%**; the 77-source aggregate growth is dominated by
+`lossless_big_random_alpha.webp` (+66164 B, +0.46%).
+
+**Oracle vs `cwebp -lossless` (47 real-image files, libwebp tools present):**
+
+| metric | before | after | gate |
+| --- | ---: | ---: | --- |
+| median_ratio | 1.0368× | 1.0368× | ≤ 1.0368× — held |
+| aggregate_ratio | 1.0460× | 1.0480× | (reported) |
+| lossless2 / lossless3 | 1.5927× | **1.4550×** | **< 1.40× — missed** |
+
+**Encode speed** (`zig build -Doptimize=ReleaseFast bench -- --encode-only`,
+34 lossless rows, sum of medians): **869.6 → 1013.5 ms** (**1.165×** slower);
+photo lossless geomean ~**1.16×** slower. Expected from the 14-modes-per-tile
+scan.
+
+**Decision:** REJECTED / production source reverted. The experiment confirmed
+the per-tile hypothesis helps the photographic and `lossless1`–`3` tail, but it
+missed the plan's `< 1.40×` oracle gate, grew the 77-source aggregate (STOP),
+and slowed lossless encode ~16%. `testdata/encode-corpus-sizes.tsv` was **not**
+regenerated. Encoder remains on the global predictor path.
+
 ### 2026-07-18 — Rust comparison campaign and direct VP8L reconstruction
 
 Six byte-exact changes were retained after alternating, CPU-pinned
@@ -1837,6 +1878,8 @@ and canonicalized on remux); the decode path rejects them like `dwebp`.
 | 2026-07-11 | Compact VP8L Huffman `Entry` accepted (`fbe738c`); 10-bit root rejected (`391f449`) | Accepted: `Entry` **6→4** bytes (**33%** denser; root **1.5KB→1KB**). **Correctness:** **135** validated; focused **11+5**; root compile; CI; wasm. **Speed (ReleaseFast, AMD EPYC 7663; two serial 135-file orderings vs `e45fafd`):** lossless opaque **1.0908×**/**1.0935×**, lossless alpha **1.3504×**/**1.3627×**, lossy opaque **0.9911×**/**0.9897×** (noise), lossy alpha **1.1011×**/**1.1170×** (ALPH→VP8L). Small-heavy aggregate; large-file variance (`photo_foliage` ~**0.99×**, `lossless_big_random_alpha` **0.985–1.070×**). Rejected `391f449`: +**3072** bytes/non-single table, +**15360** five-table scratch; vs accepted 8-bit base lossless opaque **0.9620×**, alpha **0.9261×** → reject/no merge; tests **481** pass. Accepted draft cut remains `fbe738c` (IDCT omitted); no general beat. |
 
 | 2026-07-15 | Plan 028 Rust-informed VP8L experiments: all four candidates rejected after decisive lossless-only remeasure; implementation reverted | Four gated ReleaseFast experiments from `703297c`. Rejected: spatial-copy (full-lossless sum **1.0052×**); cached-copy (targeted **0.9106×**); packed-byte palette (long-budget **1.0212×** <1.05); summary-free high-level decode after decisive 47-file A/B. Required per-file aggregation: opaque **0.9609×** geo / **0.8551×** sum, alpha **1.0392×** / **0.9890×**, full **0.9985×** / **0.9584×**; big-alpha **320.948→324.243 ms** (**0.9898×**). Source matches `703297c`; reviewed docs-only result at `30cc1ba`; no general `image-webp` beat claimed. |
+
+| 2026-07-21 | Plan 025 per-tile VP8L predictor selection rejected; production source reverted | Candidate: 16×16 per-tile predictor modes (residual-magnitude tile pick + `tile_count`-byte side estimate; tiled mode image via `writeLiteralSubImage`). **Correctness while live:** encode-report 34/77 sources, **0** round-trip mismatches; `zig build test` 507/507. **Size:** 34-source aggregate **708428→692668** (0.9778×); photos **0.9761×**; `lossless1`–`3` **1.5927→1.4550×** vs `cwebp -lossless`; 77-source aggregate **15545832→15574324** (1.0018× grow, led by `lossless_big_random_alpha` +0.46%); no file >+2%. Oracle median held at **1.0368×**; aggregate **1.0460→1.0480×**. **Speed:** ReleaseFast encode-only 34-row sum of medians **869.6→1013.5 ms** (**1.165×** slower). **Gates missed:** `lossless2`/`3` not <1.40×; 77-source aggregate growth triggers STOP. Production `encoder.zig` / `forward_transform.zig` reverted; committed `encode-corpus-sizes.tsv` unchanged. |
 
 Record new milestones here as dated rows: corpus, file counts, byte-exact or
 gate metric, and skips.

@@ -60,7 +60,7 @@ below and can be turned into plans on request.
 | 022 | VP8L pixel loop: comptime variants, hoisted group lookup, chunked copies | P1 | M | 021 (soft; independently executable) | DONE — merged as PR #100 (merge commit `2369b01`); about 1.05×–1.08× aggregate lossless speedup with byte-exact output |
 | 023 | VP8 loop-filter SIMD (@Vector), byte-exact | P2 | M | 020 (soft) | DONE — merged as PR #101 (merge commit `28d9a58`); horizontal SIMD improved aggregate lossy decode 1.0654×, while vertical edges remain scalar |
 | 024 | Attribution-gated spike: VP8 IDCT/prediction SIMD | P3 | S–M | 023 (hard) | REJECTED for merge — all-lossy 1.0287×–1.0375× straddled 1.03×; PR #103 retained scalar IDCT and left prediction untouched |
-| 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | TODO |
+| 025 | VP8L encoder: per-tile predictor selection (close the 1.59× tail) | P2 | L | — | REJECTED — 16×16 tiled predictor helped photos/lossless1–3 but missed the <1.40× gate (1.455×) and grew the 77-source aggregate; production source reverted |
 | 026 | Luma SSIM column in the lossy encode report | P3 | S | — | DONE — `fd1b77d` on `metrics-luma-ssim`; textbook `ssimLuma` + report column; first corpus mean SSIM 0.989985; finite-row PSNR mean fixed to 42.08 dB / 30 |
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | TODO |
 | 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | REJECTED — all four candidates missed their gates; source reverted, decisive record on `perf/vp8l-rust-informed-loops` at `30cc1ba` |
@@ -69,6 +69,11 @@ below and can be turned into plans on request.
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-21** — Plan **025** is REJECTED: 16×16 tiled prediction shrank
+  photos but missed its `< 1.40×` tail gate and grew the 77-source aggregate,
+  so production source was reverted. With plan **026** complete on the stacked
+  base, the executable TODO set is now **016/027**.
 
 - **2026-07-15** — Reconciled all 27 plans against `origin/main` at
   `7686a55`. Representative cheap HEAD checks still hold for every DONE
