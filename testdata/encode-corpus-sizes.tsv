@@ -1,37 +1,37 @@
-# zig-webp lossless encode report: encoded size and round-trip per source.
+# zig-webp lossless encode report: encoded size, round-trip, and digest per source.
 # Regenerate with `zig build encode-report -- testdata/encode-corpus-sizes.tsv`.
-family	name	width	height	format	raw_bytes	encoded_bytes	bpp	psnr_db	roundtrip
-synthetic	flat_1x1_rgb	1	1	rgb	3	38	304.0000	inf	ok
-synthetic	gradient_1x1_rgba	1	1	rgba	4	30	240.0000	inf	ok
-synthetic	gradient_1x17_rgb	1	17	rgb	51	74	34.8235	inf	ok
-synthetic	bars_17x1_rgb	17	1	rgb	51	88	41.4118	inf	ok
-synthetic	checker_7x7_rgb	7	7	rgb	147	50	8.1633	inf	ok
-synthetic	alpha_transparent_5x5_rgba	5	5	rgba	100	84	26.8800	inf	ok
-synthetic	gradient_16x16_rgb	16	16	rgb	768	474	14.8125	inf	ok
-synthetic	checker_16x16_rgb	16	16	rgb	768	50	1.5625	inf	ok
-synthetic	gradient_17x17_rgb	17	17	rgb	867	68	1.8824	inf	ok
-synthetic	checker_17x17_rgba	17	17	rgba	1156	52	1.4394	inf	ok
-synthetic	bars_15x15_rgb	15	15	rgb	675	84	2.9867	inf	ok
-synthetic	gradient_16x17_rgb	16	17	rgb	816	66	1.9412	inf	ok
-synthetic	noise_17x16_rgb	17	16	rgb	816	994	29.2353	inf	ok
-synthetic	grayscale_ramp_16x16_rgb	16	16	rgb	768	66	2.0625	inf	ok
-synthetic	noise_23x31_rgb	23	31	rgb	2139	2344	26.3001	inf	ok
-synthetic	radial_32x32_rgb	32	32	rgb	3072	650	5.0781	inf	ok
-synthetic	two_tone_31x17_rgb	31	17	rgb	1581	50	0.7590	inf	ok
-synthetic	alpha_gradient_32x32_rgba	32	32	rgba	4096	92	0.7188	inf	ok
-synthetic	alpha_checker_33x33_rgba	33	33	rgba	4356	54	0.3967	inf	ok
-synthetic	gradient_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok
-synthetic	bars_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok
-synthetic	flat_40x40_rgba	40	40	rgba	6400	50	0.2500	inf	ok
-synthetic	gradient_100x1_rgb	100	1	rgb	300	212	16.9600	inf	ok
-synthetic	bars_1x100_rgb	1	100	rgb	300	50	4.0000	inf	ok
-synthetic	noise_129x97_rgb	129	97	rgb	37539	37650	24.0710	inf	ok
-synthetic	radial_128x128_rgb	128	128	rgb	49152	4316	2.1074	inf	ok
-synthetic	gradient_256x256_rgb	256	256	rgb	196608	112	0.0137	inf	ok
-synthetic	alpha_transparent_64x64_rgba	64	64	rgba	16384	74	0.1445	inf	ok
-synthetic	checker_128x128_rgba	128	128	rgba	65536	56	0.0273	inf	ok
-synthetic	grayscale_ramp_200x60_rgb	200	60	rgb	36000	412	0.2747	inf	ok
-photo	photo_foliage.webp	512	342	rgba	700416	145622	6.6531	inf	ok
-photo	photo_portrait.webp	342	512	rgba	700416	156262	7.1392	inf	ok
-photo	photo_signage.webp	512	342	rgba	700416	183568	8.3867	inf	ok
-photo	photo_sky.webp	512	384	rgba	786432	174432	7.0977	inf	ok
+family	name	width	height	format	raw_bytes	encoded_bytes	bpp	psnr_db	roundtrip	sha256
+synthetic	flat_1x1_rgb	1	1	rgb	3	36	288.0000	inf	ok	f8b46d744b0a1f2a5359edb9f94794c051bb74191057c2a22325202f82773fad
+synthetic	gradient_1x1_rgba	1	1	rgba	4	36	288.0000	inf	ok	8dd77e8e6e27a340cb2750f7e0632d8aba44236dc53c92f63f7bfc40e3a6e57b
+synthetic	gradient_1x17_rgb	1	17	rgb	51	74	34.8235	inf	ok	2ed3eaf4a2833e81d642f205503b314d3d15f9f1910f5d8e1020ff878336290b
+synthetic	bars_17x1_rgb	17	1	rgb	51	88	41.4118	inf	ok	400fadf6e9fd9512989346ce4d0dc37e43bc716cded1a89dbee454a373606a49
+synthetic	checker_7x7_rgb	7	7	rgb	147	50	8.1633	inf	ok	5706e63dfc953ba0b902626e49505a22c889afd35d11574a65c6b2984c0f3266
+synthetic	alpha_transparent_5x5_rgba	5	5	rgba	100	84	26.8800	inf	ok	67300af403ceec7bc60daa980a6e2a51b204b47a6d932a53c3acb45ea317a83f
+synthetic	gradient_16x16_rgb	16	16	rgb	768	474	14.8125	inf	ok	cf78bdfb880eb9c3d93dfa29e9be729f13a98d69bb7fed395a21d62fe3663ddb
+synthetic	checker_16x16_rgb	16	16	rgb	768	46	1.4375	inf	ok	7fbc5a0364563aa4187625efa1146a637c9a6a830823f0a82dda459781092b33
+synthetic	gradient_17x17_rgb	17	17	rgb	867	68	1.8824	inf	ok	8ea70c14ac4b7f2d74cc3ecfbd4ebeca5dcf3b671bd3d2e209138a7e1e007861
+synthetic	checker_17x17_rgba	17	17	rgba	1156	52	1.4394	inf	ok	ef62c6dee7aef944ab1501b168bb1d4c6cf8c6e0625a346a0814bd097e20e565
+synthetic	bars_15x15_rgb	15	15	rgb	675	84	2.9867	inf	ok	95f483d5eb02781495f29a91b563a829ea3ee8c2d2917cb8d719f9395db4eaa8
+synthetic	gradient_16x17_rgb	16	17	rgb	816	66	1.9412	inf	ok	d56e7dd23eecd6a12e21fdd172ffba9705237fc84b0d8a919e272b5b60ae60cf
+synthetic	noise_17x16_rgb	17	16	rgb	816	994	29.2353	inf	ok	f2453fb7bcdfa90c57a6c19cfa30b106b3e5ebba8d42418907a1841c6e245215
+synthetic	grayscale_ramp_16x16_rgb	16	16	rgb	768	66	2.0625	inf	ok	24417f2dc3fa3ddbcea2d4c0f9326f9947f6736ca2011803185e1c574f9e0f12
+synthetic	noise_23x31_rgb	23	31	rgb	2139	2344	26.3001	inf	ok	52ca9c802ba5d6c70ce8bdf863358a8b77bbbbd8f6decdc65dafb75eb9a7925f
+synthetic	radial_32x32_rgb	32	32	rgb	3072	648	5.0625	inf	ok	04f37465cc406a10ca5fd371417e16c53658f768f6422cef163df57a7c41f432
+synthetic	two_tone_31x17_rgb	31	17	rgb	1581	50	0.7590	inf	ok	553725605180323079770bd4498203811991b504d65cb55b92a9f023c03e84b4
+synthetic	alpha_gradient_32x32_rgba	32	32	rgba	4096	92	0.7188	inf	ok	0a6c97674b769ce7ad0a2a26ed4f18203de709fc98a5ea6416183070ea84fa26
+synthetic	alpha_checker_33x33_rgba	33	33	rgba	4356	56	0.4114	inf	ok	e3d46e3db97be5d305343b3d78d71699ec563dc5c593ae5fa0f97bdcc70808da
+synthetic	gradient_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok	e097be761dcd35359c8854e68ac2bf9ecff6531da32cdeb329867eaebf7bd3a6
+synthetic	bars_64x48_rgb	64	48	rgb	9216	102	0.2656	inf	ok	17a95785ac8d2b828a9ab7ae7d7915abc920b662f1b22f763ecdb09de356b34e
+synthetic	flat_40x40_rgba	40	40	rgba	6400	44	0.2200	inf	ok	c3661cd970668741cbceb588ec6b812c21bb51abb7d2904eb4310fa41638ba1a
+synthetic	gradient_100x1_rgb	100	1	rgb	300	212	16.9600	inf	ok	898d8670bbfb23c840b3f4bf61ca381b035a79deeb13fa30933eba7427d85101
+synthetic	bars_1x100_rgb	1	100	rgb	300	44	3.5200	inf	ok	0858fbf0f2b84e12c93b4397e3ee612bdf7ed4318829a468e2ca613603a76e33
+synthetic	noise_129x97_rgb	129	97	rgb	37539	37650	24.0710	inf	ok	5df68037143f680b15935f7265d646080b4e8bcdab560f1c59e83454016043ff
+synthetic	radial_128x128_rgb	128	128	rgb	49152	4296	2.0977	inf	ok	e49d5cdfa5f66224c83186f89b39bbbea1b5af36929f7da09f3a15c04e476370
+synthetic	gradient_256x256_rgb	256	256	rgb	196608	112	0.0137	inf	ok	aca6b63a60e73008602370151874cf711a41d50b33c89b2ef7a0bcd63a97424d
+synthetic	alpha_transparent_64x64_rgba	64	64	rgba	16384	74	0.1445	inf	ok	9e5e8ca6808e26758add53a0b6e566168fb5a683e74e826b17d0995f42bd30ac
+synthetic	checker_128x128_rgba	128	128	rgba	65536	208	0.1016	inf	ok	ccc571b7e201d77ac6490c9a7e79baabc2b2acec0bed466d4ad2790748686fe3
+synthetic	grayscale_ramp_200x60_rgb	200	60	rgb	36000	400	0.2667	inf	ok	b7c3f3f3cdaf2b3c265a9f79bf7b9d0be6307225e42212c53096eb7b9844e9de
+photo	photo_foliage.webp	512	342	rgba	700416	145390	6.6425	inf	ok	cce7ff9a19fe6090b4e22ec170cc5ea5dd582447f2e1698183482e2e9c7df132
+photo	photo_portrait.webp	342	512	rgba	700416	156032	7.1287	inf	ok	befb32c424413e84be7befa2c3e5f066deede28e489fac3f746a6fb68c7578ff
+photo	photo_signage.webp	512	342	rgba	700416	183568	8.3867	inf	ok	bf49a98d78c626c4de0dac7d890479eb51d8423812ab5511fadcea458b7897cd
+photo	photo_sky.webp	512	384	rgba	786432	174432	7.0977	inf	ok	7809b56d32996c372979bfa63ae5b4e1cf5ef13c13e0dca7001c99dafd50be92

@@ -6,9 +6,8 @@
 //! For each source it encodes losslessly, decodes the result back, confirms a
 //! bit-exact round-trip, and emits a TSV row: family, name, dimensions, source
 //! format, raw pixel bytes, encoded bytes, bits-per-pixel, PSNR (inf for a
-//! lossless round-trip), and the round-trip verdict. PSNR/round-trip are
-//! trivial today but the plumbing is what step 8's lossy encoder will report
-//! against `cwebp`.
+//! lossless round-trip), the round-trip verdict, and the encoded-file SHA-256.
+//! The digest proves default output byte identity, not only size identity.
 //!
 //! Usage: zig-webp-encode-report [--with-corpus] [OUTPUT.tsv]
 //! With no OUTPUT.tsv the report goes to stdout. Regenerate the committed
@@ -56,9 +55,9 @@ pub fn main(init: std.process.Init) !void {
     var report: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer report.deinit();
     try report.writer.writeAll(
-        "# zig-webp lossless encode report: encoded size and round-trip per source.\n" ++
+        "# zig-webp lossless encode report: encoded size, round-trip, and digest per source.\n" ++
             "# Regenerate with `zig build encode-report -- testdata/encode-corpus-sizes.tsv`.\n" ++
-            "family\tname\twidth\theight\tformat\traw_bytes\tencoded_bytes\tbpp\tpsnr_db\troundtrip\n",
+            "family\tname\twidth\theight\tformat\traw_bytes\tencoded_bytes\tbpp\tpsnr_db\troundtrip\tsha256\n",
     );
 
     var stats: Stats = .{};
@@ -169,6 +168,9 @@ fn reportBuffer(
     const matches = std.mem.eql(u8, buffer.pixels[0..raw_bytes], decoded.buffer.pixels);
     const psnr = webp.testing.metrics.psnrBytes(buffer.pixels[0..raw_bytes], decoded.buffer.pixels);
 
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+
     stats.sources += 1;
     stats.raw_bytes += raw_bytes;
     stats.encoded_bytes += encoded.len;
@@ -189,7 +191,10 @@ fn reportBuffer(
     } else {
         try writer.print("{d:.3}\t", .{psnr});
     }
-    try writer.writeAll(if (matches) "ok\n" else "MISMATCH\n");
+    try writer.print("{s}\t{s}\n", .{
+        if (matches) "ok" else "MISMATCH",
+        &std.fmt.bytesToHex(digest, .lower),
+    });
 }
 
 fn formatName(format: webp.image.PixelFormat) []const u8 {

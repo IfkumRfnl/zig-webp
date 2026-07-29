@@ -63,10 +63,17 @@ rendered correctly in Firefox and Chromium.
 
 **Performance and hardening.** Lossy decode combines vector YUV→RGB
 conversion, table-driven VP8 boolean renormalization, vector inverse DCT,
-compact residual metadata, and SIMD loop filtering; VP8L adds buffered
-entropy reads, vector/run inverse transforms, compact Huffman setup, and
-direct reconstruction into eligible output storage. A pinned 135-file
-comparison against pure-Rust `image-webp` measured summed decode-into
+compact residual metadata, and SIMD loop filtering; VP8L decode adds buffered
+entropy reads, vector/run inverse transforms, compact Huffman setup, and direct
+reconstruction into eligible output storage. Default VP8L encoding uses
+hash-probed palette indexing, direct one-group palette emission, a
+constant-image run shortcut, and bounded previous-row/recent-index matching for
+palettes up to 96 colors. On the pinned six-source low-color UI/alpha corpus,
+this default path measured **0.7293×** libwebp lossless preset 0 time while
+emitting **0.8029×** its bytes; this is a class-specific, single-threaded
+result, not a general encoder claim.
+A pinned 135-file comparison against pure-Rust `image-webp` measured summed
+decode-into
 ratios of **0.9315×** (lossy opaque) and **0.9324×** (lossy+alpha), with
 Rust still ahead on the lossless classes (**1.0874×** opaque, **1.0492×**
 alpha) — per-class results, not a universal claim; the protocol and
@@ -121,6 +128,7 @@ tools/webp-oracle.sh compare-encode-lossy
 zig build -Doptimize=ReleaseFast bench
 tools/webp-bench.sh
 tools/webp-rust-bench.sh
+tools/webp-fast-lossless-bench.sh --output .zig-cache/fast-lossless.tsv
 ```
 
 The package exposes the `webp` module from `src/root.zig`.

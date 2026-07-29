@@ -23,6 +23,10 @@ Plan 028: Rust-informed VP8L performance audit of 2026-07-15 (commit
 Plan 029: authored 2026-07-15 after review of plan 028's decisive rejection
 record; attribution-gated removal of the avoidable VP8L `decodeStaticInto`
 packed-output allocation/copy, with a conditional output-kernel experiment.
+Plan 030: authored 2026-07-29 on maintainer request (commit `a3a0e40`);
+measurement-gated fast lossless encoding for low-color UI/icon assets, with a
+direct libwebp preset-0 comparator and explicit speed, size, and default-path
+identity gates.
 Execute in the order below unless dependencies say otherwise. Each executor:
 read the plan fully before starting, honor its STOP conditions, and update
 your row when done.
@@ -65,10 +69,32 @@ below and can be turned into plans on request.
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | DONE — merged as PR #112 (merge `8f2a7e1`); PLAN.MD step 14 records the opt-in caller-supplied `std.Io` + `Io.Group` model, determinism/budget/failure contracts, per-path structure, and implementation gates; no code |
 | 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | REJECTED — all four candidates missed their gates; source reverted, decisive record on `perf/vp8l-rust-informed-loops` at `30cc1ba` |
 | 029 | Attribute and remove the VP8L `decodeStaticInto` output tax | P1 | M-L | 022 + reviewed 028 outcome | DONE — direct lossless sink accepted at 1.0714× full-lossless summed speedup; output-kernel follow-on skipped below its 5% gate |
+| 030 | Beat libwebp on fast lossless UI encoding | P1 | L | — | REJECTED as specified — no explicit fast effort/default identity; authorized default-path follow-up passes the comparator at 0.7293× time, 2/2 real rows, and 0.8029× aggregate bytes |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Reconcile log
+
+- **2026-07-29** — A maintainer-authorized post-plan default-path campaign now
+  passes plan 030's competitive benchmark gates: **0.7293×** preset-0 primary
+  geomean time, **2/2** real rows faster, **0.8029×** aggregate size, and a
+  **1.1765×** maximum row. Formal plan 030 remains REJECTED as specified
+  because the follow-up intentionally adds no explicit fast-lossless effort and
+  changes default bytes. The 77-source oracle remains 1.0368× median with 0
+  failures.
+
+- **2026-07-29** — Plan **030** is REJECTED after both allowed focused
+  prototypes missed the direct libwebp preset-0 gate. The best time result was
+  **2.4682×** with **0/2** primary real rows faster; its **1.9339×** aggregate
+  and **10.9602×** maximum size ratios also failed. Production/API experiments
+  were reverted; the reproducible direct-API benchmark and corpus remain. The
+  executable TODO set is now **016**.
+
+- **2026-07-29** — Plan **030** added as the next competitive performance
+  campaign. It is measurement-gated: build the direct-API UI/palette benchmark
+  first, retain production changes only if fast Zig reaches ≤0.90× libwebp
+  preset-0 time within the fixed size gates, and preserve the default lossless
+  path. The executable TODO set is **016/030**.
 
 - **2026-07-21** — Plan **025** is REJECTED: 16×16 tiled prediction shrank
   photos but missed its `< 1.40×` tail gate and grew the 77-source aggregate,
@@ -246,6 +272,10 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   copy cost. Production work proceeds only if the packed-output tax is
   material, then removes that allocation and second copy from lossless
   `decodeStaticInto`; format-kernel specialization is a separate gate.
+- 030 is independent of 016 and the completed decode-performance plans. Its
+  direct libwebp benchmark/corpus must land before its production experiment;
+  a missed speed or size gate completes the plan as REJECTED, not as an
+  invitation to widen VP8L scope.
 
 ## Performance audit — 2026-07-15 (commit `02f4e05`)
 

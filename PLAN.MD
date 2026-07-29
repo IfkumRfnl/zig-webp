@@ -226,6 +226,11 @@ below is the roadmap record:
 - **Step 7** — VP8L lossless encoder: subtract-green, color, predictor, and
   palette transforms, LZ77, color cache, and meta-prefix groups; bit-exact
   round-trips with median size 1.04× `cwebp -lossless` (gate ≤ 1.10×).
+  On the pinned six-source low-color UI/alpha corpus, the default path measures
+  **0.7293×** libwebp lossless preset 0 time, wins both real-asset rows, and
+  emits **0.8029×** aggregate bytes. It uses bounded palette-specific
+  tokenization without a separate public effort mode; dated evidence and the
+  formal plan-030 disposition live in `PROGRESS.MD`.
   Optional near-lossless preprocessing was not implemented — a quality
   refinement, never a gate — and remains available future work.
 - **Step 8** — VP8 lossy encoder in three gated phases (8a valid bitstream,

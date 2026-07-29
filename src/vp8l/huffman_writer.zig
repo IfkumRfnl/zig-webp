@@ -3,8 +3,8 @@
 //! This is the exact inverse of `huffman.zig`'s reader. The reader assigns
 //! canonical codes in ascending (length, symbol) order via its `buildNextCodes`
 //! and then bit-reverses them for LSB-first reading; this writer assigns the
-//! same canonical codes and emits the reversed bits, so any code this module
-//! produces is decoded back to the same symbol by `huffman.SymbolTable`.
+//! same canonical codes and stores their reversed form so hot-path emission is
+//! a direct table lookup.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,14 +15,13 @@ const huffman = @import("huffman.zig");
 
 pub const max_code_bits = huffman.max_code_bits;
 
-/// A canonical prefix code over an alphabet: per-symbol code lengths plus the
-/// canonical code value for each populated symbol. Lengths of 0 mean a symbol
-/// is unused. The code values are *not* bit-reversed; emission reverses them.
+/// A prefix code over an alphabet: per-symbol code lengths plus the
+/// LSB-first code value for each populated symbol. Lengths of 0 mean a symbol
+/// is unused. `build` reverses canonical codes once, before emission.
 pub const Code = struct {
     /// Code length per symbol (0 = unused), sized to the alphabet.
     lengths: []const u8,
-    /// Canonical (un-reversed) code per symbol; only meaningful where
-    /// `lengths[i] != 0`.
+    /// LSB-first code per symbol; only meaningful where `lengths[i] != 0`.
     codes: []const u16,
     /// Set to the lone symbol when the code has exactly one populated symbol.
     /// The reader's single-leaf table returns that symbol without consuming any
@@ -46,8 +45,7 @@ pub const Code = struct {
         assert(length > 0);
         assert(length <= max_code_bits);
 
-        const reversed = reverseBits(self.codes[symbol], length);
-        try writer.writeBits(reversed, @intCast(length));
+        try writer.writeBits(self.codes[symbol], @intCast(length));
     }
 };
 
@@ -96,6 +94,10 @@ pub fn buildLimited(
 
     assignLengths(counts, lengths, length_limit);
     assignCodes(lengths, codes);
+    for (lengths, codes) |length, *code| {
+        if (length == 0) continue;
+        code.* = @intCast(reverseBits(code.*, length));
+    }
 }
 
 /// Computes length-limited code lengths from histogram counts using a
@@ -221,7 +223,7 @@ fn buildLengthLimited(counts: []const u32, lengths: []u8, length_limit: u8) void
 
     // Derive per-symbol depths by walking the tree.
     var depths: [symbol_count_max]u8 = .{0} ** symbol_count_max;
-    assignDepths(&nodes, &depths, &leaf_symbols, leaf_count, root);
+    assignDepths(&nodes, &depths, root);
 
     // Map leaf depths back to per-symbol lengths, limiting to the depth cap.
     var symbol_lengths: [symbol_count_max]u8 = undefined;
@@ -239,8 +241,6 @@ fn buildLengthLimited(counts: []const u32, lengths: []u8, length_limit: u8) void
 fn assignDepths(
     nodes: *const [2 * symbol_count_max]Node,
     depths: *[symbol_count_max]u8,
-    leaf_symbols: *const [symbol_count_max]usize,
-    leaf_count: usize,
     root: usize,
 ) void {
     const Frame = struct {
@@ -262,14 +262,10 @@ fn assignDepths(
             stack[stack_len] = .{ .node = node.right, .depth = frame.depth + 1 };
             stack_len += 1;
         } else {
-            // Find the leaf index for this symbol.
-            var leaf_index: usize = 0;
-            while (leaf_index < leaf_count) : (leaf_index += 1) {
-                if (leaf_symbols[leaf_index] == node.symbol) break;
-            }
-            assert(leaf_index < leaf_count);
+            // Leaf nodes are inserted first and retain their leaf-order index.
+            assert(frame.node < symbol_count_max);
             const depth: u8 = if (frame.depth == 0) 1 else @intCast(@min(frame.depth, 255));
-            depths[leaf_index] = depth;
+            depths[frame.node] = depth;
         }
     }
 }

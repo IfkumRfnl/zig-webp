@@ -8,6 +8,31 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
 
 ## [Unreleased]
 
+### Performance
+
+- Default VP8L encoding now uses direct palette emission, constant-palette run
+  tokenization, direct unpacked-index writes, and a bounded previous-row/
+  recent-index matcher for low-color images. On the pinned six-source UI/alpha
+  corpus, the primary geomean improved from 19.1765× to 0.7293× libwebp
+  lossless preset 0 time (a 26.29× normalized improvement), with both real
+  rows faster. This is a narrow single-threaded corpus result, not a general
+  encoder claim.
+- Primary output is 0.8029× libwebp preset 0 aggregate bytes with a 1.1765×
+  maximum row. It is 100 bytes larger than the pre-campaign Zig output, an
+  explicit speed/size trade within the fixed plan gates.
+- The 77-source lossless corpus remains bit-exact on decode and is 594 bytes
+  smaller than the original campaign baseline. Its libwebp size oracle remains
+  1.0368× median / 1.0460× aggregate.
+
+### Tooling
+
+- Added an optional direct-API, single-threaded Zig/libwebp fast-lossless
+  benchmark over a pinned, provenance-recorded UI/alpha corpus. Its C adapter
+  and generated artifacts remain local under `.zig-cache/`.
+- The lossless encode report now appends each encoded file's SHA-256 so
+  performance experiments can prove default output byte identity, not only
+  size and round-trip identity.
+
 ## [1.0.1] — 2026-07-22
 
 Post-1.0 performance and reporting release. The frozen Tier-1 API is
