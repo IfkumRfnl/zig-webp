@@ -235,9 +235,9 @@ fn buildLengthLimited(counts: []const u32, lengths: []u8, length_limit: u8) void
     }
 }
 
-/// Walks the tree to record each leaf's depth, indexed by leaf order. `depths`
-/// is indexed by leaf position (0..leaf_count); the symbol is looked up via the
-/// node's stored symbol against the leaf list.
+/// Iteratively walks the tree to record each leaf's depth. Leaves are inserted
+/// first, so a leaf node index is its leaf-order index and `depths` is indexed
+/// directly by that position.
 fn assignDepths(
     nodes: *const [2 * symbol_count_max]Node,
     depths: *[symbol_count_max]u8,

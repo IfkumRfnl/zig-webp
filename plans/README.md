@@ -76,8 +76,8 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 ## Reconcile log
 
 - **2026-07-29** — A maintainer-authorized post-plan default-path campaign now
-  passes plan 030's competitive benchmark gates: **0.7293×** preset-0 primary
-  geomean time, **2/2** real rows faster, **0.8029×** aggregate size, and a
+  passes plan 030's competitive speed and size gates: **0.7293×** preset-0
+  primary geomean time, **2/2** real rows faster, **0.8029×** aggregate size,
   **1.1765×** maximum row. Formal plan 030 remains REJECTED as specified
   because the follow-up intentionally adds no explicit fast-lossless effort and
   changes default bytes. The 77-source oracle remains 1.0368× median with 0

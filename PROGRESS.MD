@@ -20,9 +20,10 @@ Step 7 (VP8L lossless encode) is complete. The encoder emits valid still VP8L
 from typed pixel buffers, applies LZ77 plus the decision-gated subtract-green,
 color, predictor, palette/color-indexing, optional color-cache, and optional
 meta-prefix paths, and round-trips the encode corpus bit-exactly. Its default
-low-color path now uses bounded planning and matching work while preserving or
-improving measured output size. The committed lossless encode report remains
-the size gate (median 1.04x vs `cwebp -lossless`).
+low-color path now uses bounded planning and matching work. The committed
+77-source report remains within its size gate (median 1.04x versus
+`cwebp -lossless`), while the pinned primary UI corpus trades 100 bytes for
+speed.
 
 Step 8 (VP8 lossy encode) is complete through 8c. The encoder emits valid VP8
 key frames, implements rate-distortion mode decision, B_PRED, skip coding,
@@ -183,11 +184,15 @@ maximum row. This is a deliberate speed/size trade: the result is 100 bytes
 (3.55%) larger than the pre-campaign Zig primary output, so the claim is not
 that every Zig output shrank.
 
+The two-source secondary palette-miss class was **16.147186×** libwebp
+preset-0 geomean time and **0.966061×** aggregate bytes. That losing timing
+class was predeclared and remains outside the primary claim.
+
 The 77-source default report completed with **0 mismatches** and **15,545,238**
 encoded bytes: 594 bytes smaller than the original campaign baseline and 424
 bytes larger than the preceding intermediate. The libwebp oracle remains
 **1.0368× median / 1.0460× aggregate**, with 0 failures.
-`zig build ci --summary all` passed **19/19** steps and **512/512** tests;
+`zig build ci --summary all` passed **19/19** steps and **515/515** tests;
 `zig build wasm-check --summary all` passed **4/4** compile steps.
 
 This does not retroactively accept formal plan 030: that plan required an

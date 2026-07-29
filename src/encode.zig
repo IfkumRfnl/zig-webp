@@ -861,6 +861,96 @@ test "encodeStaticLossless honors stride and bgra input" {
     }
 }
 
+test "lossless ARGB vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // Little-endian targets gather this full row as one vector; big-endian
+    // targets exercise the scalar fallback against the same behavior.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0xff, 0x11, 0x22, 0x33,
+        0xff, 0x44, 0x55, 0x66,
+        0xff, 0x77, 0x88, 0x99,
+        0x80, 0xaa, 0xbb, 0xcc,
+        0xff, 0x0d, 0x1e, 0x2f,
+        0xff, 0x3a, 0x4b, 0x5c,
+        0xff, 0x6d, 0x7e, 0x8f,
+        0xff, 0x90, 0xa1, 0xb2,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2233,
+        0xff44_5566,
+        0xff77_8899,
+        0x80aa_bbcc,
+        0xff0d_1e2f,
+        0xff3a_4b5c,
+        0xff6d_7e8f,
+        0xff90_a1b2,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .argb,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .argb });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
+test "lossless BGRA vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // The transparent sample sits inside the first vector-width row, making
+    // vector alpha detection observable through the lossless round-trip.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0x31, 0x21, 0x11, 0xff,
+        0x62, 0x52, 0x42, 0xff,
+        0x93, 0x83, 0x73, 0xff,
+        0xc4, 0xb4, 0xa4, 0xff,
+        0xf5, 0xe5, 0xd5, 0xff,
+        0x26, 0x16, 0x06, 0x40,
+        0x57, 0x47, 0x37, 0xff,
+        0x88, 0x78, 0x68, 0xff,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2131,
+        0xff42_5262,
+        0xff73_8393,
+        0xffa4_b4c4,
+        0xffd5_e5f5,
+        0x4006_1626,
+        0xff37_4757,
+        0xff68_7888,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .bgra,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .bgra });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
 test "encodeStaticLossless rejects lossy format requests" {
     const dims = try image.Dimensions.init(1, 1);
     var pixels = [_]u8{ 1, 2, 3, 4 };

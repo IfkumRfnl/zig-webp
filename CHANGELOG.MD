@@ -12,11 +12,11 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
 
 - Default VP8L encoding now uses direct palette emission, constant-palette run
   tokenization, direct unpacked-index writes, and a bounded previous-row/
-  recent-index matcher for low-color images. On the pinned six-source UI/alpha
-  corpus, the primary geomean improved from 19.1765× to 0.7293× libwebp
-  lossless preset 0 time (a 26.29× normalized improvement), with both real
-  rows faster. This is a narrow single-threaded corpus result, not a general
-  encoder claim.
+  recent-index matcher for low-color images. On the six primary low-color
+  sources of the pinned eight-source UI/alpha corpus, the primary geomean
+  improved from 19.1765× to 0.7293× libwebp lossless preset 0 time (a 26.29×
+  normalized improvement), with both real rows faster. This is a narrow
+  single-threaded corpus result, not a general encoder claim.
 - Primary output is 0.8029× libwebp preset 0 aggregate bytes with a 1.1765×
   maximum row. It is 100 bytes larger than the pre-campaign Zig output, an
   explicit speed/size trade within the fixed plan gates.

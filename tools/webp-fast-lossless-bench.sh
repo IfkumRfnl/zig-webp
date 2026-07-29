@@ -8,10 +8,10 @@ measures Zig encodeLossless, libwebp lossless preset 0, and libwebp preset 6.
 The stable command selects Zig method 0 (currently identical to the default
 lossless path); --zig-method 4 selects the existing default/full control.
 
-Each effort uses 3 warmups and 15 median samples. Tiny inputs are batched to at
-least 262144 pixels (maximum 256 encodes). Timing includes RGBA/ARGB gathering,
-encoder work, output allocation, and cleanup, but excludes source I/O. libwebp
-uses exact=1 and thread_level=0. Codec and dwebp pixel-exact validation is fatal;
+Each effort uses 3 warmups and 15 median samples. Tiny inputs are batched up to
+roughly 262144 pixels (maximum 256 encodes). Timing includes RGBA/ARGB
+gathering, encoder work, output allocation, and cleanup, but excludes source I/O.
+libwebp uses exact=1 and thread_level=0. Codec and dwebp pixel-exact validation is fatal;
 performance and size gates are diagnostics in the TSV. All generated C, raw,
 PAM, and WebP artifacts remain under .zig-cache/webp-fast-lossless-bench.
 HELP
@@ -19,8 +19,14 @@ HELP
 output=; zig_method=0
 while (($#)); do
   case "$1" in
-    --output) (($# >= 2)) || exit 2; output=$2; shift 2 ;;
-    --zig-method) (($# >= 2)) || exit 2; zig_method=$2; shift 2 ;;
+    --output)
+      (($# >= 2)) || { echo "benchmark: --output requires a value" >&2; exit 2; }
+      output=$2; shift 2
+      ;;
+    --zig-method)
+      (($# >= 2)) || { echo "benchmark: --zig-method requires a value" >&2; exit 2; }
+      zig_method=$2; shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "benchmark: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -151,17 +157,27 @@ mkdir -p "$(dirname "$output")"; tmp=$work/report.tmp
   cat "$rows"
   awk -F'\t' '$1=="file"{k=$2 SUBSEP $5 SUBSEP $6;n[k]++;ns[k]+=$15;bytes[k]+=$17;logs[k]+=log($15)}END{print "# summary_fields\tclass\timplementation\teffort\trows\tgeomean_ns\tsummed_ns\taggregate_bytes";for(k in n){split(k,p,SUBSEP);printf "# summary\t%s\t%s\t%s\t%d\t%.3f\t%.0f\t%.0f\n",p[1],p[2],p[3],n[k],exp(logs[k]/n[k]),ns[k],bytes[k]}}' "$rows"
   awk -F'\t' '
-    $1=="file" && ($2=="opaque-ui" || $2=="alpha-ui") {
-      src[$3]=1;
+    NR==FNR {
+      if ($2=="opaque-ui" || $2=="alpha-ui") {
+        if (!($1 in expected_primary)) expected_primary_count++;
+        expected_primary[$1]=1;
+      }
+      next;
+    }
+    $1=="file" && ($3 in expected_primary) {
       if ($5=="zig-current") {
-        zt[$3]=$15; zb[$3]=$17;
+        if (($15+0)>0 && ($17+0)>0) {
+          zt[$3]=$15; zb[$3]=$17; zig_complete[$3]=1;
+        }
       } else if ($6=="preset-0") {
-        ft[$3]=$15; fb[$3]=$17;
+        if (($15+0)>0 && ($17+0)>0) {
+          ft[$3]=$15; fb[$3]=$17; preset0_complete[$3]=1;
+        }
       }
     }
     END {
-      for (id in src) {
-        if (!(id in zt) || !(id in ft) || !(id in fb)) continue;
+      for (id in expected_primary) {
+        if (!(id in zig_complete) || !(id in preset0_complete)) continue;
         ratio=zt[id]/ft[id]; log_ratio+=log(ratio); primary_count++;
         if (substr(id,1,5)=="real-") {
           real_count++;
@@ -171,16 +187,17 @@ mkdir -p "$(dirname "$output")"; tmp=$work/report.tmp
         size_ratio=zb[id]/fb[id];
         if (size_ratio>max_size_ratio) max_size_ratio=size_ratio;
       }
-      geomean=exp(log_ratio/primary_count);
-      real_win_fraction=real_wins/real_count;
-      aggregate_size_ratio=zig_bytes/preset0_bytes;
-      printf "# gate\tprimary_geomean_time_ratio\t%.6f\t<=0.90\t%s\n",geomean,(geomean <= 0.90) ? "PASS" : "FAIL";
-      printf "# gate\tprimary_real_asset_row_win_fraction\t%.6f\t>=0.70\t%s\treal_rows=%d\n",real_win_fraction,(real_win_fraction >= 0.70) ? "PASS" : "FAIL",real_count;
-      printf "# gate\tprimary_aggregate_size_ratio_vs_preset0\t%.6f\t<=1.15\t%s\n",aggregate_size_ratio,(aggregate_size_ratio <= 1.15) ? "PASS" : "FAIL";
-      printf "# gate\tprimary_max_size_ratio_vs_preset0\t%.6f\t<=1.30\t%s\n",max_size_ratio,(max_size_ratio <= 1.30) ? "PASS" : "FAIL";
-      printf "# gate\tcomplete_valid_primary_sources\t%d\trequired-all\tPASS\n",primary_count;
+      complete=(expected_primary_count>0 && primary_count==expected_primary_count);
+      geomean=(primary_count>0) ? exp(log_ratio/primary_count) : 0;
+      real_win_fraction=(real_count>0) ? real_wins/real_count : 0;
+      aggregate_size_ratio=(preset0_bytes>0) ? zig_bytes/preset0_bytes : 0;
+      printf "# gate\tprimary_geomean_time_ratio\t%.6f\t<=0.90\t%s\n",geomean,(complete && geomean <= 0.90) ? "PASS" : "FAIL";
+      printf "# gate\tprimary_real_asset_row_win_fraction\t%.6f\t>=0.70\t%s\treal_rows=%d\n",real_win_fraction,(complete && real_count>0 && real_win_fraction >= 0.70) ? "PASS" : "FAIL",real_count;
+      printf "# gate\tprimary_aggregate_size_ratio_vs_preset0\t%.6f\t<=1.15\t%s\n",aggregate_size_ratio,(complete && preset0_bytes>0 && aggregate_size_ratio <= 1.15) ? "PASS" : "FAIL";
+      printf "# gate\tprimary_max_size_ratio_vs_preset0\t%.6f\t<=1.30\t%s\n",max_size_ratio,(complete && max_size_ratio <= 1.30) ? "PASS" : "FAIL";
+      printf "# gate\tcomplete_valid_primary_sources\t%d\trequired-all\t%s\n",primary_count,complete ? "PASS" : "FAIL";
     }
-  ' "$rows"
+  ' "$manifest" "$rows"
 } >"$tmp"
 mv "$tmp" "$output"
 echo "benchmark: wrote $((count*3)) valid rows to $output" >&2

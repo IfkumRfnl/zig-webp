@@ -2227,10 +2227,29 @@ test "encodes and round-trips a 1x1 image" {
     try decodeRoundTrip(testing.allocator, dims, &pixels);
 }
 
-test "encodes and round-trips a solid all-zero image (cache-hit-on-empty-cache)" {
-    // A fully transparent black image: the first pixel value is 0, which hits
-    // the zero-initialized color cache, so no literal channels are ever emitted.
-    // The encoder must still build valid red/blue/alpha codes.
+test "GroupCodes builds side-channel fallbacks for a cache-only histogram" {
+    // A cache symbol contributes no literal-channel counts, but every emitted
+    // Huffman group still needs valid red, blue, and alpha single-leaf codes.
+    var histogram: Histogram = .{};
+    histogram.addOp(.{ .cache = 0 });
+
+    var codes: GroupCodes = .{};
+    codes.build(&histogram, 2);
+
+    const red = codes.redCode();
+    const blue = codes.blueCode();
+    const alpha = codes.alphaCode();
+    try testing.expectEqual(@as(?usize, 0), red.single_symbol);
+    try testing.expectEqual(@as(?usize, 0), blue.single_symbol);
+    try testing.expectEqual(@as(?usize, 0), alpha.single_symbol);
+    try testing.expectEqual(@as(u8, 1), red.lengths[0]);
+    try testing.expectEqual(@as(u8, 1), blue.lengths[0]);
+    try testing.expectEqual(@as(u8, 1), alpha.lengths[0]);
+}
+
+test "encodes and round-trips a solid all-zero image through a one-color palette" {
+    // Fully transparent black has one distinct color, so palette planning
+    // transforms it into a one-color indexed image before entropy coding.
     const dims = try image.Dimensions.init(40, 40);
     var pixels: [40 * 40]pixel.Pixel = undefined;
     @memset(&pixels, 0);
