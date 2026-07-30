@@ -20,9 +20,10 @@ Step 7 (VP8L lossless encode) is complete. The encoder emits valid still VP8L
 from typed pixel buffers, applies LZ77 plus the decision-gated subtract-green,
 color, predictor, palette/color-indexing, optional color-cache, and optional
 meta-prefix paths, and round-trips the encode corpus bit-exactly. Its default
-low-color path now uses bounded planning and matching work. The committed
-77-source report remains within its size gate (median 1.04x versus
-`cwebp -lossless`), while the pinned primary UI corpus trades 100 bytes for
+low-color path now uses bounded planning and matching work. The 77-source full
+report (the committed 34-source baseline plus the optional corpus) remains
+within its size gate (median 1.04x versus `cwebp -lossless`), while the pinned
+primary UI corpus trades 100 bytes for
 speed.
 
 Step 8 (VP8 lossy encode) is complete through 8c. The encoder emits valid VP8

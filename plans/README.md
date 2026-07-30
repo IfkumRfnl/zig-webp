@@ -69,7 +69,7 @@ below and can be turned into plans on request.
 | 027 | Threading design doc in PLAN.MD (post-1.0, no code) | P3 | M | 020–023 (soft) | DONE — merged as PR #112 (merge `8f2a7e1`); PLAN.MD step 14 records the opt-in caller-supplied `std.Io` + `Io.Group` model, determinism/budget/failure contracts, per-path structure, and implementation gates; no code |
 | 028 | Rust-informed VP8L entropy, cache-copy, palette, and summary experiments | P1 | L | 022 + `02f4e05` | REJECTED — all four candidates missed their gates; source reverted, decisive record on `perf/vp8l-rust-informed-loops` at `30cc1ba` |
 | 029 | Attribute and remove the VP8L `decodeStaticInto` output tax | P1 | M-L | 022 + reviewed 028 outcome | DONE — direct lossless sink accepted at 1.0714× full-lossless summed speedup; output-kernel follow-on skipped below its 5% gate |
-| 030 | Beat libwebp on fast lossless UI encoding | P1 | L | — | REJECTED as specified — no explicit fast effort/default identity; authorized default-path follow-up passes the comparator at 0.7293× time, 2/2 real rows, and 0.8029× aggregate bytes |
+| 030 | Beat libwebp on fast lossless UI encoding | P1 | L | — | REJECTED — both prototypes missed the ≤0.90× preset-0 speed gate (best 2.4682×, 0/2 real rows); the authorized default-path follow-up is outside the specified explicit-effort/default-identity contract but passes the comparator at 0.7293× time, 2/2 real rows, and 0.8029× aggregate bytes |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

@@ -32,6 +32,9 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
 - The lossless encode report now appends each encoded file's SHA-256 so
   performance experiments can prove default output byte identity, not only
   size and round-trip identity.
+- The fast-lossless benchmark now classifies one-color sources as palette
+  hits, rejects malformed manifest rows at parse time, and reports actionable
+  libwebp setup guidance when its system and optional local builds fail.
 
 ## [1.0.1] — 2026-07-22
 

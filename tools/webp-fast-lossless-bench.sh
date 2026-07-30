@@ -100,7 +100,7 @@ static void bench(const Raw *r,const char *class,const char *source,const char *
   if(!decoded||memcmp(decoded,r->pixels,r->bytes)) die("pixel-exact round-trip failed");
   WebPFree(decoded); save(path,out.mem,out.size);
   uint32_t count=colors(r); double mpps=(double)pixels*1000.0/(double)median;
-  printf("file\t%s\t%s\t%s\tlibwebp\tpreset-%d\t%u\t%u\t%" PRIu64 "\t%u\t%s\t%s\t%u\t%u\t%" PRIu64 "\t%.6f\t%zu\tyes\tyes\n",class,source,prov,preset,r->width,r->height,pixels,count,count>=2&&count<=256?"yes":"no",alpha(r)?"yes":"no",SAMPLES,b,median,mpps,out.size);
+  printf("file\t%s\t%s\t%s\tlibwebp\tpreset-%d\t%u\t%u\t%" PRIu64 "\t%u\t%s\t%s\t%u\t%u\t%" PRIu64 "\t%.6f\t%zu\tyes\tyes\n",class,source,prov,preset,r->width,r->height,pixels,count,count<=256?"yes":"no",alpha(r)?"yes":"no",SAMPLES,b,median,mpps,out.size);
   WebPMemoryWriterClear(&out);
 }
 int main(int argc,char **argv) {
@@ -114,7 +114,8 @@ elif cc -O3 -std=c11 -Wall -Wextra -Werror -Ireferences/libwebp/src \
     "$adapter.c" -l:libwebp.so.7 -o "$adapter"; then
   :
 else
-  echo "benchmark: libwebp headers/library unavailable; normal and checked-in-header compile/link attempts failed" >&2
+  echo "benchmark: system libwebp and optional references/libwebp clone compile/link attempts failed" >&2
+  echo "benchmark: install libwebp development files or clone references/libwebp; see references/README.MD" >&2
   exit 1
 fi
 zig_rows=$work/zig.tsv; c_rows=$work/c.tsv; : >"$c_rows"

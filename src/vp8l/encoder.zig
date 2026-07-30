@@ -107,6 +107,9 @@ pub fn encodeAlloc(
     return encodeAllocInternal(gpa, dimensions, pixels, null);
 }
 
+/// Encodes like `encodeAlloc` while trusting the caller's alpha hint instead of
+/// scanning `pixels`. Callers must pass `true` exactly when at least one pixel
+/// has an alpha channel value below 255.
 pub fn encodeAllocKnownAlpha(
     gpa: std.mem.Allocator,
     dimensions: image.Dimensions,
@@ -1368,13 +1371,6 @@ fn emitPaletteMainImage(
     }
 }
 
-fn tokenKind(token: lz77.Token) Op.Kind {
-    return switch (token) {
-        .literal => |value| .{ .literal = value },
-        .copy => |copy| .{ .copy = copy },
-    };
-}
-
 /// Chooses and emits the cheapest main-image encoding. Each candidate (a
 /// single Huffman group with each candidate color-cache size, and a multi-group
 /// entropy-image encoding) is fully encoded into a scratch buffer so its exact
@@ -2499,6 +2495,31 @@ test "encoder marks opaque images as alpha-free in the header" {
     defer testing.allocator.free(encoded2);
     const parsed2 = try header.parse(encoded2);
     try testing.expect(parsed2.has_alpha);
+}
+
+test "encodeAllocKnownAlpha trusts the supplied alpha hint" {
+    const dims = try image.Dimensions.init(1, 1);
+    const pixels = [_]pixel.Pixel{pixel.fromChannels(128, 1, 2, 3)};
+
+    const without_alpha_hint = try encodeAllocKnownAlpha(
+        testing.allocator,
+        dims,
+        &pixels,
+        false,
+    );
+    defer testing.allocator.free(without_alpha_hint);
+    const parsed_without_hint = try header.parse(without_alpha_hint);
+    try testing.expect(!parsed_without_hint.has_alpha);
+
+    const with_alpha_hint = try encodeAllocKnownAlpha(
+        testing.allocator,
+        dims,
+        &pixels,
+        true,
+    );
+    defer testing.allocator.free(with_alpha_hint);
+    const parsed_with_hint = try header.parse(with_alpha_hint);
+    try testing.expect(parsed_with_hint.has_alpha);
 }
 
 test "encoder rejects a pixel count that disagrees with dimensions" {

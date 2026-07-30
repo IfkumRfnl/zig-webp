@@ -684,11 +684,12 @@ fn metadataByteCount(raw_metadata: metadata.RawPayloads) u64 {
     return bytes;
 }
 
-/// Reads the caller buffer's pixels (any supported format, honoring stride)
-/// into packed ARGB `vp8l_pixel.Pixel` values in row-major order.
 const gather_vector_pixels = 8;
 const GatherPixelVector = @Vector(gather_vector_pixels, vp8l_pixel.Pixel);
 
+/// Reads the caller buffer's pixels (any supported format, honoring stride)
+/// into packed ARGB `vp8l_pixel.Pixel` values in row-major order. Returns
+/// whether any source pixel has an alpha channel value below 255.
 fn gatherArgb(buffer: image.Buffer, argb: []vp8l_pixel.Pixel) bool {
     return switch (buffer.format) {
         inline else => |format| gatherArgbFormat(format, buffer, argb),
@@ -902,6 +903,51 @@ test "lossless ARGB vector-width gather preserves channels and alpha" {
     const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
     defer testing.allocator.free(encoded);
     var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .argb });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
+test "lossless RGBA vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // Little-endian targets gather this full row as one vector; big-endian
+    // targets exercise the scalar fallback against the same behavior.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0x11, 0x22, 0x33, 0xff,
+        0x44, 0x55, 0x66, 0xff,
+        0x77, 0x88, 0x99, 0xff,
+        0xaa, 0xbb, 0xcc, 0x80,
+        0x0d, 0x1e, 0x2f, 0xff,
+        0x3a, 0x4b, 0x5c, 0xff,
+        0x6d, 0x7e, 0x8f, 0xff,
+        0x90, 0xa1, 0xb2, 0xff,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2233,
+        0xff44_5566,
+        0xff77_8899,
+        0x80aa_bbcc,
+        0xff0d_1e2f,
+        0xff3a_4b5c,
+        0xff6d_7e8f,
+        0xff90_a1b2,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .rgba });
     defer decoded.deinit();
     try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
 }

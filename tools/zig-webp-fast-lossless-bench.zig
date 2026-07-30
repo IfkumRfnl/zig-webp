@@ -68,7 +68,7 @@ fn prepareAndBench(
 
     var lines = std.mem.splitScalar(u8, manifest, '\n');
     while (lines.next()) |line| {
-        const entry = parseEntry(line) orelse continue;
+        const entry = (try parseEntry(line)) orelse continue;
         var pixels = if (std.mem.eql(u8, entry.kind, "generated"))
             try generate(ctx.gpa, entry.source)
         else if (std.mem.eql(u8, entry.kind, "webp"))
@@ -96,17 +96,17 @@ fn prepareAndBench(
     try ctx.writeOutput(output_path, report.written());
 }
 
-fn parseEntry(line: []const u8) ?Entry {
+fn parseEntry(line: []const u8) !?Entry {
     if (line.len == 0 or line[0] == '#') return null;
     if (std.mem.startsWith(u8, line, "id\tclass\t")) return null;
     var fields = std.mem.splitScalar(u8, line, '\t');
-    const id = fields.next() orelse return null;
-    const class = fields.next() orelse return null;
-    const kind = fields.next() orelse return null;
-    const source = fields.next() orelse return null;
-    const provenance = fields.next() orelse return null;
-    _ = fields.next() orelse return null;
-    if (fields.next() != null) return null;
+    const id = fields.next() orelse return error.InvalidManifest;
+    const class = fields.next() orelse return error.InvalidManifest;
+    const kind = fields.next() orelse return error.InvalidManifest;
+    const source = fields.next() orelse return error.InvalidManifest;
+    const provenance = fields.next() orelse return error.InvalidManifest;
+    _ = fields.next() orelse return error.InvalidManifest;
+    if (fields.next() != null) return error.InvalidManifest;
     return .{
         .id = id,
         .class = class,
@@ -299,8 +299,8 @@ fn benchOne(
         "file\t{s}\t{s}\t{s}\tzig-current\tmethod-{d}\t{d}\t{d}\t{d}\t{d}\t" ++
             "{s}\t{s}\t{d}\t{d}\t{d}\t{d:.6}\t{d}\tyes\tyes\n",
         .{
-            entry.class, entry.id, entry.provenance,                     method,           raw.width,    raw.height,
-            pixel_count, colors,   yesNo(colors >= 2 and colors <= 256), yesNo(has_alpha), sample_count, batch_count,
+            entry.class, entry.id, entry.provenance,     method,           raw.width,    raw.height,
+            pixel_count, colors,   yesNo(colors <= 256), yesNo(has_alpha), sample_count, batch_count,
             median_ns,   mpps,     encoded.len,
         },
     );
