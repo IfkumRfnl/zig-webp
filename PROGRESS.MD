@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-23
+Last updated: 2026-07-29
 
 ## Current Position
 
@@ -19,9 +19,12 @@ with committed frame hashes locking the `anim_dump`-matched output.
 Step 7 (VP8L lossless encode) is complete. The encoder emits valid still VP8L
 from typed pixel buffers, applies LZ77 plus the decision-gated subtract-green,
 color, predictor, palette/color-indexing, optional color-cache, and optional
-meta-prefix paths, and round-trips the encode corpus bit-exactly. The committed
-lossless encode report remains the size baseline (median 1.04x vs
-`cwebp -lossless` at the recorded gate).
+meta-prefix paths, and round-trips the encode corpus bit-exactly. Its default
+low-color path now uses bounded planning and matching work. The 77-source full
+report (the committed 34-source baseline plus the optional corpus) remains
+within its size gate (median 1.04x versus `cwebp -lossless`), while the pinned
+primary UI corpus trades 100 bytes for
+speed.
 
 Step 8 (VP8 lossy encode) is complete through 8c. The encoder emits valid VP8
 key frames, implements rate-distortion mode decision, B_PRED, skip coding,
@@ -118,11 +121,18 @@ and alpha cases, generated at test time) and the committed CC0 photographs in
 `testdata/photos/` (decoded to pristine pixels). No hashes are needed — for
 lossless the source pixels are the oracle. `src/testing/metrics.zig` provides
 MSE/PSNR helpers for the lossy quality gates, plus windowed luma SSIM for
-internal A/B reporting (not gated; not cwebp-comparable). The `zig build encode-report` tool
-prints encoded size, bits-per-pixel, and the round-trip verdict per source
-(committed baseline `testdata/encode-corpus-sizes.tsv`), and
-`tools/webp-oracle.sh compare-encode-corpus REPORT.tsv` pairs those sizes against
-`cwebp -lossless`.
+internal A/B reporting (not gated; not cwebp-comparable). The
+`zig build encode-report` tool prints encoded size, bits-per-pixel, round-trip
+verdict, and encoded-file SHA-256 per source (committed size baseline
+`testdata/encode-corpus-sizes.tsv`); the digest supports byte-identity checks
+between performance experiments.
+`tools/webp-oracle.sh compare-encode-corpus REPORT.tsv` pairs those sizes
+against `cwebp -lossless`.
+The optional `tools/webp-fast-lossless-bench.sh --output REPORT.tsv` harness
+compares Zig lossless encoding with direct, single-threaded libwebp preset-0
+and preset-6 API calls over the pinned `testdata/ui/corpus.tsv` RGBA sources.
+It is a local oracle only: its generated C adapter and artifacts stay under
+`.zig-cache/` and never enter the package build.
 
 Fuzz smoke targets are in place for the public decode and encode surfaces:
 strict demux, VP8L still decode, alpha-plane decode, VP8 header/mode/token
@@ -142,6 +152,105 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-07-29 — Default VP8L low-color encoder beats libwebp preset 0
+
+After the formal plan-030 fast-mode experiment was rejected, the maintainer
+authorized a separate default-path optimization campaign without its two-
+prototype limit. The retained implementation attacks the measured low-color
+work directly:
+
+- palette-index images of at most 96 colors use one no-cache Huffman group;
+- one-color images use a dedicated literal-plus-distance-1 run tokenizer;
+- other qualifying palette images use a bounded matcher that probes the
+  previous row and the latest occurrence of the current index, compares
+  matches four pixels at a time, and needs no hash-chain scratch allocation;
+- unpacked palette indices are written directly, while packed indices retain
+  the hash-probed palette lookup; and
+- the earlier active-alphabet Huffman storage, bounded depth assignment, and
+  direct palette emission remain in place.
+
+The final matched report,
+`.zig-cache/plan030-fast-lossless-final.tsv`, contains all 24 Zig/preset-0/
+preset-6 rows. Every row passed the in-tree round-trip and `dwebp` validity
+checks. On the six primary sources, Zig's geomean was **102.278 µs** versus
+**140.239 µs** for libwebp 1.5.0 preset 0: a **0.729310×** time ratio, with
+**2/2** real-asset rows faster. Relative to the original **19.1765×** baseline,
+the normalized primary result improved **26.29×**; relative to the preceding
+**1.7019×** intermediate, it improved another **2.33×**.
+
+The fixed compression gates also pass: primary output is **2,916 bytes** versus
+libwebp's **3,632 bytes** (**0.802863×** aggregate), with a **1.176471×**
+maximum row. This is a deliberate speed/size trade: the result is 100 bytes
+(3.55%) larger than the pre-campaign Zig primary output, so the claim is not
+that every Zig output shrank.
+
+The two-source secondary palette-miss class was **16.147186×** libwebp
+preset-0 geomean time and **0.966061×** aggregate bytes. That losing timing
+class was predeclared and remains outside the primary claim.
+
+The 77-source default report completed with **0 mismatches** and **15,545,238**
+encoded bytes: 594 bytes smaller than the original campaign baseline and 424
+bytes larger than the preceding intermediate. The libwebp oracle remains
+**1.0368× median / 1.0460× aggregate**, with 0 failures.
+`zig build ci --summary all` passed **19/19** steps and **515/515** tests;
+`zig build wasm-check --summary all` passed **4/4** compile steps.
+
+This does not retroactively accept formal plan 030: that plan required an
+explicit fast-lossless effort and byte-identical default output. The
+maintainer-authorized follow-up instead improves the unchanged public API's
+default low-color path. The publishable claim is limited to the pinned corpus,
+the direct single-threaded protocol, and libwebp lossless preset 0.
+
+### 2026-07-29 — Plan 030 fast lossless UI campaign rejected
+
+Plan 030 first added a direct-API matched-effort harness and pinned eight-source
+corpus: six primary low-color sources (three opaque UI, three alpha UI,
+including two BSD-licensed libwebp test-data assets) and two predeclared
+palette-miss secondary sources. Zig and libwebp consume identical prepared RGBA
+pixels. Each row uses three warmups and 15 median samples, batches tiny inputs,
+includes input gathering/import, output allocation, encode work, and cleanup,
+and excludes source I/O. The C side calls libwebp 1.5.0 lossless presets 0 and 6
+with `exact=1` and `thread_level=0`. Measurements ran single-threaded on an AMD
+EPYC 7663 with Zig 0.16.0.
+
+The unchanged encoder (lossless still ignored `method=0`) started at:
+
+- primary per-source geomean time **19.1765×** libwebp preset 0, with
+  **0/2** primary real-asset rows faster (required ≥70%);
+- primary aggregate bytes **0.7753×** preset 0 and maximum row
+  **1.2353×** (both size gates passed);
+- secondary palette-miss geomean time **31.6701×** and aggregate bytes
+  **0.9661×** preset 0.
+
+Two focused, profile-backed prototypes exhausted the plan's iteration budget:
+
+1. Directly emitting one no-cache Huffman group removed cache trials,
+   multi-group planning, trial scratch, and final re-emission. Primary time
+   improved to **3.0324×** preset 0, still with **0/2** real rows faster; size
+   remained **0.7753×** aggregate / **1.2353×** maximum. Secondary time was
+   **7.2973×** and size **0.9914×**.
+2. A stacked fast primary pipeline added one-candidate LZ77 matching,
+   first-seen palette probe lookup, and skipped full predictor/color search on
+   palette misses. Primary time reached **2.4682×**, still **0/2** real rows
+   faster, while aggregate size regressed to **1.9339×** and the worst row to
+   **10.9602×**. Secondary time was **6.9951×** and size **3.0617×**.
+
+Every run emitted 24 complete Zig/libwebp rows, and every output round-tripped
+pixel-exactly through both the in-tree decoder and `dwebp`. The first prototype
+missed the required ≤0.90× speed and ≥70% real-row gates; the second also
+failed both fixed size gates. Per the STOP condition, all VP8L/public-option
+experiments were reverted. The reproducible benchmark/corpus and the
+encode-report SHA-256 column remain as generally useful local infrastructure.
+
+After rollback, the 77-source default report had **0 mismatches** and was
+byte-for-byte identical (all encoded SHA-256 values) to the pre-experiment
+report. The default libwebp size oracle remains **1.0368× median** and
+**1.0460× aggregate**, with 0 failures. No fast lossless API or production
+encoder change ships from plan 030.
+Final verification passed: `zig build ci --summary all` completed 19/19 steps
+with 509/509 tests, and `zig build wasm-check --summary all` completed 4/4
+compile steps.
 
 ### 2026-07-22 — 1.0.1 release verification
 

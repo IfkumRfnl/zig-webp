@@ -132,6 +132,14 @@ pub fn build(b: *std.Build) void {
             .install = false,
             .cwd_repo_root = true,
         },
+        .{
+            .name = "zig-webp-fast-lossless-bench",
+            .source = "tools/zig-webp-fast-lossless-bench.zig",
+            .step = "fast-lossless-bench-tool",
+            .description = "Run the local Plan 030 matched-effort benchmark helper",
+            .install = false,
+            .cwd_repo_root = true,
+        },
     };
 
     const check_step = b.step("check", "Compile the library and tools");

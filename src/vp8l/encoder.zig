@@ -58,16 +58,24 @@ pub const Error = errors.Error;
 /// VP8L header limit.
 pub const dimension_max = header.dimension_limit;
 
-/// The green channel's full alphabet spans literals + length codes, plus the
-/// color-cache symbols when a cache is in use. Sized to the maximum so the same
-/// working storage serves any chosen cache size.
-const green_alphabet_size_max = huffman.green_alphabet_size_max;
+/// The encoder only evaluates cache sizes up to 2^10 entries. Therefore every
+/// green symbol is at most `green_base_alphabet_size + 2^10 - 1`, well below the
+/// format-wide maximum used by the decoder.
 const green_base_alphabet_size = huffman.literal_alphabet_size + huffman.length_code_count;
 const literal_alphabet_size = huffman.literal_alphabet_size;
 const distance_alphabet_size = huffman.distance_alphabet_size;
 
+const color_cache_bits_max: u4 = 10;
+const color_cache_size_max: u16 = @as(u16, 1) << color_cache_bits_max;
+const green_alphabet_size_working = green_base_alphabet_size + color_cache_size_max;
+
 /// Color-cache bit choices the encoder evaluates. 0 means "no cache".
-const color_cache_bits_candidates = [_]u4{ 0, 10 };
+const color_cache_bits_candidates = [_]u4{ 0, color_cache_bits_max };
+
+comptime {
+    assert(green_alphabet_size_working <= huffman.green_alphabet_size_max);
+    for (color_cache_bits_candidates) |bits| assert(bits <= color_cache_bits_max);
+}
 
 /// Prefix bits (block-size log2) the encoder evaluates for the entropy image.
 /// Larger blocks mean fewer, cheaper-to-store groups; smaller blocks adapt
@@ -83,6 +91,9 @@ const code_length_code_count = huffman.code_length_code_count;
 
 /// Maximum palette size for the color-indexing transform.
 const palette_size_max = transform.color_table_size_max;
+/// Low-color images use a single no-cache Huffman group. Above this bound the
+/// full planner remains worthwhile for spatially varied palette images.
+const palette_low_effort_size_max: usize = 96;
 
 /// Encodes the `width`x`height` ARGB pixel array (row-major, `pixel.Pixel` =
 /// packed 0xAARRGGBB) as a VP8L bitstream into a freshly allocated buffer the
@@ -93,6 +104,27 @@ pub fn encodeAlloc(
     dimensions: image.Dimensions,
     pixels: []const pixel.Pixel,
 ) Error![]u8 {
+    return encodeAllocInternal(gpa, dimensions, pixels, null);
+}
+
+/// Encodes like `encodeAlloc` while trusting the caller's alpha hint instead of
+/// scanning `pixels`. Callers must pass `true` exactly when at least one pixel
+/// has an alpha channel value below 255.
+pub fn encodeAllocKnownAlpha(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
+    has_alpha: bool,
+) Error![]u8 {
+    return encodeAllocInternal(gpa, dimensions, pixels, has_alpha);
+}
+
+fn encodeAllocInternal(
+    gpa: std.mem.Allocator,
+    dimensions: image.Dimensions,
+    pixels: []const pixel.Pixel,
+    known_has_alpha: ?bool,
+) Error![]u8 {
     const pixel_count = try dimensions.pixelCount();
     if (pixels.len != pixel_count) return error.OutputTooLarge;
     if (dimensions.width == 0 or dimensions.height == 0) return error.InvalidVP8LHeader;
@@ -100,7 +132,12 @@ pub fn encodeAlloc(
         return error.InvalidVP8LHeader;
     }
 
-    var encoder = try Encoder.init(gpa, dimensions, pixels);
+    var encoder = try Encoder.init(
+        gpa,
+        dimensions,
+        pixels,
+        known_has_alpha orelse imageHasAlpha(pixels),
+    );
     defer encoder.deinit();
 
     return encoder.run();
@@ -117,12 +154,13 @@ const Encoder = struct {
         gpa: std.mem.Allocator,
         dimensions: image.Dimensions,
         source: []const pixel.Pixel,
+        has_alpha: bool,
     ) Error!Encoder {
         return .{
             .gpa = gpa,
             .dimensions = dimensions,
             .source = source,
-            .has_alpha = imageHasAlpha(source),
+            .has_alpha = has_alpha,
         };
     }
 
@@ -169,10 +207,30 @@ const Encoder = struct {
         const main_dimensions = plan.main_dimensions;
         const main_pixel_count: usize = @intCast(try main_dimensions.pixelCount());
         assert(main_pixels.len == main_pixel_count);
+        const low_effort_palette = if (plan.palette) |palette|
+            palette.len <= palette_low_effort_size_max
+        else
+            false;
+        const constant_palette = if (plan.palette) |palette|
+            palette.len == 1
+        else
+            false;
 
         const tokens = try self.gpa.alloc(lz77.Token, main_pixel_count);
         defer self.gpa.free(tokens);
-        const token_stream = try tokenize(self.gpa, main_dimensions, main_pixels, tokens);
+        const token_stream = if (constant_palette)
+            tokenizeConstant(main_pixel_count, tokens)
+        else if (low_effort_palette)
+            (lz77.LowColorMatcher{
+                .pixels = main_pixels,
+                .width = main_dimensions.width,
+            }).tokenize(tokens)
+        else
+            try tokenize(
+                self.gpa,
+                main_pixels,
+                tokens,
+            );
 
         var writer = bit_writer.BitWriter.init(out);
 
@@ -184,9 +242,14 @@ const Encoder = struct {
         }
         try writer.writeBit(0); // no more transforms
 
-        // Main image stream: choose the cheapest of single-group (with or
-        // without a color cache) and multi-group (entropy image) encodings.
-        try emitMainImage(self.gpa, &writer, main_dimensions, main_pixels, token_stream);
+        // Palette indexing has already reduced the alphabet and spatial stream.
+        // Its low-effort path avoids re-encoding cache and entropy-image trials
+        // that do not pay for their planning cost on genuinely low-color images.
+        if (low_effort_palette) {
+            try emitPaletteMainImage(&writer, token_stream);
+        } else {
+            try emitMainImage(self.gpa, &writer, main_dimensions, main_pixels, token_stream);
+        }
 
         const image_bytes = try writer.finish();
         return image_bytes.len;
@@ -210,7 +273,7 @@ pub fn encodeImageStreamAlloc(
         return error.InvalidVP8LHeader;
     }
 
-    var encoder = try Encoder.init(gpa, dimensions, pixels);
+    var encoder = try Encoder.init(gpa, dimensions, pixels, false);
     defer encoder.deinit();
 
     // The headerless stream is strictly shorter than the full encoding, whose
@@ -400,6 +463,16 @@ const Plan = struct {
     }
 };
 
+const palette_lookup_bits: u5 = 10;
+const palette_lookup_len: usize = @as(usize, 1) << palette_lookup_bits;
+const palette_lookup_shift: u5 = @intCast(32 - @as(u6, palette_lookup_bits));
+const palette_lookup_empty = std.math.maxInt(u16);
+
+comptime {
+    assert(palette_lookup_len >= 4 * palette_size_max);
+    assert(std.math.isPowerOfTwo(palette_lookup_len));
+}
+
 const BuiltPalette = struct {
     record: ColorIndexingRecord,
     palette: []pixel.Pixel,
@@ -424,42 +497,55 @@ fn tryBuildPalette(
     // empty sentinel), sidestepping the pixel-value-0 sentinel problem: 0 is
     // a legitimate pixel value, but index 0 only occupies a slot once a real
     // color is written there. Reuses `color_cache.multiplier` for the hash.
-    const probe_table_bits: u5 = 10;
-    const probe_table_len: usize = @as(usize, 1) << probe_table_bits;
-    // Load factor ≤ 0.25 at the 256-color bail-out; if `color_table_size_max`
-    // ever grows, this assert forces the table to scale with it.
-    comptime assert(probe_table_len >= 4 * palette_size_max);
-    const probe_empty = std.math.maxInt(u16);
-    var probe_table: [probe_table_len]u16 = [_]u16{probe_empty} ** probe_table_len;
-    const probe_shift: u5 = @intCast(32 - @as(u6, probe_table_bits));
-
+    var palette_lookup: [palette_lookup_len]u16 =
+        [_]u16{palette_lookup_empty} ** palette_lookup_len;
     // Collect distinct colors, bailing out past the palette limit. The probe
-    // loop is bounded by `probe_table_len`; the table can never fill (256
+    // loop is bounded by `palette_lookup_len`; the table can never fill (256
     // entries max in 1024 slots), so an empty slot is always reached.
+    var previous_value: pixel.Pixel = undefined;
+    var has_previous_value = false;
     outer: for (source) |value| {
+        if (has_previous_value and value == previous_value) continue;
+        previous_value = value;
+        has_previous_value = true;
         const hash: u32 = color_cache.multiplier *% value;
-        var slot: usize = @intCast(hash >> probe_shift);
+        var slot: usize = @intCast(hash >> palette_lookup_shift);
         var probes: usize = 0;
-        while (probes < probe_table_len) : (probes += 1) {
-            const idx = probe_table[slot];
-            if (idx == probe_empty) break;
+        while (probes < palette_lookup_len) : (probes += 1) {
+            const idx = palette_lookup[slot];
+            if (idx == palette_lookup_empty) break;
+            assert(idx < palette_count);
             if (palette_buffer[idx] == value) continue :outer;
-            slot = (slot + 1) & (probe_table_len - 1);
+            slot = (slot + 1) & (palette_lookup_len - 1);
         }
+        assert(probes < palette_lookup_len);
         // Empty slot found: insert, bailing past the palette limit.
         if (palette_count == palette_size_max) return null;
         palette_buffer[palette_count] = value;
-        probe_table[slot] = @intCast(palette_count);
+        palette_lookup[slot] = @intCast(palette_count);
         palette_count += 1;
     }
 
-    // A palette of one color still works, but offers little; require at least
-    // two so the index image carries information (single-color images are
-    // already tiny via the literal path).
-    if (palette_count < 2) return null;
+    // A one-color palette is the cheapest path for constant images and packs
+    // eight source pixels into each index pixel.
+    assert(palette_count > 0);
 
     // Sort the palette for deterministic, delta-friendly ordering.
     std.mem.sort(pixel.Pixel, palette_buffer[0..palette_count], {}, std.sort.asc(pixel.Pixel));
+    // Rebuild the same stack table so its entries are the sorted indices that
+    // the decoder's palette order requires.
+    @memset(&palette_lookup, palette_lookup_empty);
+    for (palette_buffer[0..palette_count], 0..) |color, color_index| {
+        const hash: u32 = color_cache.multiplier *% color;
+        var slot: usize = @intCast(hash >> palette_lookup_shift);
+        var probes: usize = 0;
+        while (probes < palette_lookup_len) : (probes += 1) {
+            if (palette_lookup[slot] == palette_lookup_empty) break;
+            slot = (slot + 1) & (palette_lookup_len - 1);
+        }
+        assert(probes < palette_lookup_len);
+        palette_lookup[slot] = @intCast(color_index);
+    }
 
     const palette = try gpa.alloc(pixel.Pixel, palette_count);
     errdefer gpa.free(palette);
@@ -470,19 +556,22 @@ fn tryBuildPalette(
     const index_width = divRoundUp(dimensions.width, width_scale);
     const index_dimensions = try image.Dimensions.init(index_width, dimensions.height);
     const index_pixel_count: usize = @intCast(try index_dimensions.pixelCount());
-
     const index_pixels = try gpa.alloc(pixel.Pixel, index_pixel_count);
     errdefer gpa.free(index_pixels);
-    @memset(index_pixels, pixel.fromChannels(0, 0, 0, 0));
 
-    try packIndices(
-        dimensions,
-        source,
-        palette,
-        index_pixels,
-        index_dimensions,
-        width_bits,
-    );
+    if (palette_count == 1) {
+        @memset(index_pixels, 0);
+    } else {
+        try packIndices(
+            dimensions,
+            source,
+            palette,
+            &palette_lookup,
+            index_pixels,
+            index_dimensions,
+            width_bits,
+        );
+    }
 
     // Delta-code the palette as the decoder reads it.
     const delta_table = try gpa.alloc(pixel.Pixel, palette_count);
@@ -509,6 +598,7 @@ fn packIndices(
     dimensions: image.Dimensions,
     source: []const pixel.Pixel,
     palette: []const pixel.Pixel,
+    palette_lookup: *const [palette_lookup_len]u16,
     index_pixels: []pixel.Pixel,
     index_dimensions: image.Dimensions,
     width_bits: u3,
@@ -516,50 +606,77 @@ fn packIndices(
     const width: usize = @intCast(dimensions.width);
     const height: usize = @intCast(dimensions.height);
     const index_width: usize = @intCast(index_dimensions.width);
+    if (width_bits == 0) {
+        assert(source.len == index_pixels.len);
+        var previous_color: pixel.Pixel = undefined;
+        var previous_index: u8 = undefined;
+        var has_previous_color = false;
+        for (source, index_pixels) |color, *index_pixel| {
+            const color_index = if (has_previous_color and color == previous_color)
+                previous_index
+            else
+                paletteIndex(palette, palette_lookup, color);
+            previous_color = color;
+            previous_index = color_index;
+            has_previous_color = true;
+            index_pixel.* = pixel.fromChannels(0, 0, color_index, 0);
+        }
+        return;
+    }
 
-    const index_bits: u4 = if (width_bits == 0)
-        8
-    else
-        @intCast(@as(u8, 8) >> width_bits);
-    const per_pixel: usize = if (width_bits == 0) 1 else (@as(usize, 1) << width_bits);
+    const index_bits: u4 = @intCast(@as(u8, 8) >> width_bits);
+    const per_pixel: usize = @as(usize, 1) << width_bits;
 
+    var previous_color: pixel.Pixel = undefined;
+    var previous_index: u8 = undefined;
+    var has_previous_color = false;
     var y: usize = 0;
     while (y < height) : (y += 1) {
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            const color = source[y * width + x];
-            const color_index = paletteIndex(palette, color);
+        const source_row = source[y * width ..][0..width];
+        const index_row = index_pixels[y * index_width ..][0..index_width];
+        var source_x: usize = 0;
+        for (index_row) |*index_pixel| {
+            var packed_green: u8 = 0;
+            var slot: usize = 0;
+            while (slot < per_pixel and source_x < source_row.len) : (slot += 1) {
+                const color = source_row[source_x];
+                const color_index = if (has_previous_color and color == previous_color)
+                    previous_index
+                else
+                    paletteIndex(palette, palette_lookup, color);
+                previous_color = color;
+                previous_index = color_index;
+                has_previous_color = true;
 
-            const index_x = x >> width_bits;
-            const dest = y * index_width + index_x;
-            const slot: usize = if (width_bits == 0)
-                0
-            else
-                (x & (per_pixel - 1));
-            const shift: u3 = @intCast(slot * index_bits);
-
-            const existing_green = pixel.green(index_pixels[dest]);
-            const packed_green = existing_green | (color_index << shift);
-            index_pixels[dest] = pixel.fromChannels(0, 0, packed_green, 0);
+                const shift: u3 = @intCast(slot * index_bits);
+                packed_green |= color_index << shift;
+                source_x += 1;
+            }
+            index_pixel.* = pixel.fromChannels(0, 0, packed_green, 0);
         }
+        assert(source_x == source_row.len);
     }
 }
 
-fn paletteIndex(palette: []const pixel.Pixel, color: pixel.Pixel) u8 {
-    // Binary search: palette is sorted ascending.
-    var lo: usize = 0;
-    var hi: usize = palette.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (palette[mid] < color) {
-            lo = mid + 1;
-        } else if (palette[mid] > color) {
-            hi = mid;
-        } else {
-            return @intCast(mid);
-        }
+fn paletteIndex(
+    palette: []const pixel.Pixel,
+    palette_lookup: *const [palette_lookup_len]u16,
+    color: pixel.Pixel,
+) u8 {
+    assert(palette.len > 0);
+    assert(palette.len <= palette_size_max);
+
+    const hash: u32 = color_cache.multiplier *% color;
+    var slot: usize = @intCast(hash >> palette_lookup_shift);
+    var probes: usize = 0;
+    while (probes < palette_lookup_len) : (probes += 1) {
+        const color_index = palette_lookup[slot];
+        if (color_index == palette_lookup_empty) unreachable;
+        assert(color_index < palette.len);
+        if (palette[color_index] == color) return @intCast(color_index);
+        slot = (slot + 1) & (palette_lookup_len - 1);
     }
-    unreachable; // every source color is in the palette by construction
+    unreachable; // Every source color is in the palette by construction.
 }
 
 fn colorTableWidthBits(color_table_size: u16) u3 {
@@ -744,19 +861,40 @@ fn channelMagnitude(value: u8) u64 {
 // LZ77 tokenization.
 // ---------------------------------------------------------------------------
 
+fn tokenizeConstant(pixel_count: usize, tokens_out: []lz77.Token) []lz77.Token {
+    assert(pixel_count > 0);
+    assert(tokens_out.len >= pixel_count);
+
+    var token_count: usize = 0;
+    var position: usize = 0;
+    while (position < pixel_count) {
+        const remaining = pixel_count - position;
+        if (position > 0 and remaining >= lz77.min_match_length) {
+            const length: u32 = @intCast(@min(remaining, lz77.max_match_length));
+            tokens_out[token_count] = .{ .copy = .{ .length = length, .distance = 1 } };
+            position += length;
+        } else {
+            tokens_out[token_count] = .{ .literal = 0 };
+            position += 1;
+        }
+        token_count += 1;
+    }
+    return tokens_out[0..token_count];
+}
+
 fn tokenize(
     gpa: std.mem.Allocator,
-    dimensions: image.Dimensions,
     pixels: []const pixel.Pixel,
     tokens_out: []lz77.Token,
 ) Error![]lz77.Token {
-    const head = try gpa.alloc(u32, 1 << 14);
+    const head = try gpa.alloc(u32, lz77.Matcher.hash_size);
     defer gpa.free(head);
     const prev = try gpa.alloc(u32, pixels.len);
     defer gpa.free(prev);
+    var head_presence: [lz77.Matcher.head_presence_size]u8 = undefined;
 
-    const matcher = lz77.Matcher{ .pixels = pixels, .width = dimensions.width };
-    return matcher.tokenize(tokens_out, head, prev);
+    const matcher = lz77.Matcher{ .pixels = pixels };
+    return matcher.tokenize(tokens_out, head, prev, &head_presence);
 }
 
 // ---------------------------------------------------------------------------
@@ -788,10 +926,10 @@ const Op = struct {
     };
 };
 
-/// Per-channel histograms for one Huffman group. The green histogram spans the
-/// full alphabet (literals + length codes + cache symbols).
+/// Per-channel histograms for one Huffman group. The green storage only spans
+/// cache sizes this encoder can select, rather than the format-wide maximum.
 const Histogram = struct {
-    green: [green_alphabet_size_max]u32 = .{0} ** green_alphabet_size_max,
+    green: [green_alphabet_size_working]u32 = .{0} ** green_alphabet_size_working,
     red: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
     blue: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
     alpha: [literal_alphabet_size]u32 = .{0} ** literal_alphabet_size,
@@ -799,12 +937,40 @@ const Histogram = struct {
 
     fn addOp(self: *Histogram, kind: Op.Kind) void {
         switch (kind) {
+            .literal => |value| self.green[pixel.green(value)] += 1,
+            .copy => |copy| {
+                const length_prefix = lz77.prefixForValue(copy.length);
+                self.green[literal_alphabet_size + length_prefix.symbol] += 1;
+            },
+            .cache => |index| self.green[green_base_alphabet_size + index] += 1,
+        }
+        self.addSideChannels(kind);
+    }
+
+    fn addSideChannels(self: *Histogram, kind: Op.Kind) void {
+        switch (kind) {
             .literal => |value| {
-                self.green[pixel.green(value)] += 1;
                 self.red[pixel.red(value)] += 1;
                 self.blue[pixel.blue(value)] += 1;
                 self.alpha[pixel.alpha(value)] += 1;
             },
+            .copy => |copy| {
+                const distance_code = lz77.distanceCodeForPixels(copy.distance);
+                const distance_prefix = lz77.prefixForValue(distance_code);
+                self.distance[distance_prefix.symbol] += 1;
+            },
+            .cache => {},
+        }
+    }
+};
+
+const PaletteHistogram = struct {
+    green: [green_base_alphabet_size]u32 = .{0} ** green_base_alphabet_size,
+    distance: [distance_alphabet_size]u32 = .{0} ** distance_alphabet_size,
+
+    fn addToken(self: *PaletteHistogram, token: lz77.Token) void {
+        switch (token) {
+            .literal => |value| self.green[pixel.green(value)] += 1,
             .copy => |copy| {
                 const length_prefix = lz77.prefixForValue(copy.length);
                 self.green[literal_alphabet_size + length_prefix.symbol] += 1;
@@ -812,34 +978,111 @@ const Histogram = struct {
                 const distance_prefix = lz77.prefixForValue(distance_code);
                 self.distance[distance_prefix.symbol] += 1;
             },
-            .cache => |index| {
-                self.green[green_base_alphabet_size + index] += 1;
-            },
         }
     }
+};
 
-    fn merge(self: *Histogram, other: *const Histogram) void {
-        for (&self.green, other.green) |*dst, src| dst.* += src;
-        for (&self.red, other.red) |*dst, src| dst.* += src;
-        for (&self.blue, other.blue) |*dst, src| dst.* += src;
-        for (&self.alpha, other.alpha) |*dst, src| dst.* += src;
-        for (&self.distance, other.distance) |*dst, src| dst.* += src;
+const PaletteCodes = struct {
+    green_lengths: [green_base_alphabet_size]u8 = undefined,
+    green_codes: [green_base_alphabet_size]u16 = undefined,
+    distance_lengths: [distance_alphabet_size]u8 = undefined,
+    distance_codes: [distance_alphabet_size]u16 = undefined,
+    green_single_symbol: ?usize = undefined,
+    distance_single_symbol: ?usize = undefined,
+
+    fn build(self: *PaletteCodes, hist: *const PaletteHistogram) void {
+        assert(sumCounts(&hist.green) > 0);
+        huffman_writer.build(&hist.green, &self.green_lengths, &self.green_codes);
+
+        var distance = hist.distance;
+        if (sumCounts(&distance) == 0) distance[0] = 1;
+        huffman_writer.build(
+            &distance,
+            &self.distance_lengths,
+            &self.distance_codes,
+        );
+        self.green_single_symbol = huffman_writer.singleSymbol(&self.green_lengths);
+        self.distance_single_symbol = huffman_writer.singleSymbol(&self.distance_lengths);
+    }
+
+    fn greenCode(self: *const PaletteCodes) huffman_writer.Code {
+        return codeOf(
+            &self.green_lengths,
+            &self.green_codes,
+            self.green_single_symbol,
+        );
+    }
+
+    fn distanceCode(self: *const PaletteCodes) huffman_writer.Code {
+        return codeOf(
+            &self.distance_lengths,
+            &self.distance_codes,
+            self.distance_single_symbol,
+        );
+    }
+
+    fn writeDescriptors(
+        self: *const PaletteCodes,
+        writer: *bit_writer.BitWriter,
+    ) Error!void {
+        const single_zero_lengths = [_]u8{1};
+        try writeNormalPrefixCode(writer, &self.green_lengths);
+        try writeNormalPrefixCode(writer, &single_zero_lengths);
+        try writeNormalPrefixCode(writer, &single_zero_lengths);
+        try writeNormalPrefixCode(writer, &single_zero_lengths);
+        try writeNormalPrefixCode(writer, &self.distance_lengths);
+    }
+};
+
+/// A block contains at most 32 x 32 pixels for the supported prefix candidates,
+/// so each per-symbol count fits in u16. Only green participates in clustering;
+/// the other channels are accumulated directly into the selected group.
+const meta_prefix_bits_max: u4 = max: {
+    var result: u4 = 0;
+    for (meta_prefix_bits_candidates) |bits| result = @max(result, bits);
+    break :max result;
+};
+const block_size_max = @as(u32, 1) << meta_prefix_bits_max;
+const block_pixel_count_max = block_size_max * block_size_max;
+comptime {
+    assert(block_pixel_count_max <= std.math.maxInt(u16));
+}
+
+const BlockHistogram = struct {
+    green: [green_alphabet_size_working]u16 = .{0} ** green_alphabet_size_working,
+
+    fn addOp(self: *BlockHistogram, kind: Op.Kind) void {
+        const symbol: usize = switch (kind) {
+            .literal => |value| pixel.green(value),
+            .copy => |copy| literal_alphabet_size + lz77.prefixForValue(copy.length).symbol,
+            .cache => |index| green_base_alphabet_size + index,
+        };
+        self.green[symbol] += 1;
+    }
+
+    fn mergeInto(self: *const BlockHistogram, group: *Histogram) void {
+        for (&group.green, self.green) |*dst, src| dst.* += src;
     }
 };
 
 /// One group's built Huffman codes plus the green alphabet size in effect.
 const GroupCodes = struct {
-    green_lengths: [green_alphabet_size_max]u8 = .{0} ** green_alphabet_size_max,
-    green_codes: [green_alphabet_size_max]u16 = .{0} ** green_alphabet_size_max,
-    red_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
-    red_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
-    blue_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
-    blue_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
-    alpha_lengths: [literal_alphabet_size]u8 = .{0} ** literal_alphabet_size,
-    alpha_codes: [literal_alphabet_size]u16 = .{0} ** literal_alphabet_size,
-    distance_lengths: [distance_alphabet_size]u8 = .{0} ** distance_alphabet_size,
-    distance_codes: [distance_alphabet_size]u16 = .{0} ** distance_alphabet_size,
+    green_lengths: [green_alphabet_size_working]u8 = undefined,
+    green_codes: [green_alphabet_size_working]u16 = undefined,
+    red_lengths: [literal_alphabet_size]u8 = undefined,
+    red_codes: [literal_alphabet_size]u16 = undefined,
+    blue_lengths: [literal_alphabet_size]u8 = undefined,
+    blue_codes: [literal_alphabet_size]u16 = undefined,
+    alpha_lengths: [literal_alphabet_size]u8 = undefined,
+    alpha_codes: [literal_alphabet_size]u16 = undefined,
+    distance_lengths: [distance_alphabet_size]u8 = undefined,
+    distance_codes: [distance_alphabet_size]u16 = undefined,
     green_alphabet_size: u16 = green_base_alphabet_size,
+    green_single_symbol: ?usize = undefined,
+    red_single_symbol: ?usize = undefined,
+    blue_single_symbol: ?usize = undefined,
+    alpha_single_symbol: ?usize = undefined,
+    distance_single_symbol: ?usize = undefined,
 
     /// Builds the five codes from `hist`. The green code spans
     /// `green_base_alphabet_size + cache_size`. Any channel histogram with no
@@ -850,9 +1093,13 @@ const GroupCodes = struct {
     /// the zero-initialized cache, emitting no literals at all).
     fn build(self: *GroupCodes, hist: *const Histogram, cache_size: u16) void {
         self.green_alphabet_size = green_base_alphabet_size + cache_size;
-        assert(self.green_alphabet_size <= green_alphabet_size_max);
+        assert(self.green_alphabet_size <= green_alphabet_size_working);
 
-        var green = hist.green;
+        var green: [green_alphabet_size_working]u32 = undefined;
+        @memcpy(
+            green[0..self.green_alphabet_size],
+            hist.green[0..self.green_alphabet_size],
+        );
         var red = hist.red;
         var blue = hist.blue;
         var alpha = hist.alpha;
@@ -872,25 +1119,36 @@ const GroupCodes = struct {
         huffman_writer.build(&blue, &self.blue_lengths, &self.blue_codes);
         huffman_writer.build(&alpha, &self.alpha_lengths, &self.alpha_codes);
         huffman_writer.build(&distance, &self.distance_lengths, &self.distance_codes);
+        self.green_single_symbol =
+            huffman_writer.singleSymbol(self.green_lengths[0..self.green_alphabet_size]);
+        self.red_single_symbol = huffman_writer.singleSymbol(&self.red_lengths);
+        self.blue_single_symbol = huffman_writer.singleSymbol(&self.blue_lengths);
+        self.alpha_single_symbol = huffman_writer.singleSymbol(&self.alpha_lengths);
+        self.distance_single_symbol = huffman_writer.singleSymbol(&self.distance_lengths);
     }
 
     fn greenCode(self: *const GroupCodes) huffman_writer.Code {
         return codeOf(
             self.green_lengths[0..self.green_alphabet_size],
             self.green_codes[0..self.green_alphabet_size],
+            self.green_single_symbol,
         );
     }
     fn redCode(self: *const GroupCodes) huffman_writer.Code {
-        return codeOf(&self.red_lengths, &self.red_codes);
+        return codeOf(&self.red_lengths, &self.red_codes, self.red_single_symbol);
     }
     fn blueCode(self: *const GroupCodes) huffman_writer.Code {
-        return codeOf(&self.blue_lengths, &self.blue_codes);
+        return codeOf(&self.blue_lengths, &self.blue_codes, self.blue_single_symbol);
     }
     fn alphaCode(self: *const GroupCodes) huffman_writer.Code {
-        return codeOf(&self.alpha_lengths, &self.alpha_codes);
+        return codeOf(&self.alpha_lengths, &self.alpha_codes, self.alpha_single_symbol);
     }
     fn distanceCode(self: *const GroupCodes) huffman_writer.Code {
-        return codeOf(&self.distance_lengths, &self.distance_codes);
+        return codeOf(
+            &self.distance_lengths,
+            &self.distance_codes,
+            self.distance_single_symbol,
+        );
     }
 
     /// Writes the five prefix-code descriptors in decoder order.
@@ -903,11 +1161,15 @@ const GroupCodes = struct {
     }
 };
 
-fn codeOf(lengths: []const u8, codes: []const u16) huffman_writer.Code {
+fn codeOf(
+    lengths: []const u8,
+    codes: []const u16,
+    single_symbol: ?usize,
+) huffman_writer.Code {
     return .{
         .lengths = lengths,
         .codes = codes,
-        .single_symbol = huffman_writer.singleSymbol(lengths),
+        .single_symbol = single_symbol,
     };
 }
 
@@ -1059,6 +1321,54 @@ fn emitOp(
 
 fn cacheSizeFor(cache_bits: u4) u16 {
     return if (cache_bits == 0) 0 else @as(u16, 1) << cache_bits;
+}
+
+/// Emits a palette-indexed main image with one no-cache Huffman group. Palette
+/// indexing already concentrates the source symbols; repeating the general
+/// cache and spatial-group search costs more than the final encoding on UI
+/// images and does not improve their output.
+fn emitPaletteMainImage(
+    writer: *bit_writer.BitWriter,
+    tokens: []const lz77.Token,
+) Error!void {
+    var hist: PaletteHistogram = .{};
+    for (tokens) |token| hist.addToken(token);
+
+    var codes: PaletteCodes = .{};
+    codes.build(&hist);
+
+    try writeColorCacheHeader(writer, 0);
+    try writer.writeBit(0); // meta-prefix present = 0
+    try codes.writeDescriptors(writer);
+
+    const green_code = codes.greenCode();
+    const distance_code = codes.distanceCode();
+    for (tokens) |token| {
+        switch (token) {
+            .literal => |value| {
+                assert(pixel.red(value) == 0);
+                assert(pixel.blue(value) == 0);
+                assert(pixel.alpha(value) == 0);
+                try green_code.writeSymbol(writer, pixel.green(value));
+            },
+            .copy => |copy| {
+                const length_prefix = lz77.prefixForValue(copy.length);
+                try green_code.writeSymbol(
+                    writer,
+                    literal_alphabet_size + length_prefix.symbol,
+                );
+                if (length_prefix.extra_bits > 0) {
+                    try writer.writeBits(length_prefix.extra_value, length_prefix.extra_bits);
+                }
+                const distance = lz77.distanceCodeForPixels(copy.distance);
+                const distance_prefix = lz77.prefixForValue(distance);
+                try distance_code.writeSymbol(writer, distance_prefix.symbol);
+                if (distance_prefix.extra_bits > 0) {
+                    try writer.writeBits(distance_prefix.extra_value, distance_prefix.extra_bits);
+                }
+            },
+        }
+    }
 }
 
 /// Chooses and emits the cheapest main-image encoding. Each candidate (a
@@ -1260,9 +1570,9 @@ fn buildGroupingForPrefix(
     const width: usize = dimensions.width;
     const block_count: usize = @as(usize, entropy_width) * entropy_height;
 
-    const block_hists = try gpa.alloc(Histogram, block_count);
+    const block_hists = try gpa.alloc(BlockHistogram, block_count);
     defer gpa.free(block_hists);
-    @memset(block_hists, Histogram{});
+    @memset(block_hists, BlockHistogram{});
     for (ops) |op| {
         const block = blockIndex(op.position, width, prefix_bits, entropy_width);
         block_hists[block].addOp(op.kind);
@@ -1276,12 +1586,25 @@ fn buildGroupingForPrefix(
     const group_hists = try gpa.alloc(Histogram, group_count_max_local);
     defer gpa.free(group_hists);
     var group_count: u32 = 0;
-    for (block_hists, 0..) |*bh, i| {
-        const g = assignBlockToGroup(bh, group_hists[0..group_count], &group_count);
-        block_groups[i] = g;
-        group_hists[g].merge(bh);
+    for (block_hists, 0..) |*block_hist, i| {
+        const group_count_before = group_count;
+        const group = assignBlockToGroup(
+            block_hist,
+            group_hists[0..group_count],
+            &group_count,
+        );
+        block_groups[i] = group;
+        if (group == group_count_before) group_hists[group] = .{};
+        block_hist.mergeInto(&group_hists[group]);
     }
     assert(group_count >= 1);
+
+    // Green counts were accumulated during clustering. Populate the channels
+    // that do not influence grouping without storing them once per block.
+    for (ops) |op| {
+        const block = blockIndex(op.position, width, prefix_bits, entropy_width);
+        group_hists[block_groups[block]].addSideChannels(op.kind);
+    }
 
     var total_bits: u64 = extra_bits;
     var gi: u32 = 0;
@@ -1315,7 +1638,7 @@ fn blockIndex(position: usize, width: usize, prefix_bits: u4, entropy_width: u32
 /// Picks the closest existing group for `bh` by green-histogram L1 distance, or
 /// opens a new group when capacity remains and the block is distinct enough.
 fn assignBlockToGroup(
-    bh: *const Histogram,
+    block_hist: *const BlockHistogram,
     group_hists: []const Histogram,
     group_count: *u32,
 ) u16 {
@@ -1327,7 +1650,7 @@ fn assignBlockToGroup(
     var best_group: u16 = 0;
     var best_distance: u64 = std.math.maxInt(u64);
     for (group_hists, 0..) |*gh, g| {
-        const d = greenHistogramDistance(bh, gh);
+        const d = greenHistogramDistance(block_hist, gh);
         if (d < best_distance) {
             best_distance = d;
             best_group = @intCast(g);
@@ -1345,12 +1668,16 @@ fn assignBlockToGroup(
 
 const new_group_threshold: u64 = 32;
 
-/// L1 distance between two groups' green histograms. Cheap and good enough to
-/// cluster visually distinct regions.
-fn greenHistogramDistance(a: *const Histogram, b: *const Histogram) u64 {
+/// L1 distance between a block's green histogram and a group's accumulated
+/// green histogram.
+fn greenHistogramDistance(a: *const BlockHistogram, b: *const Histogram) u64 {
     var distance: u64 = 0;
-    for (a.green, b.green) |ca, cb| {
-        distance += if (ca > cb) ca - cb else cb - ca;
+    for (a.green, b.green) |block_count_u16, group_count| {
+        const block_count: u32 = block_count_u16;
+        distance += if (block_count > group_count)
+            block_count - group_count
+        else
+            group_count - block_count;
     }
     return distance;
 }
@@ -1467,10 +1794,10 @@ fn writeEntropyImage(writer: *bit_writer.BitWriter, plan: *const MultiGroupPlan)
     try writeNormalPrefixCode(writer, &alpha_l);
     try writeNormalPrefixCode(writer, &dist_l);
 
-    const g_code = codeOf(&green_l, &green_c);
-    const r_code = codeOf(&red_l, &red_c);
-    const b_code = codeOf(&blue_l, &blue_c);
-    const a_code = codeOf(&alpha_l, &alpha_c);
+    const g_code = codeOf(&green_l, &green_c, huffman_writer.singleSymbol(&green_l));
+    const r_code = codeOf(&red_l, &red_c, huffman_writer.singleSymbol(&red_l));
+    const b_code = codeOf(&blue_l, &blue_c, huffman_writer.singleSymbol(&blue_l));
+    const a_code = codeOf(&alpha_l, &alpha_c, huffman_writer.singleSymbol(&alpha_l));
     for (plan.block_groups) |g| {
         try g_code.writeSymbol(writer, @intCast(g & 0xff));
         try r_code.writeSymbol(writer, @intCast(g >> 8));
@@ -1591,6 +1918,10 @@ const TransformChannelCodes = struct {
     alpha_c: [literal_alphabet_size]u16 = undefined,
     dist_l: [distance_alphabet_size]u8 = undefined,
     dist_c: [distance_alphabet_size]u16 = undefined,
+    green_single_symbol: ?usize = undefined,
+    red_single_symbol: ?usize = undefined,
+    blue_single_symbol: ?usize = undefined,
+    alpha_single_symbol: ?usize = undefined,
 
     fn build(
         self: *TransformChannelCodes,
@@ -1605,6 +1936,10 @@ const TransformChannelCodes = struct {
         huffman_writer.build(blue_counts, &self.blue_l, &self.blue_c);
         huffman_writer.build(alpha_counts, &self.alpha_l, &self.alpha_c);
         huffman_writer.build(distance_counts, &self.dist_l, &self.dist_c);
+        self.green_single_symbol = huffman_writer.singleSymbol(&self.green_l);
+        self.red_single_symbol = huffman_writer.singleSymbol(&self.red_l);
+        self.blue_single_symbol = huffman_writer.singleSymbol(&self.blue_l);
+        self.alpha_single_symbol = huffman_writer.singleSymbol(&self.alpha_l);
     }
 
     fn writeDescriptors(self: *const TransformChannelCodes, writer: *bit_writer.BitWriter) Error!void {
@@ -1616,10 +1951,26 @@ const TransformChannelCodes = struct {
     }
 
     fn writePixel(self: *const TransformChannelCodes, writer: *bit_writer.BitWriter, value: pixel.Pixel) Error!void {
-        try codeOf(&self.green_l, &self.green_c).writeSymbol(writer, pixel.green(value));
-        try codeOf(&self.red_l, &self.red_c).writeSymbol(writer, pixel.red(value));
-        try codeOf(&self.blue_l, &self.blue_c).writeSymbol(writer, pixel.blue(value));
-        try codeOf(&self.alpha_l, &self.alpha_c).writeSymbol(writer, pixel.alpha(value));
+        try codeOf(
+            &self.green_l,
+            &self.green_c,
+            self.green_single_symbol,
+        ).writeSymbol(writer, pixel.green(value));
+        try codeOf(
+            &self.red_l,
+            &self.red_c,
+            self.red_single_symbol,
+        ).writeSymbol(writer, pixel.red(value));
+        try codeOf(
+            &self.blue_l,
+            &self.blue_c,
+            self.blue_single_symbol,
+        ).writeSymbol(writer, pixel.blue(value));
+        try codeOf(
+            &self.alpha_l,
+            &self.alpha_c,
+            self.alpha_single_symbol,
+        ).writeSymbol(writer, pixel.alpha(value));
     }
 };
 
@@ -1872,10 +2223,29 @@ test "encodes and round-trips a 1x1 image" {
     try decodeRoundTrip(testing.allocator, dims, &pixels);
 }
 
-test "encodes and round-trips a solid all-zero image (cache-hit-on-empty-cache)" {
-    // A fully transparent black image: the first pixel value is 0, which hits
-    // the zero-initialized color cache, so no literal channels are ever emitted.
-    // The encoder must still build valid red/blue/alpha codes.
+test "GroupCodes builds side-channel fallbacks for a cache-only histogram" {
+    // A cache symbol contributes no literal-channel counts, but every emitted
+    // Huffman group still needs valid red, blue, and alpha single-leaf codes.
+    var histogram: Histogram = .{};
+    histogram.addOp(.{ .cache = 0 });
+
+    var codes: GroupCodes = .{};
+    codes.build(&histogram, 2);
+
+    const red = codes.redCode();
+    const blue = codes.blueCode();
+    const alpha = codes.alphaCode();
+    try testing.expectEqual(@as(?usize, 0), red.single_symbol);
+    try testing.expectEqual(@as(?usize, 0), blue.single_symbol);
+    try testing.expectEqual(@as(?usize, 0), alpha.single_symbol);
+    try testing.expectEqual(@as(u8, 1), red.lengths[0]);
+    try testing.expectEqual(@as(u8, 1), blue.lengths[0]);
+    try testing.expectEqual(@as(u8, 1), alpha.lengths[0]);
+}
+
+test "encodes and round-trips a solid all-zero image through a one-color palette" {
+    // Fully transparent black has one distinct color, so palette planning
+    // transforms it into a one-color indexed image before entropy coding.
     const dims = try image.Dimensions.init(40, 40);
     var pixels: [40 * 40]pixel.Pixel = undefined;
     @memset(&pixels, 0);
@@ -1953,6 +2323,24 @@ test "encodes and round-trips a two-color (1-bit packed) palette image" {
     var pixels: [width * height]pixel.Pixel = undefined;
     for (&pixels, 0..) |*p, i| p.* = if ((i * 7 + i / 3) % 3 == 0) a else b;
     try decodeRoundTrip(testing.allocator, dims, &pixels);
+}
+
+test "one-color palette packs eight source pixels per index pixel" {
+    const dims = try image.Dimensions.init(10, 2);
+    const color = pixel.fromChannels(37, 11, 22, 33);
+    const pixels = [_]pixel.Pixel{color} ** 20;
+
+    const built_optional = try tryBuildPalette(testing.allocator, dims, &pixels);
+    try testing.expect(built_optional != null);
+    const built = built_optional.?;
+    defer testing.allocator.free(built.palette);
+    defer testing.allocator.free(built.index_pixels);
+    defer testing.allocator.free(built.record.delta_table);
+
+    try testing.expectEqual(@as(usize, 1), built.palette.len);
+    try testing.expectEqual(@as(u3, 3), built.record.width_bits);
+    try testing.expectEqual(@as(u32, 2), built.index_dimensions.width);
+    for (built.index_pixels) |value| try testing.expectEqual(@as(pixel.Pixel, 0), value);
 }
 
 test "tryBuildPalette collects transparent vs opaque black and bails past 256" {
@@ -2109,6 +2497,31 @@ test "encoder marks opaque images as alpha-free in the header" {
     try testing.expect(parsed2.has_alpha);
 }
 
+test "encodeAllocKnownAlpha trusts the supplied alpha hint" {
+    const dims = try image.Dimensions.init(1, 1);
+    const pixels = [_]pixel.Pixel{pixel.fromChannels(128, 1, 2, 3)};
+
+    const without_alpha_hint = try encodeAllocKnownAlpha(
+        testing.allocator,
+        dims,
+        &pixels,
+        false,
+    );
+    defer testing.allocator.free(without_alpha_hint);
+    const parsed_without_hint = try header.parse(without_alpha_hint);
+    try testing.expect(!parsed_without_hint.has_alpha);
+
+    const with_alpha_hint = try encodeAllocKnownAlpha(
+        testing.allocator,
+        dims,
+        &pixels,
+        true,
+    );
+    defer testing.allocator.free(with_alpha_hint);
+    const parsed_with_hint = try header.parse(with_alpha_hint);
+    try testing.expect(parsed_with_hint.has_alpha);
+}
+
 test "encoder rejects a pixel count that disagrees with dimensions" {
     const dims = try image.Dimensions.init(4, 4);
     const pixels = [_]pixel.Pixel{pixel.fromChannels(0, 0, 0, 0)} ** 4;
@@ -2197,7 +2610,11 @@ test "encoder selects a multi-group plan for a two-region image" {
 
     const tokens = try testing.allocator.alloc(lz77.Token, pixels.len);
     defer testing.allocator.free(tokens);
-    const token_stream = try tokenize(testing.allocator, dims, pixels, tokens);
+    const token_stream = try tokenize(
+        testing.allocator,
+        pixels,
+        tokens,
+    );
 
     const ops_buffer = try testing.allocator.alloc(Op, token_stream.len);
     defer testing.allocator.free(ops_buffer);

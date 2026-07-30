@@ -6,7 +6,9 @@
 //! through this library's decoder.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
+const native_endian = builtin.cpu.arch.endian();
 
 const alpha = @import("alpha.zig");
 const color = @import("color.zig");
@@ -48,9 +50,14 @@ pub fn encodeStaticLossless(
     try encode_options.limits.validateCanvas(dimensions.width, dimensions.height, false);
     const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
     defer gpa.free(argb);
-    gatherArgb(buffer, argb);
+    const has_alpha = gatherArgb(buffer, argb);
 
-    const bitstream = try vp8l_encoder.encodeAlloc(gpa, dimensions, argb);
+    const bitstream = try vp8l_encoder.encodeAllocKnownAlpha(
+        gpa,
+        dimensions,
+        argb,
+        has_alpha,
+    );
     defer gpa.free(bitstream);
 
     return mux.encodeStatic(gpa, .{
@@ -132,7 +139,7 @@ pub fn encodeStaticLossy(
 
     const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
     defer gpa.free(argb);
-    gatherArgb(buffer, argb);
+    _ = gatherArgb(buffer, argb);
 
     // Extract the straight (non-premultiplied) alpha plane. A fully-opaque
     // plane is left as no ALPH chunk so the output matches the color-only path
@@ -677,24 +684,80 @@ fn metadataByteCount(raw_metadata: metadata.RawPayloads) u64 {
     return bytes;
 }
 
+const gather_vector_pixels = 8;
+const GatherPixelVector = @Vector(gather_vector_pixels, vp8l_pixel.Pixel);
+
 /// Reads the caller buffer's pixels (any supported format, honoring stride)
-/// into packed ARGB `vp8l_pixel.Pixel` values in row-major order.
-fn gatherArgb(buffer: image.Buffer, argb: []vp8l_pixel.Pixel) void {
+/// into packed ARGB `vp8l_pixel.Pixel` values in row-major order. Returns
+/// whether any source pixel has an alpha channel value below 255.
+fn gatherArgb(buffer: image.Buffer, argb: []vp8l_pixel.Pixel) bool {
+    return switch (buffer.format) {
+        inline else => |format| gatherArgbFormat(format, buffer, argb),
+    };
+}
+
+fn gatherArgbFormat(
+    comptime format: image.PixelFormat,
+    buffer: image.Buffer,
+    argb: []vp8l_pixel.Pixel,
+) bool {
     const width: usize = buffer.dimensions.width;
     const height: usize = buffer.dimensions.height;
     const stride: usize = buffer.stride;
-    const channels: usize = @intCast(buffer.format.channelCount());
+    const channels: usize = @intCast(format.channelCount());
     assert(argb.len == width * height);
 
+    var has_alpha = false;
+    const shift_sixteen: @Vector(gather_vector_pixels, u5) = @splat(16);
+    const shift_twenty_four: @Vector(gather_vector_pixels, u5) = @splat(24);
+    const alpha_opaque: GatherPixelVector = @splat(255);
     var y: usize = 0;
     while (y < height) : (y += 1) {
         const row = buffer.pixels[y * stride ..][0 .. width * channels];
         var x: usize = 0;
+        if (comptime native_endian == .little and format != .rgb) {
+            while (x + gather_vector_pixels <= width) : (x += gather_vector_pixels) {
+                var source_values: GatherPixelVector = undefined;
+                @memcpy(
+                    std.mem.asBytes(&source_values),
+                    row[x * 4 ..][0 .. gather_vector_pixels * 4],
+                );
+                const values = unpackFourBytePixels(format, source_values, shift_sixteen);
+                argb[y * width + x ..][0..gather_vector_pixels].* = values;
+                if (!@reduce(.And, (values >> shift_twenty_four) == alpha_opaque)) {
+                    has_alpha = true;
+                }
+            }
+        }
         while (x < width) : (x += 1) {
             const sample = row[x * channels ..][0..channels];
-            argb[y * width + x] = pixelFromSample(buffer.format, sample);
+            const value = pixelFromSample(format, sample);
+            argb[y * width + x] = value;
+            if (comptime format != .rgb) {
+                has_alpha = has_alpha or vp8l_pixel.alpha(value) != 255;
+            }
         }
     }
+    return has_alpha;
+}
+
+fn unpackFourBytePixels(
+    comptime format: image.PixelFormat,
+    source: GatherPixelVector,
+    shift_sixteen: @Vector(gather_vector_pixels, u5),
+) GatherPixelVector {
+    comptime assert(native_endian == .little);
+    comptime assert(format != .rgb);
+
+    const byte_swapped = @byteSwap(source);
+    return switch (format) {
+        .rgba => (source & @as(GatherPixelVector, @splat(0xff00_ff00))) |
+            ((source & @as(GatherPixelVector, @splat(0x00ff_0000))) >> shift_sixteen) |
+            ((source & @as(GatherPixelVector, @splat(0x0000_00ff))) << shift_sixteen),
+        .bgra => source,
+        .argb => byte_swapped,
+        .rgb => comptime unreachable,
+    };
 }
 
 fn pixelFromSample(format: image.PixelFormat, sample: []const u8) vp8l_pixel.Pixel {
@@ -716,7 +779,7 @@ pub fn gatherArgbAlloc(
     const pixel_count: usize = @as(usize, buffer.dimensions.width) * buffer.dimensions.height;
     const argb = try gpa.alloc(vp8l_pixel.Pixel, pixel_count);
     errdefer gpa.free(argb);
-    gatherArgb(buffer, argb);
+    _ = gatherArgb(buffer, argb);
     return argb;
 }
 
@@ -797,6 +860,141 @@ test "encodeStaticLossless honors stride and bgra input" {
             try testing.expectEqualSlices(u8, src, out);
         }
     }
+}
+
+test "lossless ARGB vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // Little-endian targets gather this full row as one vector; big-endian
+    // targets exercise the scalar fallback against the same behavior.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0xff, 0x11, 0x22, 0x33,
+        0xff, 0x44, 0x55, 0x66,
+        0xff, 0x77, 0x88, 0x99,
+        0x80, 0xaa, 0xbb, 0xcc,
+        0xff, 0x0d, 0x1e, 0x2f,
+        0xff, 0x3a, 0x4b, 0x5c,
+        0xff, 0x6d, 0x7e, 0x8f,
+        0xff, 0x90, 0xa1, 0xb2,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2233,
+        0xff44_5566,
+        0xff77_8899,
+        0x80aa_bbcc,
+        0xff0d_1e2f,
+        0xff3a_4b5c,
+        0xff6d_7e8f,
+        0xff90_a1b2,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .argb,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .argb });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
+test "lossless RGBA vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // Little-endian targets gather this full row as one vector; big-endian
+    // targets exercise the scalar fallback against the same behavior.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0x11, 0x22, 0x33, 0xff,
+        0x44, 0x55, 0x66, 0xff,
+        0x77, 0x88, 0x99, 0xff,
+        0xaa, 0xbb, 0xcc, 0x80,
+        0x0d, 0x1e, 0x2f, 0xff,
+        0x3a, 0x4b, 0x5c, 0xff,
+        0x6d, 0x7e, 0x8f, 0xff,
+        0x90, 0xa1, 0xb2, 0xff,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2233,
+        0xff44_5566,
+        0xff77_8899,
+        0x80aa_bbcc,
+        0xff0d_1e2f,
+        0xff3a_4b5c,
+        0xff6d_7e8f,
+        0xff90_a1b2,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .rgba,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .rgba });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
+}
+
+test "lossless BGRA vector-width gather preserves channels and alpha" {
+    const decode = @import("decode.zig");
+
+    // The transparent sample sits inside the first vector-width row, making
+    // vector alpha detection observable through the lossless round-trip.
+    const width = 8;
+    const dims = try image.Dimensions.init(width, 1);
+    var pixels = [_]u8{
+        0x31, 0x21, 0x11, 0xff,
+        0x62, 0x52, 0x42, 0xff,
+        0x93, 0x83, 0x73, 0xff,
+        0xc4, 0xb4, 0xa4, 0xff,
+        0xf5, 0xe5, 0xd5, 0xff,
+        0x26, 0x16, 0x06, 0x40,
+        0x57, 0x47, 0x37, 0xff,
+        0x88, 0x78, 0x68, 0xff,
+    };
+    const expected = [_]vp8l_pixel.Pixel{
+        0xff11_2131,
+        0xff42_5262,
+        0xff73_8393,
+        0xffa4_b4c4,
+        0xffd5_e5f5,
+        0x4006_1626,
+        0xff37_4757,
+        0xff68_7888,
+    };
+    const buffer = image.Buffer{
+        .pixels = &pixels,
+        .dimensions = dims,
+        .stride = width * 4,
+        .format = .bgra,
+    };
+
+    var gathered: [width]vp8l_pixel.Pixel = undefined;
+    try testing.expect(gatherArgb(buffer, &gathered));
+    try testing.expectEqualSlices(vp8l_pixel.Pixel, &expected, &gathered);
+
+    const encoded = try encodeStaticLossless(testing.allocator, buffer, .{});
+    defer testing.allocator.free(encoded);
+    var decoded = try decode.decodeStatic(testing.allocator, encoded, .{ .output_format = .bgra });
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &pixels, decoded.buffer.pixels);
 }
 
 test "encodeStaticLossless rejects lossy format requests" {

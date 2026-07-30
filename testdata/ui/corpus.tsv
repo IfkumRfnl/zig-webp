@@ -1,0 +1,14 @@
+# Plan 030 pinned UI/fast-lossless corpus. Tab-separated; paths are repository-relative.
+# Classes: opaque-ui and alpha-ui are primary; palette-miss is secondary.
+# Generated fixtures are deterministic definitions in tools/zig-webp-fast-lossless-bench.zig.
+# libwebp-test-data files are redistributed under testdata/libwebp-test-data/COPYING (BSD-3-Clause).
+# photo_sky.webp is CC0; full author/source/processing details are in testdata/photos/PROVENANCE.md.
+id	class	kind	source	provenance	license
+gen-toolbar-17	opaque-ui	generated	toolbar-17	deterministic:toolbar-buttons-and-separators	CC0-1.0
+gen-dashboard-320	opaque-ui	generated	dashboard-320	deterministic:flat-dashboard-panels-and-text-like-bars	CC0-1.0
+real-solid-libwebp	opaque-ui	webp	testdata/libwebp-test-data/one_color_no_palette.webp	libwebp-test-data:one_color_no_palette.webp	BSD-3-Clause
+gen-alpha-icon-32	alpha-ui	generated	alpha-icon-32	deterministic:antialiased-ring-with-transparent-background	CC0-1.0
+gen-alpha-badge-193	alpha-ui	generated	alpha-badge-193	deterministic:translucent-badge-and-shadow	CC0-1.0
+real-alpha-libwebp	alpha-ui	webp	testdata/libwebp-test-data/alpha_color_cache.webp	libwebp-test-data:alpha_color_cache.webp	BSD-3-Clause
+gen-gradient-257	palette-miss	generated	gradient-257	deterministic:rgba-antialiased-gradient-over-256-colors	CC0-1.0
+real-sky-cc0	palette-miss	webp	testdata/photos/photo_sky.webp	commons:Orange_and_blue_sunset_Unsplash	CC0-1.0
