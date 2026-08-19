@@ -65,13 +65,20 @@ rendered correctly in Firefox and Chromium.
 conversion, table-driven VP8 boolean renormalization, vector inverse DCT,
 compact residual metadata, and SIMD loop filtering; VP8L decode adds buffered
 entropy reads, vector/run inverse transforms, compact Huffman setup, and direct
-reconstruction into eligible output storage. Default VP8L encoding uses
-hash-probed palette indexing, direct one-group palette emission, a
-constant-image run shortcut, and bounded previous-row/recent-index matching for
-palettes up to 96 colors. On the six primary low-color sources of the pinned
+reconstruction into eligible output storage. Packed 1–16-color VP8L images use
+the grouped palette inverse at all image sizes. Default VP8L encoding uses
+hash-probed palette indexing, direct one-group palette emission, direct
+constant-image streams, and bounded previous-row/recent-index matching for
+palettes up to 96 colors; small binary `ALPH` masks without uniformly colored
+rows bypass redundant filter trials. On the six primary low-color sources of
+the pinned
 eight-source UI/alpha corpus, this default path measured **0.7293×** libwebp
 lossless preset 0 time while emitting **0.8029×** its bytes; this is a
 class-specific, single-threaded result, not a general encoder claim.
+Fresh combined-tree measurements on narrower C-weak classes measured
+**0.371× C** for packed-palette decode, **0.495× C** geomean for solid-color
+lossless encode, and **0.461× C** aggregate for small binary-alpha lossy
+encode. These are likewise class-specific, single-threaded results.
 A pinned 135-file comparison against pure-Rust `image-webp` measured summed
 decode-into
 ratios of **0.9315×** (lossy opaque) and **0.9324×** (lossy+alpha), with

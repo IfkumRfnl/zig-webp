@@ -10,7 +10,7 @@ const transform = @import("transform.zig");
 
 const predictor_mode_count = 14;
 const predictor_black = pixel.fromChannels(255, 0, 0, 0);
-const grouped_color_indexing_pixel_min = 100_000;
+const grouped_color_indexing_pixel_min = 1;
 const grouped_color_indexing_green_pixel_min = 100_000;
 
 pub fn applyTransform(
