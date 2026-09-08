@@ -180,6 +180,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    const pam_validation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/pam_validation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+        }),
+    });
+    const run_pam_validation_tests = b.addRunArtifact(pam_validation_tests);
+
     // Optional N-way sharding for slow environments (the big-endian CI job
     // runs 4 shards in parallel under QEMU). Sharding uses a custom
     // simple-mode runner that partitions tests by index modulo the shard
@@ -192,6 +202,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_pam_validation_tests.step);
     if (test_shards) |shard_count| {
         if (shard_count == 0) {
             std.debug.panic("-Dtest-shards must be >= 1", .{});
@@ -278,4 +289,5 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&fmt_check.step);
     ci_step.dependOn(check_step);
     ci_step.dependOn(&run_unit_tests.step);
+    ci_step.dependOn(&run_pam_validation_tests.step);
 }
