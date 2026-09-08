@@ -162,3 +162,9 @@ compile gate for wasm32-wasi/freestanding. Regenerate
 the manifests with `zig build corpus-hashes` / `zig build anim-hashes` only
 after a corpus-wide oracle run confirms the decoded planes and composited
 frames (`tools/webp-oracle.sh compare-anim`).
+
+The animation oracle requires equal, nonempty frame sequences with contiguous
+zero-based filenames before comparing PAM pixels. Its offline shell regression
+tests run with `sh tools/test-webp-oracle-anim.sh` (no Zig or libwebp tools
+needed), and also run in Linux and macOS CI. Set `ORACLE_SHELL=bash` or
+`ORACLE_SHELL=dash` to check the comparator with a specific shell.

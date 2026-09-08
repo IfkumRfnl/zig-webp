@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-29
+Last updated: 2026-09-08
 
 ## Current Position
 
@@ -152,6 +152,22 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-09-08 — Animation oracle frame-sequence completeness
+
+`tools/webp-oracle.sh compare-anim` now checks equal, nonzero PAM frame counts
+and exact contiguous zero-based filenames on both sides before comparing
+pixels. Numeric iteration also avoids relying on lexicographic glob order.
+Previously, a matching actual prefix could report `OK` while reference frames
+remained, and misnumbered actual frames could be compared to the wrong indices.
+
+The offline `tools/test-webp-oracle-anim.sh` regression suite uses shell-only
+decoder/build test doubles and valid 1×1 PAMs. On the unmodified comparator,
+12 cases passed and 5 failed, including the one-actual/two-reference false
+success; after the fix, all 17 cases pass under `sh`, Dash, and Bash. Cases cover
+matching sequences, shorter/longer output, gaps, noncanonical names, empty
+sequences, and pixel differences. Linux and macOS CI run this standalone suite;
+it adds no package dependencies.
 
 ### 2026-07-29 — Default VP8L low-color encoder beats libwebp preset 0
 

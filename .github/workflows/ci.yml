@@ -22,6 +22,12 @@ jobs:
       - name: Check formatting
         run: zig fmt --check .
 
+      - name: Test animation oracle comparator (offline)
+        run: |
+          sh -n tools/webp-oracle.sh
+          sh -n tools/test-webp-oracle-anim.sh
+          sh tools/test-webp-oracle-anim.sh
+
       # Compiles the library and the four CLI tools that back
       # tools/webp-oracle.sh, so tool breakage cannot merge silently.
       - name: Compile library and tools
@@ -94,6 +100,12 @@ jobs:
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.16.0
+
+      - name: Test animation oracle comparator (offline)
+        run: |
+          sh -n tools/webp-oracle.sh
+          sh -n tools/test-webp-oracle-anim.sh
+          sh tools/test-webp-oracle-anim.sh
 
       - name: Compile library and tools
         run: zig build check
