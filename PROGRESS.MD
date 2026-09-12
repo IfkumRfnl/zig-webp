@@ -169,6 +169,64 @@ matching sequences, shorter/longer output, gaps, noncanonical names, empty
 sequences, and pixel differences. Linux and macOS CI run this standalone suite;
 it adds no package dependencies.
 
+### 2026-09-08 — Fast-lossless oracle validates PAM geometry and format
+
+The benchmark's PAM validator now parses complete header fields and checks
+width and height before comparing raster bytes. It requires `MAXVAL 255` and
+the matching `RGB`/depth-3 or `RGB_ALPHA`/depth-4 tuple type, validates exact
+raster length, and preserves the opaque-alpha requirement for RGB output.
+Comments, blank lines, reordered fields, and field whitespace are supported.
+
+The ordinary two-pixel CLI regression previously accepted a 1×2 PAM as a
+round-trip of a 2×1 RAW image for both RGB and RGBA. Both mismatches are now
+rejected; both matching 2×1 controls still pass (4/4 checks). Five focused Zig
+tests cover geometry, header fields, tuple semantics, pixels, and alpha and
+are wired into both `zig build test` and `zig build ci`. Local libwebp 1.5.0
+`cwebp -lossless -exact` / `dwebp -pam` round-trips pass for opaque and
+transparent two-pixel images, including RGB values under zero alpha.
+
+### 2026-08-19 — Three narrow libwebp C wins prepared for integration
+
+A 19-idea isolated performance audition was recovered and completed against
+`origin/main` at `a2b7f81`, Zig 0.16.0, and libwebp 1.5.0. The maintainer set
+the target gate to final Zig time below matched C time; size, correctness,
+control regression, and implementation risk remain independent merge gates.
+Three modular changes survived a fresh combined-tree recheck:
+
+- packed 1–16-color VP8L inverse transforms now use the existing grouped
+  lookup below 100,000 pixels; the four-file UI target measured **55,791 ns**
+  Zig versus **150,306 ns** C (**0.371183×**), with byte-identical RGBA;
+- constant VP8L sources bypass generic transform, index, token, and entropy
+  planning and directly emit a one-entry color transform plus zero-bit index
+  stream; the four-row solid target measured **0.494619× C** geomean, and
+  every Zig artifact was two bytes smaller than libwebp preset 0; and
+- binary 0/255 `ALPH` planes up to 4,096 pixels try only the unfiltered
+  raw-or-VP8L candidate unless every row is uniform, where horizontal
+  filtering can materially reduce size; the three-row target measured
+  **213,885 ns** Zig versus **464,230 ns** C (**0.460731×**) with aggregate
+  bytes **490/504**.
+
+All measurements used ReleaseFast, one calling thread, three warmups, 15
+samples, median timing, identical prepared input, and caller-owned decode
+output where applicable. The final artifacts decoded exactly through the
+in-tree decoder and `dwebp`; the packed-palette aggregate matched libwebp RGBA
+with SHA-256
+`03d5215b81c546aa75580bb3164ab76e8772ab8db7f45099aa8737ed4e19d094`.
+An additional 40-case deterministic binary-mask sweep found a 31-to-90-byte
+horizontal-stripe regression in the isolated shortcut. The integrated version
+keeps the full filter search for row-uniform masks; the rerun's worst remaining
+change was two bytes (22 to 24) on a 64x64 vertical split.
+
+The allocation-free static demux cursor was not retained: although both the
+old and changed implementations beat C on the tiny-still class, a fresh
+back-to-back combined-tree run did not reproduce an incremental improvement
+for its roughly 180-line semantic refactor. The 128 KiB stack-first tiny
+decode experiment was also left out because unmodified Zig already beat C and
+the patch saved only 2.27% while changing allocator observability. Full
+audition and integration evidence lives in `plans/perf-audition/`.
+The final reduced stack passed `zig fmt .`, `git diff --check`, and
+`zig build ci --summary all`: **19/19** steps and **518/518** tests.
+
 ### 2026-07-29 — Default VP8L low-color encoder beats libwebp preset 0
 
 After the formal plan-030 fast-mode experiment was rejected, the maintainer

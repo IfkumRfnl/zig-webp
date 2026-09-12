@@ -5,6 +5,7 @@
 const std = @import("std");
 const webp = @import("webp");
 const cli = @import("cli_common");
+const pam_validation = @import("pam_validation.zig");
 
 const clock = std.Io.Clock.awake;
 const warmup_count: u32 = 3;
@@ -359,26 +360,5 @@ fn validatePam(ctx: cli.Cli, raw_path: []const u8, pam_path: []const u8) !void {
     defer raw.deinit(ctx.gpa);
     const pam = try ctx.readInput(pam_path);
     defer ctx.gpa.free(pam);
-    const marker = "ENDHDR\n";
-    const marker_offset = std.mem.indexOf(u8, pam, marker) orelse return error.InvalidPam;
-    const header = pam[0..marker_offset];
-    const payload = pam[marker_offset + marker.len ..];
-    const is_rgba = std.mem.indexOf(u8, header, "DEPTH 4") != null;
-    const is_rgb = std.mem.indexOf(u8, header, "DEPTH 3") != null;
-    if (is_rgba) {
-        if (!std.mem.eql(u8, payload, raw.pixels)) return error.RoundTripMismatch;
-    } else if (is_rgb) {
-        const pixel_count = @as(usize, raw.width) * raw.height;
-        if (payload.len != pixel_count * 3) return error.InvalidPam;
-        var pixel_index: usize = 0;
-        while (pixel_index < pixel_count) : (pixel_index += 1) {
-            const source = raw.pixels[pixel_index * 4 ..][0..3];
-            if (!std.mem.eql(u8, payload[pixel_index * 3 ..][0..3], source)) {
-                return error.RoundTripMismatch;
-            }
-            if (raw.pixels[pixel_index * 4 + 3] != 255) return error.RoundTripMismatch;
-        }
-    } else {
-        return error.InvalidPam;
-    }
+    try pam_validation.validate(raw.pixels, raw.width, raw.height, pam);
 }

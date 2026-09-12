@@ -429,6 +429,9 @@ fn gradientPredictor(left: u8, top: u8, top_left: u8) u8 {
 /// wins. `none` is always valid; the others reduce residual entropy on smooth
 /// or structured alpha.
 const filter_candidates = [_]Filter{ .none, .horizontal, .vertical, .gradient };
+// Bound the shortcut to setup-dominated masks no larger than 64x64. Large
+// planes retain the size-focused filter search below.
+const binary_fast_path_pixel_max = 64 * 64;
 
 /// Encodes an alpha plane (one byte per pixel, `dimensions.width *
 /// dimensions.height` long, row-major) into a complete ALPH chunk payload
@@ -448,6 +451,20 @@ pub fn encodePlaneAlloc(
 ) errors.Error![]u8 {
     const pixel_count: usize = @intCast(try dimensions.pixelCount());
     assert(plane.len == pixel_count);
+
+    // A small binary mask has at most two symbols. Keeping it unfiltered
+    // preserves that alphabet; predictive filters can only add residual
+    // values. On this setup-dominated class, encode that one candidate directly
+    // instead of allocating filter scratch and running VP8L for all four
+    // filters. Larger masks and masks with uniformly colored rows retain the
+    // full filter search, where output-size decisions matter more or the
+    // horizontal predictor can collapse each row to one residual plus zeros.
+    if (pixel_count <= binary_fast_path_pixel_max and
+        planeIsBinary(plane) and
+        !allRowsUniform(plane, dimensions.width))
+    {
+        return encodeBinaryPlaneAlloc(gpa, plane, dimensions, alpha_quality);
+    }
 
     const filtered = try gpa.alloc(u8, pixel_count);
     defer gpa.free(filtered);
@@ -493,6 +510,58 @@ pub fn encodePlaneAlloc(
     // A non-empty plane always produces at least the uncompressed candidate.
     assert(best != null);
     return best.?;
+}
+
+fn planeIsBinary(plane: []const u8) bool {
+    for (plane) |sample| {
+        if (sample != 0 and sample != 255) return false;
+    }
+    return true;
+}
+
+/// Uniform rows are exactly the binary class where the horizontal predictor
+/// can collapse each row to one residual plus zeros. Keep the full filter
+/// search for those masks so the speed shortcut cannot discard that large
+/// compression win.
+fn allRowsUniform(plane: []const u8, width: u32) bool {
+    const row_width: usize = @intCast(width);
+    var offset: usize = 0;
+    while (offset < plane.len) : (offset += row_width) {
+        const row = plane[offset..][0..row_width];
+        for (row[1..]) |sample| {
+            if (sample != row[0]) return false;
+        }
+    }
+    return true;
+}
+
+fn encodeBinaryPlaneAlloc(
+    gpa: std.mem.Allocator,
+    plane: []const u8,
+    dimensions: image.Dimensions,
+    alpha_quality: u8,
+) errors.Error![]u8 {
+    if (alpha_quality == 0) {
+        const payload = try gpa.alloc(u8, header_size + plane.len);
+        payload[0] = encodeHeaderByte(.none, .none, .none);
+        @memcpy(payload[header_size..], plane);
+        return payload;
+    }
+
+    const stream = try encodeLosslessStream(gpa, plane, dimensions);
+    defer gpa.free(stream);
+    const use_lossless = stream.len < plane.len;
+    const payload = try gpa.alloc(
+        u8,
+        header_size + if (use_lossless) stream.len else plane.len,
+    );
+    payload[0] = encodeHeaderByte(
+        if (use_lossless) .lossless else .none,
+        .none,
+        .none,
+    );
+    @memcpy(payload[header_size..], if (use_lossless) stream else plane);
+    return payload;
 }
 
 /// Returns true when the plane carries meaningful (non-fully-opaque) alpha. A
@@ -727,6 +796,34 @@ test "raw alpha round-trips through forward filtering" {
 
         try std.testing.expectEqualSlices(u8, &plane, &decoded);
     }
+}
+
+test "binary alpha takes the unfiltered single-candidate path" {
+    const dimensions = try image.Dimensions.init(16, 16);
+    var plane: [16 * 16]u8 = undefined;
+    for (&plane, 0..) |*sample, index| {
+        sample.* = if ((index / 4 + index / 16 / 4) % 2 == 0) 0 else 255;
+    }
+
+    const payload = try encodePlaneAlloc(std.testing.allocator, &plane, dimensions, 100);
+    defer std.testing.allocator.free(payload);
+    const header = try parseHeader(payload);
+    try std.testing.expectEqual(Filter.none, header.filter);
+
+    var decoded: [plane.len]u8 = undefined;
+    _ = try decodePlaneAlloc(std.testing.allocator, payload, dimensions, &decoded);
+    try std.testing.expectEqualSlices(u8, &plane, &decoded);
+
+    try std.testing.expect(planeIsBinary(&plane));
+    try std.testing.expect(!allRowsUniform(&plane, dimensions.width));
+    plane[7] = 1;
+    try std.testing.expect(!planeIsBinary(&plane));
+
+    var stripes: [plane.len]u8 = undefined;
+    for (&stripes, 0..) |*sample, index| {
+        sample.* = if ((index / 16) % 2 == 0) 0 else 255;
+    }
+    try std.testing.expect(allRowsUniform(&stripes, dimensions.width));
 }
 
 test "rejects truncated and undersized raw alpha buffers" {

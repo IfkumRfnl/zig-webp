@@ -197,6 +197,32 @@ const Encoder = struct {
     /// decoder's `decodeImageStream` consumes, i.e. a full `VP8L` chunk minus
     /// the 5-byte image header. The ALPH lossless alpha path reuses it.
     fn encodeStreamInto(self: *Encoder, out: []u8) Error!usize {
+        // A constant image needs neither transform planning nor a materialized
+        // palette/index image. Detect it before those allocations and emit the
+        // one-entry color transform and its all-zero index image directly.
+        if (constantPixel(self.source)) |value| {
+            var writer = bit_writer.BitWriter.init(out);
+            var delta_table = [_]pixel.Pixel{value};
+            try writeTransformRecord(
+                &writer,
+                .{ .color_indexing = .{
+                    .delta_table = &delta_table,
+                    .color_table_size = 1,
+                    .width_bits = colorTableWidthBits(1),
+                } },
+                self.dimensions,
+            );
+            try writer.writeBit(0); // no more transforms
+            const index_width = divRoundUp(
+                self.dimensions.width,
+                @as(u32, 1) << colorTableWidthBits(1),
+            );
+            const index_pixel_count: usize = @intCast(index_width * self.dimensions.height);
+            try emitConstantPaletteMainImage(&writer, index_pixel_count);
+            const image_bytes = try writer.finish();
+            return image_bytes.len;
+        }
+
         // Plan: decide the transform stack and produce the transformed main
         // image plus the transform records to emit.
         var plan = try Plan.build(self.gpa, self.dimensions, self.source);
@@ -314,6 +340,15 @@ fn imageHasAlpha(pixels: []const pixel.Pixel) bool {
         if (pixel.alpha(value) != 255) return true;
     }
     return false;
+}
+
+fn constantPixel(pixels: []const pixel.Pixel) ?pixel.Pixel {
+    assert(pixels.len > 0);
+    const first = pixels[0];
+    for (pixels[1..]) |value| {
+        if (value != first) return null;
+    }
+    return first;
 }
 
 fn writeImageHeader(
@@ -1317,6 +1352,27 @@ fn emitOp(
             try codes.greenCode().writeSymbol(writer, green_base_alphabet_size + index);
         },
     }
+}
+
+/// Emits the all-zero index image of a one-color transform without allocating
+/// packed pixels, tokens, or entropy-planning scratch. A single-symbol literal
+/// tree consumes no bits per pixel, so the decoder reconstructs the dimensions'
+/// complete index image without an explicit token stream.
+fn emitConstantPaletteMainImage(
+    writer: *bit_writer.BitWriter,
+    pixel_count: usize,
+) Error!void {
+    assert(pixel_count > 0);
+
+    var histogram: PaletteHistogram = .{};
+    histogram.addToken(.{ .literal = 0 });
+
+    var codes: PaletteCodes = .{};
+    codes.build(&histogram);
+    assert(codes.green_single_symbol == 0);
+    try writeColorCacheHeader(writer, 0);
+    try writer.writeBit(0); // meta-prefix present = 0
+    try codes.writeDescriptors(writer);
 }
 
 fn cacheSizeFor(cache_bits: u4) u16 {
