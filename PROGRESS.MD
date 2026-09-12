@@ -4,7 +4,7 @@ Status log for the roadmap in `PLAN.MD`. `PLAN.MD` stays forward-looking
 (scope, ordering, acceptance gates); completed scope, dated oracle results,
 and the current position are recorded here.
 
-Last updated: 2026-07-29
+Last updated: 2026-09-08
 
 ## Current Position
 
@@ -152,6 +152,22 @@ when the toolchain updates.
 Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms` (dwebp's internal decode time via `-v`), which removes the recorded PAM-formatting caveat from the 10a baseline rows.
 
 ## Recently Completed
+
+### 2026-09-08 — Fast-lossless oracle validates PAM geometry and format
+
+The benchmark's PAM validator now parses complete header fields and checks
+width and height before comparing raster bytes. It requires `MAXVAL 255` and
+the matching `RGB`/depth-3 or `RGB_ALPHA`/depth-4 tuple type, validates exact
+raster length, and preserves the opaque-alpha requirement for RGB output.
+Comments, blank lines, reordered fields, and field whitespace are supported.
+
+The ordinary two-pixel CLI regression previously accepted a 1×2 PAM as a
+round-trip of a 2×1 RAW image for both RGB and RGBA. Both mismatches are now
+rejected; both matching 2×1 controls still pass (4/4 checks). Five focused Zig
+tests cover geometry, header fields, tuple semantics, pixels, and alpha and
+are wired into both `zig build test` and `zig build ci`. Local libwebp 1.5.0
+`cwebp -lossless -exact` / `dwebp -pam` round-trips pass for opaque and
+transparent two-pixel images, including RGB values under zero alpha.
 
 ### 2026-08-19 — Three narrow libwebp C wins prepared for integration
 

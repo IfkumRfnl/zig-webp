@@ -156,6 +156,10 @@ set, and supports `--all` over `testdata/photos` plus the committed static
 corpus (skipping files without a validated Zig decode-into digest). These are
 local reports — timing is environment-dependent and is not a CI gate.
 
+The fast-lossless benchmark's PAM round-trip gate requires matching width,
+height, and pixels, with `MAXVAL 255` and an explicit `RGB` (depth 3) or
+`RGB_ALPHA` (depth 4) tuple type. RGB output must match an opaque RAW image.
+
 `zig build test` includes a hash-based corpus regression: decoded RGBA and
 alpha planes of the committed corpus in `testdata/libwebp-test-data`, and the
 composited frames of the committed animations in `testdata/animation`, are
