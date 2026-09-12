@@ -61,8 +61,8 @@ encode entry points, encode fuzz smoke targets, and deterministic bounded
 mutation exploration are all merged. A review follow-up also closed real
 allocation-budget enforcement gaps in VP8 lossy frame reconstruction and
 VP8L-compressed `ALPH` decode. Coverage-guided `zig build test --fuzz` remains
-blocked by the Zig 0.16.0 test-runner instrumentation bug, but the weekly Zig
-master canary watches for that upstream blocker to clear.
+blocked by the Zig 0.16.0 test-runner instrumentation bug. The weekly Zig
+master canary was removed on 2026-09-12; CI targets supported Zig 0.16.0.
 
 Step 12's remaining stabilization work is done. A 2026-07-08 audit of the
 Tier-1 surface walked all 16 stable entry points and every contract-listed

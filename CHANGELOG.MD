@@ -8,6 +8,11 @@ still change in any release. See `src/root.zig` for the Tier-1 list.
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the advisory weekly Zig-master canary workflow. Stable Zig 0.16.0
+  CI remains unchanged.
+
 ### Performance
 
 - Default VP8L encoding now uses direct palette emission, constant-palette run
@@ -152,7 +157,7 @@ still not frozen (`0.x`); API stabilization is step 12.
   replayed under fixed-seed PRNG byte substitutions and truncations on every
   `zig build test` run, exploring the seeds' input neighborhoods with zero
   flake risk while coverage-guided `--fuzz` remains blocked by an upstream
-  Zig 0.16.0 bug (watched by the weekly Zig-master canary).
+  Zig 0.16.0 bug.
 
 ### Tooling and docs
 
