@@ -153,6 +153,22 @@ Future decode-speed ratios vs libwebp should be recorded against `decode_int_ms`
 
 ## Recently Completed
 
+### 2026-09-08 — Animation oracle frame-sequence completeness
+
+`tools/webp-oracle.sh compare-anim` now checks equal, nonzero PAM frame counts
+and exact contiguous zero-based filenames on both sides before comparing
+pixels. Numeric iteration also avoids relying on lexicographic glob order.
+Previously, a matching actual prefix could report `OK` while reference frames
+remained, and misnumbered actual frames could be compared to the wrong indices.
+
+The offline `tools/test-webp-oracle-anim.sh` regression suite uses shell-only
+decoder/build test doubles and valid 1×1 PAMs. On the unmodified comparator,
+12 cases passed and 5 failed, including the one-actual/two-reference false
+success; after the fix, all 17 cases pass under `sh`, Dash, and Bash. Cases cover
+matching sequences, shorter/longer output, gaps, noncanonical names, empty
+sequences, and pixel differences. Linux and macOS CI run this standalone suite;
+it adds no package dependencies.
+
 ### 2026-09-08 — Fast-lossless oracle validates PAM geometry and format
 
 The benchmark's PAM validator now parses complete header fields and checks

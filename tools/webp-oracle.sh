@@ -523,7 +523,8 @@ compare_rgb_files() {
 
 # Compares composited animation frames against `anim_dump -pam`, frame by
 # frame. Both emit canvas-sized RGBA PAM with identical headers, so whole files
-# are compared. Non-animated files are skipped via the tool's exit code 3.
+# are compared after checking equal, nonempty, contiguous frame sequences.
+# Non-animated files are skipped via the tool's exit code 3.
 compare_anim_files() {
     out_dir=$1
     shift
@@ -577,14 +578,45 @@ compare_anim_files() {
         fi
 
         file_failed=0
+        actual_count=0
+        oracle_count=0
+        for frame in "$actual_dir"/*.pam; do
+            [ -f "$frame" ] || continue
+            actual_count=$((actual_count + 1))
+        done
+        for frame in "$oracle_dir"/*.pam; do
+            [ -f "$frame" ] || continue
+            oracle_count=$((oracle_count + 1))
+        done
+        if [ "$actual_count" -eq 0 ] || [ "$actual_count" -ne "$oracle_count" ]; then
+            printf 'FAIL\tframe counts actual=%s oracle=%s\t%s\n' "$actual_count" "$oracle_count" "$file" >&2
+            file_failed=1
+        fi
+
+        # Equal counts alone can hide gaps or unexpected filenames. Require
+        # exactly the zero-based, four-digit-minimum names emitted by each tool
+        # before comparing pixels; iterate numerically rather than glob order.
         frame_index=0
-        for actual_frame in "$actual_dir"/frame_*.pam; do
+        while [ "$file_failed" -eq 0 ] && [ "$frame_index" -lt "$actual_count" ]; do
+            actual_frame=$(printf '%s/frame_%04d.pam' "$actual_dir" "$frame_index")
             oracle_frame=$(printf '%s/dump_%04d.pam' "$oracle_dir" "$frame_index")
+            if [ ! -f "$actual_frame" ]; then
+                printf 'FAIL\tzig-webp-anim missing frame %s\t%s\n' "$frame_index" "$file" >&2
+                file_failed=1
+                break
+            fi
             if [ ! -f "$oracle_frame" ]; then
                 printf 'FAIL\tanim_dump missing frame %s\t%s\n' "$frame_index" "$file" >&2
                 file_failed=1
                 break
             fi
+            frame_index=$((frame_index + 1))
+        done
+
+        frame_index=0
+        while [ "$file_failed" -eq 0 ] && [ "$frame_index" -lt "$actual_count" ]; do
+            actual_frame=$(printf '%s/frame_%04d.pam' "$actual_dir" "$frame_index")
+            oracle_frame=$(printf '%s/dump_%04d.pam' "$oracle_dir" "$frame_index")
             if ! cmp -s "$oracle_frame" "$actual_frame"; then
                 printf 'DIFF\tframe %s\t%s\n' "$frame_index" "$file" >&2
                 file_failed=1
